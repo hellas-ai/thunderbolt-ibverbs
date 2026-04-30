@@ -7,6 +7,7 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
 
 obj-m := usb4_rdma.o
+usb4_rdma-y := main.o bar.o
 
 ccflags-y := -Wall -Wextra -Wno-unused-parameter
 

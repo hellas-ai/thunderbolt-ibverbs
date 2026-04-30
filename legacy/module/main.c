@@ -37,6 +37,8 @@
 #include <linux/atomic.h>
 #include <linux/spinlock.h>
 
+#include "usb4_rdma.h"
+
 #define DRV_NAME    "usb4_rdma"
 
 /* Protocol key as advertised on the xdomain bus. Constrained to ≤ 8
@@ -274,6 +276,10 @@ static int __init usb4_rdma_init(void)
 		goto err_propdir;
 	}
 
+	/* PCI BAR explorer — best-effort, doesn't fail module load. */
+	if (usb4_rdma_pci_init(usb4_rdma_debugfs_root))
+		pr_warn("PCI BAR explorer init failed; continuing without it\n");
+
 	pr_info("%s ready, advertising service uuid %pUb\n",
 		DRV_NAME, &usb4_rdma_uuid);
 	return 0;
@@ -288,6 +294,7 @@ err_debugfs:
 static void __exit usb4_rdma_exit(void)
 {
 	pr_info("%s unloading\n", DRV_NAME);
+	usb4_rdma_pci_exit();
 	tb_unregister_service_driver(&usb4_rdma_driver);
 	usb4_rdma_destroy_property_dir();
 	debugfs_remove_recursive(usb4_rdma_debugfs_root);
