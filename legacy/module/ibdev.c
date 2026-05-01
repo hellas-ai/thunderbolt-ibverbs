@@ -54,11 +54,14 @@
 #include <linux/sched/mm.h>
 #include <linux/refcount.h>
 #include <linux/wait.h>
+#include <linux/netdevice.h>
 #include <net/addrconf.h>
+#include <net/net_namespace.h>
 
 #include <rdma/ib_verbs.h>
 #include <rdma/ib_user_verbs.h>
 #include <rdma/uverbs_ioctl.h>
+#include <rdma/ib_mad.h>
 
 #include "usb4_rdma.h"
 #include "wire.h"
@@ -138,6 +141,7 @@ struct usb4_rdma_qp {
 struct usb4_rdma_ib_dev {
 	struct ib_device base;
 	atomic_t active_peers;
+	struct net_device *netdev;	/* RoCEv2 IP→GID stub; see netdev.c */
 };
 
 static struct usb4_rdma_ib_dev *u4r_dev;
@@ -1074,7 +1078,9 @@ static int u4r_query_port(struct ib_device *ibdev, u32 port_num,
 				: IB_PORT_PHYS_STATE_DISABLED;
 	attr->max_mtu        = IB_MTU_4096;
 	attr->active_mtu     = IB_MTU_4096;
-	attr->gid_tbl_len    = 1;
+	/* Hold link-local v1 + per-IP v2 GIDs (×2 for v4 and v6 per IP).
+	 * Kernel populates from add_gid(); we only need a sane upper bound. */
+	attr->gid_tbl_len    = 32;
 	attr->pkey_tbl_len   = 1;
 	attr->max_vl_num     = 1;
 	attr->active_width   = IB_WIDTH_4X;
@@ -1092,8 +1098,16 @@ static int u4r_get_port_immutable(struct ib_device *ibdev, u32 port_num,
 		return err;
 	immutable->pkey_tbl_len = attr.pkey_tbl_len;
 	immutable->gid_tbl_len  = attr.gid_tbl_len;
-	immutable->core_cap_flags = 0;
-	immutable->max_mad_size = 0;
+	/* Declare RoCEv2: closest match to "RDMA over Ethernet-class
+	 * fabric with explicit IP-routed CM". The kernel has no
+	 * RDMA_CORE_PORT_USB4 (yet), and we do behave like RoCEv2 to
+	 * userspace — IP→GID resolution via netdev, RDMA-CM does the
+	 * out-of-band handshake, our wire format takes over for data.
+	 * The on-the-wire bytes are NOT actually UDP/IP encapsulated;
+	 * that's an implementation detail libfabric/RCCL/MPI don't see. */
+	immutable->core_cap_flags = RDMA_CORE_PORT_IBA_ROCE
+				  | RDMA_CORE_PORT_IBA_ROCE_UDP_ENCAP;
+	immutable->max_mad_size = IB_MGMT_MAD_SIZE;
 	return 0;
 }
 
@@ -1106,28 +1120,53 @@ static int u4r_query_pkey(struct ib_device *ibdev, u32 port, u16 index,
 	return 0;
 }
 
-static int u4r_query_gid(struct ib_device *ibdev, u32 port, int idx,
-			 union ib_gid *gid)
-{
-	if (port != 1 || idx > 0)
-		return -EINVAL;
-	/* RoCEv2 link-local GID: fe80::/64 prefix + EUI-64 from node_guid.
-	 * RCCL and other libibverbs apps use the GID to identify the peer
-	 * out of band, then plumb it back via modify_qp(RTR).av.grh.dgid.
-	 * Our wire transport routes by tb_xdomain peer + qp_num, not by
-	 * GID — but the GID still needs to be unique per peer and in a
-	 * shape consumers will accept. */
-	memset(gid, 0, sizeof(*gid));
-	gid->raw[0] = 0xfe;
-	gid->raw[1] = 0x80;
-	memcpy(gid->raw + 8, &ibdev->node_guid, 8);
-	return 0;
-}
+/* The RoCE GID cache (rdma/ib_cache + roce_gid_mgmt.c) maintains the
+ * authoritative GID table by listening to inet/inet6 events on our
+ * netdev. Drivers that participate in that flow don't implement
+ * query_gid themselves — the core does it. We omit the op entry from
+ * the ops table so the core's default kicks in. */
 
 static enum rdma_link_layer u4r_get_link_layer(struct ib_device *ibdev,
 					       u32 port_num)
 {
 	return IB_LINK_LAYER_ETHERNET;
+}
+
+/* ----- netdev / GID plumbing -------------------------------------- */
+
+/* Hand the netdev back to the RDMA core so RDMA-CM can resolve
+ * source addrs against it. The core takes a reference; we just
+ * pin our shared netdev pointer and bump it. */
+static struct net_device *u4r_get_netdev(struct ib_device *ibdev, u32 port_num)
+{
+	struct usb4_rdma_ib_dev *u4r =
+		container_of(ibdev, struct usb4_rdma_ib_dev, base);
+	struct net_device *ndev;
+
+	if (port_num != 1)
+		return NULL;
+	ndev = u4r->netdev;
+	if (ndev)
+		dev_hold(ndev);
+	return ndev;
+}
+
+/* The RoCE GID cache calls these whenever an IP is added/removed on
+ * our netdev. The kernel itself maintains the GID table that
+ * query_gid serves; our jobs are (a) accept the call so the caller
+ * doesn't error out, and (b) eventually plumb gid → peer routing
+ * for multi-cable. For now: no-op, single-peer routing ignores GID. */
+static int u4r_add_gid(const struct ib_gid_attr *attr, void **context)
+{
+	pr_info("add_gid: idx=%u type=%u\n",
+		attr->index, attr->gid_type);
+	return 0;
+}
+
+static int u4r_del_gid(const struct ib_gid_attr *attr, void **context)
+{
+	pr_info("del_gid: idx=%u\n", attr->index);
+	return 0;
 }
 
 /* ----- ops table -------------------------------------------------- */
@@ -1147,7 +1186,9 @@ static const struct ib_device_ops u4r_dev_ops = {
 	.query_device      = u4r_query_device,
 	.query_port        = u4r_query_port,
 	.query_pkey        = u4r_query_pkey,
-	.query_gid         = u4r_query_gid,
+	.add_gid           = u4r_add_gid,
+	.del_gid           = u4r_del_gid,
+	.get_netdev        = u4r_get_netdev,
 	.get_port_immutable= u4r_get_port_immutable,
 	.get_link_layer    = u4r_get_link_layer,
 
@@ -1218,7 +1259,11 @@ int usb4_rdma_ibdev_init(void)
 	u4r->base.phys_port_cnt    = USB4_RDMA_NPORTS;
 	u4r->base.num_comp_vectors = num_possible_cpus();
 	u4r->base.local_dma_lkey   = 0;
-	u4r->base.node_type        = RDMA_NODE_RNIC;
+	/* RDMA_NODE_RNIC was iWARP territory and libfabric classifies us as
+	 * iWARP if we say that — even though we don't speak MPA/TCP. We're
+	 * fundamentally RoCE-shaped (IB transport over Ethernet-class link
+	 * layer + IP-based addressing), so present as IB_CA. */
+	u4r->base.node_type        = RDMA_NODE_IB_CA;
 	/* The default uverbs_cmd_mask in _ib_alloc_device doesn't include
 	 * POST_SEND/POST_RECV/POLL_CQ/REQ_NOTIFY_CQ — drivers opt in
 	 * explicitly. Without these bits, ib_uverbs_run_method returns
@@ -1230,14 +1275,51 @@ int usb4_rdma_ibdev_init(void)
 		BIT_ULL(IB_USER_VERBS_CMD_POLL_CQ)   |
 		BIT_ULL(IB_USER_VERBS_CMD_REQ_NOTIFY_CQ);
 
+	/* Borrow `thunderbolt0` as the netdev for RDMA-CM control plane.
+	 *
+	 * Why not our own netdev? RDMA-CM uses real UDP/IP packets (port
+	 * 4791 for RoCEv2 GID queries, 4791 for ConnectMgr exchange) for
+	 * connection establishment. A pure-stub netdev that drops xmit
+	 * leaves CM hung at handshake. thunderbolt0 already has working
+	 * IPs end-to-end (assigned by the user, tested at 10 Gbps), and
+	 * the CM control plane is small handshake traffic — using it for
+	 * that is fine. Our actual data path is tb_ring on a separate
+	 * hop and never traverses thunderbolt0. rxe uses the same trick
+	 * over the same netdev simultaneously without interference.
+	 *
+	 * Future: switch to a per-peer usb4r%d netdev once we implement
+	 * IP-over-tb_ring (essentially: integrate with `tbnetmq`). The
+	 * stub netdev infrastructure lives on in netdev.c for that.
+	 *
+	 * MAC + node_guid still derived from a random EUI here so the
+	 * GID we synthesize is unique per machine even though we share
+	 * the netdev with rxe.
+	 */
 	eth_random_addr(mac);
 	addrconf_addr_eui48((u8 *)&u4r->base.node_guid, mac);
 
+	u4r->netdev = dev_get_by_name(&init_net, "thunderbolt0");
+	if (!u4r->netdev) {
+		pr_err("thunderbolt0 netdev not found — bring up "
+		       "thunderbolt-net before loading usb4_rdma\n");
+		ib_dealloc_device(&u4r->base);
+		return -ENODEV;
+	}
+
 	ib_set_device_ops(&u4r->base, &u4r_dev_ops);
+
+	err = ib_device_set_netdev(&u4r->base, u4r->netdev, 1);
+	if (err) {
+		pr_err("ib_device_set_netdev failed: %d\n", err);
+		dev_put(u4r->netdev);
+		ib_dealloc_device(&u4r->base);
+		return err;
+	}
 
 	err = ib_register_device(&u4r->base, "usb4_rdma%d", NULL);
 	if (err) {
 		pr_err("ib_register_device failed: %d\n", err);
+		dev_put(u4r->netdev);
 		ib_dealloc_device(&u4r->base);
 		return err;
 	}
@@ -1251,10 +1333,16 @@ int usb4_rdma_ibdev_init(void)
 
 void usb4_rdma_ibdev_exit(void)
 {
+	struct net_device *ndev;
+
 	if (!u4r_dev)
 		return;
+	ndev = u4r_dev->netdev;
+	u4r_dev->netdev = NULL;
 	usb4_rdma_data_set_rx_handler(NULL);
 	ib_unregister_device(&u4r_dev->base);
 	ib_dealloc_device(&u4r_dev->base);
 	u4r_dev = NULL;
+	if (ndev)
+		dev_put(ndev);
 }
