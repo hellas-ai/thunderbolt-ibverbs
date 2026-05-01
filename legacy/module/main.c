@@ -152,16 +152,12 @@ static int usb4_rdma_probe(struct tb_service *svc, const struct tb_service_id *i
 
 	tb_service_set_drvdata(svc, dev);
 
-	/*
-	 * TODO(tier-1):
-	 *   - tb_ring_alloc_tx(svc->parent->parent, hop=?, RING_SIZE, RING_FLAG_E2E)
-	 *   - tb_ring_alloc_rx(... callback for incoming frames ...)
-	 *   - tb_ring_start() on both
-	 *   - register an ib_device with verbs callbacks (alloc_pd, reg_user_mr,
-	 *     create_qp, post_send, post_recv, poll_cq, req_notify_cq, ...)
-	 *   - hook post_send → wire-frame builder → ring_tx
-	 *   - hook ring_rx callback → completion event
-	 */
+	/* Bring up the data path (rings + frame pool + RX dispatcher). */
+	if (usb4_rdma_data_attach_peer(svc))
+		dev_warn(&svc->dev, "data path attach failed; verbs will not see this peer\n");
+	else
+		usb4_rdma_ibdev_peer_event(true);
+
 	atomic_set(&dev->state, USB4_RDMA_STATE_RUNNING);
 	return 0;
 }
@@ -177,12 +173,9 @@ static void usb4_rdma_remove(struct tb_service *svc)
 
 	atomic_set(&dev->state, USB4_RDMA_STATE_REMOVED);
 
-	/*
-	 * TODO(tier-1):
-	 *   - ib_unregister_device()
-	 *   - tb_ring_stop() + tb_ring_free() for both rings
-	 *   - drain any pending CQEs / async events
-	 */
+	if (usb4_rdma_data_peer_attached())
+		usb4_rdma_ibdev_peer_event(false);
+	usb4_rdma_data_detach_peer(svc);
 
 	debugfs_remove_recursive(dev->debugfs_dir);
 	tb_service_set_drvdata(svc, NULL);
