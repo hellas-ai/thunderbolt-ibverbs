@@ -4,34 +4,47 @@
  *
  * The question: when we open N parallel `tb_ring` pairs on the same
  * USB4 host router, does aggregate throughput scale linearly with N,
- * or is there a shared internal bottleneck (DMA engine, memory port,
- * scheduler) that caps the controller below N × per-ring rate?
+ * or is there a shared internal bottleneck that caps the controller
+ * below N × per-ring rate?
  *
- * Answering this gates the bandwidth thesis behind the soft-RDMA
- * project. If aggregate scales to ~5 × 10 Gbps = ~50 Gbps single-cable
- * before hitting the 40 Gbps PHY ceiling, multi-ring is the right
- * lever to pull. If it plateaus at the ~10 Gbps single-ring rate seen
- * by `thunderbolt_net` regardless of N, the strategy needs a rethink.
+ * On Strix Halo this turned out narrow: REG_CAPS reports hop_count=3,
+ * of which the connection manager and (when loaded) thunderbolt_net
+ * consume 2, leaving 1 free hop per controller. So the practical
+ * version of the question is "does a single raw `tb_ring` deliver
+ * more than thunderbolt_net's TCP path (~10 Gbps), validating that
+ * the cap is in `tbnet`/IP rather than in the controller itself?"
  *
  * Approach:
  *   1. Register a `tb_service` under a separate key ("u4lt") so we
  *      don't conflict with thunderbolt_net's "network".
- *   2. On probe (peer discovered), allocate N TX+RX ring pairs at
- *      fixed hops (LOADTEST_HOP_BASE..LOADTEST_HOP_BASE+N-1). Stays
- *      out of thunderbolt_net's hops 0/1.
- *   3. Use tb_xdomain_enable_paths() to wire the routing.
- *   4. Pre-post RX frames; spawn one TX kthread per ring.
- *   5. Frames carry no protocol — just 4 KB of zeros, SOF/EOF
+ *   2. On probe (peer discovered), allocate N TX+RX ring pairs with
+ *      auto-assigned hop IDs (`tb_xdomain_alloc_*_hopid(xd, -1)` —
+ *      kernel picks the lowest free hop >= TB_PATH_MIN_HOPID = 8).
+ *   3. Order matters (per `drivers/net/thunderbolt/main.c`):
+ *        a. allocate TX/RX ring objects
+ *        b. allocate TX/RX frame buffers
+ *        c. tb_ring_start() on both
+ *        d. post RX buffers via tb_ring_rx()
+ *        e. tb_xdomain_enable_paths() LAST
+ *      Posting RX before tb_ring_start() returns -ESHUTDOWN and the
+ *      buffers never get queued, leaving RX silent.
+ *   4. Frames carry no protocol — just SZ_4K of zeros, SOF/EOF
  *      markers per `dma_test`.
- *   6. RX callback re-posts the frame; TX callback marks slot free.
- *   7. Aggregate counters in debugfs:
+ *   5. RX callback re-posts the frame; TX callback marks slot free.
+ *   6. Aggregate counters in debugfs:
  *        /sys/kernel/debug/usb4_rdma/loadtest/<peer>/stats
  *        /sys/kernel/debug/usb4_rdma/loadtest/<peer>/start
- *        /sys/kernel/debug/usb4_rdma/loadtest/<peer>/stop
  *
- * Both peers must run this module. Hop allocation is symmetric — both
- * sides claim hops [BASE..BASE+N-1] and both call enable_paths with
- * the same arguments.
+ * Wire-protocol caveat: `tb_xdomain_enable_paths()` takes
+ *   (xd, local_tx_path, local_tx_ring_hop, remote_tx_path, local_rx_ring_hop)
+ * where `remote_tx_path` is the peer's TX HopID — what they send TO,
+ * which is what we receive FROM. The correct way to learn this is a
+ * login-style xdomain request/response (see `tbnet_login_request` for
+ * the canonical example). This module currently relies on accidental
+ * symmetry: both peers run identical code from identical state, so
+ * `alloc_*_hopid(-1)` returns the same number on both sides. Works
+ * for a single-ring-pair test from a clean boot; fragile in general.
+ * Marked TODO; first-class login is its own commit.
  */
 
 #define pr_fmt(fmt) "usb4_rdma/loadtest: " fmt
@@ -206,6 +219,19 @@ static void free_frames(struct loadtest_ring *lr,
 
 /* ----- callbacks --------------------------------------------------- */
 
+/*
+ * struct ring_frame.size is a 12-bit field. A "full" 4096-byte frame
+ * is encoded as 0 in the descriptor (the convention the hardware uses
+ * because 4096 doesn't fit). On TX completion the value we set isn't
+ * updated; on RX the hardware writes the actual received length, again
+ * with 0 meaning 4096. So both directions need the same fixup before
+ * accounting bytes.
+ */
+static inline u32 frame_actual_bytes(const struct ring_frame *frame)
+{
+	return frame->size ? frame->size : (u32)frame_size;
+}
+
 static void tx_callback(struct tb_ring *ring, struct ring_frame *frame,
 			bool canceled)
 {
@@ -213,7 +239,7 @@ static void tx_callback(struct tb_ring *ring, struct ring_frame *frame,
 	struct loadtest_ring *lr = lf->lr;
 
 	if (!canceled) {
-		atomic64_add(frame->size, &lr->tx_bytes);
+		atomic64_add(frame_actual_bytes(frame), &lr->tx_bytes);
 		atomic64_inc(&lr->tx_packets);
 	}
 	atomic_dec(&lr->tx_inflight);
@@ -228,7 +254,7 @@ static void rx_callback(struct tb_ring *ring, struct ring_frame *frame,
 	if (canceled)
 		return;
 
-	atomic64_add(frame->size, &lr->rx_bytes);
+	atomic64_add(frame_actual_bytes(frame), &lr->rx_bytes);
 	atomic64_inc(&lr->rx_packets);
 
 	/* Re-post the frame for another receive. */
@@ -331,31 +357,40 @@ static int loadtest_ring_setup(struct loadtest_dev *dev, int idx)
 	if (ret)
 		goto err_tx_frames;
 
-	/* Wire the actual data path between the peers. The signature is
-	 *   enable_paths(xd, transmit_path, transmit_ring,
-	 *                receive_path, receive_ring)
-	 * where transmit_* is the local TX side, receive_* is the local
-	 * RX side. Both peers call this; kernel reconciles. */
+	/* Order matters: start rings BEFORE posting RX buffers
+	 * (tb_ring_rx returns -ESHUTDOWN on a stopped ring), and call
+	 * enable_paths LAST after both sides are ready to receive. This
+	 * mirrors `tbnet_open` in drivers/net/thunderbolt/main.c. */
+	tb_ring_start(lr->tx_ring);
+	tb_ring_start(lr->rx_ring);
+
+	for (i = 0; i < lr->frames_per_side; i++) {
+		struct loadtest_frame *lf = &lr->rx_frames[i];
+		lf->frame.callback = rx_callback;
+		ret = tb_ring_rx(lr->rx_ring, &lf->frame);
+		if (ret) {
+			pr_warn("ring %d: tb_ring_rx() returned %d at slot %d\n",
+				idx, ret, i);
+			goto err_rings_started;
+		}
+	}
+
+	/* TODO: real wire-protocol coordination. Today both peers happen
+	 * to allocate matching hop numbers because they run identical
+	 * code from identical state. Replace with a tb_xdomain_request
+	 * exchange à la tbnet_login_request before deploying. */
 	ret = tb_xdomain_enable_paths(xd, lr->out_hop, lr->tx_ring->hop,
 				      lr->in_hop, lr->rx_ring->hop);
 	if (ret) {
 		pr_warn("ring %d: enable_paths failed: %d\n", idx, ret);
-		goto err_rx_frames;
+		goto err_rings_started;
 	}
-
-	/* Pre-post all RX frames. */
-	for (i = 0; i < lr->frames_per_side; i++) {
-		struct loadtest_frame *lf = &lr->rx_frames[i];
-		lf->frame.callback = rx_callback;
-		tb_ring_rx(lr->rx_ring, &lf->frame);
-	}
-
-	tb_ring_start(lr->tx_ring);
-	tb_ring_start(lr->rx_ring);
 
 	return 0;
 
-err_rx_frames:
+err_rings_started:
+	tb_ring_stop(lr->tx_ring);
+	tb_ring_stop(lr->rx_ring);
 	free_frames(lr, lr->rx_frames, lr->frames_per_side, false);
 	lr->rx_frames = NULL;
 err_tx_frames:
