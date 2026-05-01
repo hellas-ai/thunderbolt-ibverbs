@@ -1130,9 +1130,100 @@ static int u4r_fill_from_sges(void *dst, u32 length, void *ctx)
 	return 0;
 }
 
-/* Build wire frames directly from one WR's SGE list. For messages larger
- * than one USB4 frame, each fragment is copied straight from the source MR
- * pages into the claimed TX DMA buffer; no full-message gather buffer. */
+/* Zero-copy send path: walk a WR's SGE list and emit one (struct page *,
+ * page_off, length) tuple per call to data.c's send_page_stream. The DMA
+ * mapping happens inside data.c (dma_map_page on the user's pinned MR
+ * page directly), avoiding the staging-frame memcpy used by
+ * u4r_fill_from_sges. Each segment hands an MR refcount off to the done
+ * callback (u4r_mr_put_done) which fires once tb_ring signals TX
+ * completion, keeping the MR alive across the in-flight DMA window. */
+struct u4r_zc_send_cursor {
+	struct usb4_rdma_pd *pd;
+	const struct ib_sge *sg_list;
+	int num_sge;
+	int sge_idx;
+	u32 sge_off;
+	struct usb4_rdma_mr *cur_mr;	/* one ref held while traversing this SGE */
+};
+
+static void u4r_zc_send_cursor_init(struct u4r_zc_send_cursor *c,
+				    struct usb4_rdma_pd *pd,
+				    const struct ib_sge *sg_list, int num_sge)
+{
+	c->pd = pd;
+	c->sg_list = sg_list;
+	c->num_sge = num_sge;
+	c->sge_idx = 0;
+	c->sge_off = 0;
+	c->cur_mr = NULL;
+}
+
+static void u4r_zc_send_cursor_fini(struct u4r_zc_send_cursor *c)
+{
+	if (c->cur_mr) {
+		u4r_mr_put(c->cur_mr);
+		c->cur_mr = NULL;
+	}
+}
+
+static int u4r_zc_next_send_page(void *opaque, struct page **page,
+				 u32 *page_off, u32 *length,
+				 dma_addr_t *dma_addr, bool *dma_mapped,
+				 usb4_rdma_data_done_fn *done,
+				 void **done_ctx)
+{
+	struct u4r_zc_send_cursor *c = opaque;
+	const struct ib_sge *sge;
+	u32 page_idx, remaining;
+	int ret;
+
+	/* Advance past empty / fully-consumed SGEs; acquire MR for the
+	 * current one if we don't already hold it. */
+	while (c->sge_idx < c->num_sge) {
+		sge = &c->sg_list[c->sge_idx];
+		if (sge->length == 0 || c->sge_off == sge->length) {
+			if (c->cur_mr) {
+				u4r_mr_put(c->cur_mr);
+				c->cur_mr = NULL;
+			}
+			c->sge_idx++;
+			c->sge_off = 0;
+			continue;
+		}
+		if (!c->cur_mr) {
+			c->cur_mr = u4r_pd_get_mr_by_lkey(c->pd, sge->lkey);
+			if (!c->cur_mr)
+				return -EINVAL;
+		}
+		break;
+	}
+	if (c->sge_idx >= c->num_sge)
+		return -ENOENT;
+
+	sge = &c->sg_list[c->sge_idx];
+	remaining = sge->length - c->sge_off;
+	ret = u4r_mr_page_chunk(c->cur_mr, sge->addr + c->sge_off, remaining,
+				page, &page_idx, page_off, length);
+	if (ret)
+		return ret;
+
+	c->sge_off += *length;
+
+	/* Hand the done callback an extra MR reference; it'll drop it via
+	 * u4r_mr_put_done when this segment's DMA completes. */
+	refcount_inc(&c->cur_mr->refs);
+	*done = u4r_mr_put_done;
+	*done_ctx = c->cur_mr;
+	*dma_addr = 0;
+	*dma_mapped = false;
+	return 0;
+}
+
+/* Build wire frames directly from one WR's SGE list. For non-INLINE WRs
+ * the SGEs reference MR-backed pinned pages and we use the zero-copy
+ * page-stream path (data.c dma_map_page's the source page directly into
+ * the NHI descriptor). For IB_SEND_INLINE the source is user memory not
+ * an MR, so we fall back to the staging-frame fill-callback path. */
 static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 {
 	struct usb4_rdma_pd *pd =
@@ -1161,6 +1252,22 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 					  qp->send_psn++,
 					  U4_F_LAST | U4_F_SOLICITED,
 					  0, 0, 0, NULL, NULL, 0);
+		goto out;
+	}
+
+	if (!cursor.inline_data) {
+		struct u4r_zc_send_cursor zc;
+
+		u4r_zc_send_cursor_init(&zc, pd, wr->sg_list, wr->num_sge);
+		ret = usb4_rdma_data_send_page_stream(U4_OP_SEND,
+						      qp->base.qp_num,
+						      qp->attr.dest_qp_num,
+						      qp->send_psn++,
+						      U4_F_LAST | U4_F_SOLICITED,
+						      0, 0, 0, total_len,
+						      u4r_zc_next_send_page,
+						      &zc);
+		u4r_zc_send_cursor_fini(&zc);
 		goto out;
 	}
 
@@ -1217,6 +1324,23 @@ static int u4r_write_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 					  qp->send_psn++, U4_F_LAST,
 					  imm_data, rwr->remote_addr,
 					  rwr->rkey, NULL, NULL, 0);
+		goto out;
+	}
+
+	if (!cursor.inline_data) {
+		struct u4r_zc_send_cursor zc;
+
+		u4r_zc_send_cursor_init(&zc, pd, wr->sg_list, wr->num_sge);
+		ret = usb4_rdma_data_send_page_stream(opcode,
+						      qp->base.qp_num,
+						      qp->attr.dest_qp_num,
+						      qp->send_psn++,
+						      U4_F_LAST, imm_data,
+						      rwr->remote_addr,
+						      rwr->rkey, total_len,
+						      u4r_zc_next_send_page,
+						      &zc);
+		u4r_zc_send_cursor_fini(&zc);
 		goto out;
 	}
 
