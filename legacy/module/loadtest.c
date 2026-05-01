@@ -672,6 +672,7 @@ static int loadtest_probe(struct tb_service *svc, const struct tb_service_id *id
 	}
 
 	tb_service_set_drvdata(svc, dev);
+	usb4_rdma_ibdev_peer_event(true);
 
 	dev_info(&svc->dev,
 		"loadtest: ready with %d ring pair(s). Write 1 to debugfs/start to begin TX.\n",
@@ -689,6 +690,7 @@ static void loadtest_remove(struct tb_service *svc)
 	if (!dev)
 		return;
 
+	usb4_rdma_ibdev_peer_event(false);
 	loadtest_stop(dev);
 	debugfs_remove_recursive(dev->dir);
 	for (i = 0; i < dev->rings_setup; i++)

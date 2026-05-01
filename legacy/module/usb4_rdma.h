@@ -12,4 +12,9 @@ void usb4_rdma_pci_exit(void);
 int  usb4_rdma_loadtest_init(struct dentry *parent_dir);
 void usb4_rdma_loadtest_exit(void);
 
+/* ibdev.c — soft-RDMA ib_device skeleton. */
+int  usb4_rdma_ibdev_init(void);
+void usb4_rdma_ibdev_exit(void);
+void usb4_rdma_ibdev_peer_event(bool joined);
+
 #endif /* _USB4_RDMA_H */

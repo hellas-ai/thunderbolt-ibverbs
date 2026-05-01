@@ -284,6 +284,10 @@ static int __init usb4_rdma_init(void)
 	if (usb4_rdma_loadtest_init(usb4_rdma_debugfs_root))
 		pr_warn("loadtest init failed; continuing without it\n");
 
+	/* RDMA ib_device skeleton — best-effort. */
+	if (usb4_rdma_ibdev_init())
+		pr_warn("ib_device init failed; continuing without it\n");
+
 	pr_info("%s ready, advertising service uuid %pUb\n",
 		DRV_NAME, &usb4_rdma_uuid);
 	return 0;
@@ -298,6 +302,7 @@ err_debugfs:
 static void __exit usb4_rdma_exit(void)
 {
 	pr_info("%s unloading\n", DRV_NAME);
+	usb4_rdma_ibdev_exit();
 	usb4_rdma_loadtest_exit();
 	usb4_rdma_pci_exit();
 	tb_unregister_service_driver(&usb4_rdma_driver);
