@@ -53,6 +53,18 @@ struct usb4_rdma_pd {
 	struct ib_pd base;
 };
 
+struct usb4_rdma_cq {
+	struct ib_cq base;
+	int cqe;
+};
+
+struct usb4_rdma_qp {
+	struct ib_qp base;
+	enum ib_qp_state state;
+	struct ib_qp_attr attr;
+	int attr_mask;
+};
+
 struct usb4_rdma_ib_dev {
 	struct ib_device base;
 	atomic_t active_peers;	/* # of bound xdomain services */
@@ -231,31 +243,70 @@ static int u4r_dealloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 static int u4r_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 			 struct ib_udata *udata)
 {
-	U4R_STUB(create_qp);
-	return -ENOSYS;
+	struct usb4_rdma_qp *qp = container_of(ibqp, struct usb4_rdma_qp, base);
+
+	if (attr->qp_type != IB_QPT_RC) {
+		pr_warn("create_qp: only RC supported, got type %d\n",
+			attr->qp_type);
+		return -EOPNOTSUPP;
+	}
+	qp->state = IB_QPS_RESET;
+	pr_info("create_qp ok (RC, max_send_wr=%u max_recv_wr=%u)\n",
+		attr->cap.max_send_wr, attr->cap.max_recv_wr);
+	return 0;
 }
 
 static int u4r_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 {
+	pr_info("destroy_qp\n");
 	return 0;
 }
 
 static int u4r_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 			 int attr_mask, struct ib_udata *udata)
 {
-	U4R_STUB(modify_qp);
-	return -ENOSYS;
+	struct usb4_rdma_qp *qp = container_of(ibqp, struct usb4_rdma_qp, base);
+
+	/* IB core validates the (current_state, attr_mask, new_state)
+	 * tuple against the RC state-machine table before calling us,
+	 * so we only need to reflect the new state and remember the
+	 * attrs for when the data path comes online. */
+	if (attr_mask & IB_QP_STATE) {
+		pr_info("modify_qp: state %d -> %d (mask 0x%x)\n",
+			qp->state, attr->qp_state, attr_mask);
+		qp->state = attr->qp_state;
+	}
+	qp->attr = *attr;
+	qp->attr_mask = attr_mask;
+	return 0;
+}
+
+static int u4r_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+			int attr_mask, struct ib_qp_init_attr *init_attr)
+{
+	struct usb4_rdma_qp *qp = container_of(ibqp, struct usb4_rdma_qp, base);
+
+	*attr = qp->attr;
+	attr->qp_state = qp->state;
+	memset(init_attr, 0, sizeof(*init_attr));
+	init_attr->qp_type = IB_QPT_RC;
+	return 0;
 }
 
 static int u4r_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 			 struct uverbs_attr_bundle *attrs)
 {
-	U4R_STUB(create_cq);
-	return -ENOSYS;
+	struct usb4_rdma_cq *cq = container_of(ibcq, struct usb4_rdma_cq, base);
+
+	cq->cqe = attr->cqe;
+	pr_info("create_cq ok (cqe=%u, comp_vector=%u)\n",
+		attr->cqe, attr->comp_vector);
+	return 0;
 }
 
 static int u4r_destroy_cq(struct ib_cq *ibcq, struct ib_udata *udata)
 {
+	pr_info("destroy_cq\n");
 	return 0;
 }
 
@@ -327,6 +378,7 @@ static const struct ib_device_ops u4r_dev_ops = {
 	.create_qp         = u4r_create_qp,
 	.destroy_qp        = u4r_destroy_qp,
 	.modify_qp         = u4r_modify_qp,
+	.query_qp          = u4r_query_qp,
 	.create_cq         = u4r_create_cq,
 	.destroy_cq        = u4r_destroy_cq,
 	.post_send         = u4r_post_send,
@@ -338,7 +390,9 @@ static const struct ib_device_ops u4r_dev_ops = {
 	.get_dma_mr        = u4r_get_dma_mr,
 
 	INIT_RDMA_OBJ_SIZE(ib_ucontext, usb4_rdma_ucontext, base),
-	INIT_RDMA_OBJ_SIZE(ib_pd, usb4_rdma_pd, base),
+	INIT_RDMA_OBJ_SIZE(ib_pd,        usb4_rdma_pd,       base),
+	INIT_RDMA_OBJ_SIZE(ib_cq,        usb4_rdma_cq,       base),
+	INIT_RDMA_OBJ_SIZE(ib_qp,        usb4_rdma_qp,       base),
 };
 
 /* ----- peer-tracking hook called from loadtest probe/remove ------- */
