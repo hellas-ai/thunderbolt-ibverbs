@@ -67,6 +67,7 @@ struct u4_data_frame {
 	void *buf;
 	dma_addr_t dma;
 	bool is_tx;
+	atomic_t in_use;	/* 1 while submitted to ring, 0 when free */
 };
 
 struct u4_data_peer {
@@ -182,11 +183,9 @@ static void u4_data_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	struct u4_data_frame *f = container_of(frame, typeof(*f), frame);
 
 	atomic_dec(&f->peer->tx_inflight);
+	atomic_set(&f->in_use, 0);
 	if (!canceled)
 		atomic64_inc(&f->peer->tx_frames_sent);
-	/* Frame goes back to the per-peer pool by virtue of being
-	 * accessible — caller (post_send) finds free slots by checking
-	 * tx_inflight. */
 }
 
 static void u4_data_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
@@ -398,9 +397,8 @@ int usb4_rdma_data_send(u32 src_qp, u32 dest_qp, u32 psn, u8 flags,
 			const void *payload, u32 length)
 {
 	struct u4_data_peer *p;
-	struct u4_data_frame *f;
-	int i, slot = -1;
-	int ret;
+	struct u4_data_frame *f = NULL;
+	int i, ret;
 
 	if (length > U4_MAX_PAYLOAD)
 		return -EMSGSIZE;
@@ -412,21 +410,26 @@ int usb4_rdma_data_send(u32 src_qp, u32 dest_qp, u32 psn, u8 flags,
 		return -ENOTCONN;
 	}
 
-	/* Find a free TX slot. Simple linear scan; with E2E flow control
-	 * we should always find one quickly under steady-state. */
+	/* Find a free TX slot — atomically claim one whose in_use is 0.
+	 * The previous version checked tx_inflight against the pool size
+	 * and then always reused slot 0; under any concurrent / pipelined
+	 * post_send that trampled the ring_frame of an in-flight frame.
+	 *
+	 * Linear scan with cmpxchg-style atomic claim is fine for our
+	 * 96-slot pool; if every slot is busy we return -EBUSY and the
+	 * caller (verbs post_send) returns the WR to userspace as bad. */
 	for (i = 0; i < U4_DATA_FRAMES_PER_DIR; i++) {
-		f = &p->tx_frames[i];
-		if (atomic_read(&p->tx_inflight) < U4_DATA_FRAMES_PER_DIR) {
-			slot = i;
+		struct u4_data_frame *cand = &p->tx_frames[i];
+		if (atomic_cmpxchg(&cand->in_use, 0, 1) == 0) {
+			f = cand;
 			break;
 		}
 	}
-	if (slot < 0) {
+	if (!f) {
 		read_unlock(&the_peer_lock);
 		return -EBUSY;
 	}
 
-	f = &p->tx_frames[slot];
 	u4_wire_hdr_init((struct u4_wire_hdr *)f->buf, U4_OP_SEND,
 			 dest_qp, src_qp, psn, length, flags);
 	if (length)
@@ -441,6 +444,7 @@ int usb4_rdma_data_send(u32 src_qp, u32 dest_qp, u32 psn, u8 flags,
 	ret = tb_ring_tx(p->tx_ring, &f->frame);
 	if (ret) {
 		atomic_dec(&p->tx_inflight);
+		atomic_set(&f->in_use, 0);
 		read_unlock(&the_peer_lock);
 		return ret;
 	}

@@ -222,6 +222,8 @@ static int u4r_alloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 		container_of(ibpd, struct usb4_rdma_pd, base);
 	INIT_LIST_HEAD(&pd->mrs);
 	spin_lock_init(&pd->mr_lock);
+	/* No pr_info here — would fire on every userspace ibv_alloc_pd
+	 * call, which can happen many times per benchmark iteration. */
 	return 0;
 }
 
@@ -570,7 +572,6 @@ static int u4r_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 	struct usb4_rdma_qp *qp = container_of(ibqp, struct usb4_rdma_qp, base);
 	unsigned long flags;
 
-	pr_info("post_recv enter qp=%u\n", ibqp->qp_num);
 	for (; wr; wr = wr->next) {
 		struct usb4_rdma_recv_wr *r;
 		int i;
