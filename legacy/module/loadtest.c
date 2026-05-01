@@ -54,8 +54,9 @@
 #define LOADTEST_PROTO_KEY        "u4lt"
 #define LOADTEST_PROTO_ID         1
 
-/* Stay above thunderbolt_net's hops 0/1, below the silicon limit at 7. */
-#define LOADTEST_HOP_BASE         2
+/* Hops are auto-allocated by the xdomain layer (must be >= TB_PATH_MIN_HOPID
+ * which is 8 for non-NHI paths). The "hops 0..6" we observed in BAR0 register
+ * slots are controller ring indices, not xdomain hop IDs — different concept. */
 #define LOADTEST_MAX_RINGS        5
 
 /* SOF/EOF markers (PDFs) — borrowed from dma_test layout. */
@@ -96,6 +97,8 @@ struct loadtest_ring {
 	struct loadtest_dev *dev;
 	int idx;
 	int hop;
+	int out_hop;	/* xdomain TX path hop (we send TO this on the peer) */
+	int in_hop;	/* xdomain RX path hop (peer sends TO this on us) */
 
 	struct tb_ring *tx_ring;
 	struct tb_ring *rx_ring;
@@ -274,46 +277,52 @@ static int loadtest_ring_setup(struct loadtest_dev *dev, int idx)
 {
 	struct loadtest_ring *lr = &dev->rings[idx];
 	struct tb_xdomain *xd = dev->xd;
-	int hop = LOADTEST_HOP_BASE + idx;
+	int out_hop, in_hop;
 	u16 sof_mask = BIT(LOADTEST_PDF_FRAME_START);
 	u16 eof_mask = BIT(LOADTEST_PDF_FRAME_END);
 	int ret, i;
 
 	lr->dev = dev;
 	lr->idx = idx;
-	lr->hop = hop;
 	lr->frames_per_side = LOADTEST_FRAMES_PER_RING;
 	atomic_set(&lr->tx_inflight, 0);
 	atomic64_set(&lr->tx_bytes, 0);
 	atomic64_set(&lr->rx_bytes, 0);
 
-	/* Claim hop IDs explicitly — both peers do the same on probe so
-	 * the assignment matches. */
-	ret = tb_xdomain_alloc_out_hopid(xd, hop);
-	if (ret < 0) {
-		pr_warn("ring %d: out hopid %d busy (%d)\n", idx, hop, ret);
-		return ret;
+	/* Auto-allocate hop IDs (>= TB_PATH_MIN_HOPID = 8). */
+	out_hop = tb_xdomain_alloc_out_hopid(xd, -1);
+	if (out_hop < 0) {
+		pr_warn("ring %d: out hopid alloc failed (%d)\n", idx, out_hop);
+		return out_hop;
 	}
-	ret = tb_xdomain_alloc_in_hopid(xd, hop);
-	if (ret < 0) {
-		tb_xdomain_release_out_hopid(xd, hop);
-		return ret;
+	in_hop = tb_xdomain_alloc_in_hopid(xd, -1);
+	if (in_hop < 0) {
+		tb_xdomain_release_out_hopid(xd, out_hop);
+		return in_hop;
 	}
+	lr->out_hop = out_hop;
+	lr->in_hop = in_hop;
+	lr->hop = out_hop;
+	pr_info("ring %d: allocated out_hop=%d in_hop=%d\n",
+		idx, out_hop, in_hop);
 
-	lr->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, hop, LOADTEST_RING_DEPTH,
+	lr->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, LOADTEST_RING_DEPTH,
 				       RING_FLAG_FRAME);
 	if (!lr->tx_ring) {
 		ret = -ENOMEM;
 		goto err_hopid;
 	}
 
-	lr->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, hop, LOADTEST_RING_DEPTH,
+	lr->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, LOADTEST_RING_DEPTH,
 				       RING_FLAG_FRAME, 0,
 				       sof_mask, eof_mask, NULL, NULL);
 	if (!lr->rx_ring) {
 		ret = -ENOMEM;
 		goto err_tx_ring;
 	}
+
+	pr_info("ring %d: tx_ring->hop=%d rx_ring->hop=%d\n",
+		idx, lr->tx_ring->hop, lr->rx_ring->hop);
 
 	ret = alloc_frames(lr, &lr->tx_frames, lr->frames_per_side, true);
 	if (ret)
@@ -322,10 +331,13 @@ static int loadtest_ring_setup(struct loadtest_dev *dev, int idx)
 	if (ret)
 		goto err_tx_frames;
 
-	/* Wire the actual data path between the peers. Both sides will
-	 * call this with the same arguments — kernel reconciles. */
-	ret = tb_xdomain_enable_paths(xd, hop, lr->tx_ring->hop,
-				      hop, lr->rx_ring->hop);
+	/* Wire the actual data path between the peers. The signature is
+	 *   enable_paths(xd, transmit_path, transmit_ring,
+	 *                receive_path, receive_ring)
+	 * where transmit_* is the local TX side, receive_* is the local
+	 * RX side. Both peers call this; kernel reconciles. */
+	ret = tb_xdomain_enable_paths(xd, lr->out_hop, lr->tx_ring->hop,
+				      lr->in_hop, lr->rx_ring->hop);
 	if (ret) {
 		pr_warn("ring %d: enable_paths failed: %d\n", idx, ret);
 		goto err_rx_frames;
@@ -356,8 +368,8 @@ err_tx_ring:
 	tb_ring_free(lr->tx_ring);
 	lr->tx_ring = NULL;
 err_hopid:
-	tb_xdomain_release_in_hopid(xd, hop);
-	tb_xdomain_release_out_hopid(xd, hop);
+	tb_xdomain_release_in_hopid(xd, in_hop);
+	tb_xdomain_release_out_hopid(xd, out_hop);
 	return ret;
 }
 
@@ -373,8 +385,8 @@ static void loadtest_ring_teardown(struct loadtest_dev *dev, int idx)
 
 	if (lr->tx_ring) {
 		tb_ring_stop(lr->tx_ring);
-		tb_xdomain_disable_paths(xd, lr->hop, lr->tx_ring->hop,
-					 lr->hop, lr->rx_ring->hop);
+		tb_xdomain_disable_paths(xd, lr->out_hop, lr->tx_ring->hop,
+					 lr->in_hop, lr->rx_ring->hop);
 	}
 	if (lr->rx_ring)
 		tb_ring_stop(lr->rx_ring);
@@ -393,8 +405,8 @@ static void loadtest_ring_teardown(struct loadtest_dev *dev, int idx)
 		lr->rx_ring = NULL;
 	}
 
-	tb_xdomain_release_in_hopid(xd, lr->hop);
-	tb_xdomain_release_out_hopid(xd, lr->hop);
+	tb_xdomain_release_in_hopid(xd, lr->in_hop);
+	tb_xdomain_release_out_hopid(xd, lr->out_hop);
 }
 
 /* ----- start / stop the test -------------------------------------- */
@@ -562,34 +574,36 @@ static int loadtest_probe(struct tb_service *svc, const struct tb_service_id *id
 	struct tb_xdomain *xd;
 	int i, ret;
 
-	dev_info(&svc->dev, "loadtest: probe stage 1 (entered)\n");
+	pr_info("loadtest: probe entered, sizeof(loadtest_dev)=%zu, "
+		"offsetof svc=%zu xd=%zu nr_rings=%zu rings=%zu rings_setup=%zu\n",
+		sizeof(struct loadtest_dev),
+		offsetof(struct loadtest_dev, svc),
+		offsetof(struct loadtest_dev, xd),
+		offsetof(struct loadtest_dev, nr_rings),
+		offsetof(struct loadtest_dev, rings),
+		offsetof(struct loadtest_dev, rings_setup));
 
 	xd = tb_service_parent(svc);
-	dev_info(&svc->dev, "loadtest: probe stage 2 (xd=%p)\n", xd);
+	pr_info("loadtest: xd=%p\n", xd);
 
-	if (!xd) {
-		dev_err(&svc->dev, "no xdomain parent\n");
+	if (!xd)
 		return -ENODEV;
-	}
 
-	if (nr_rings < 1 || nr_rings > LOADTEST_MAX_RINGS) {
-		dev_err(&svc->dev, "nr_rings=%d out of range\n", nr_rings);
+	if (nr_rings < 1 || nr_rings > LOADTEST_MAX_RINGS)
 		return -EINVAL;
-	}
 
-	dev_info(&svc->dev,
-		 "loadtest: probe stage 3 — route 0x%llx, link_speed=%u Gb/s, %d rings\n",
-		 xd->route, xd->link_speed, nr_rings);
+	pr_info("loadtest: route 0x%llx, link_speed=%u, %d rings\n",
+		xd->route, xd->link_speed, nr_rings);
 
 	dev = devm_kzalloc(&svc->dev, sizeof(*dev), GFP_KERNEL);
-	dev_info(&svc->dev, "loadtest: probe stage 4 (dev=%p)\n", dev);
+	pr_info("loadtest: dev=%p\n", dev);
 	if (!dev)
 		return -ENOMEM;
 
 	dev->svc = svc;
 	dev->xd = xd;
 	dev->nr_rings = nr_rings;
-	dev_info(&svc->dev, "loadtest: probe stage 5 (struct populated)\n");
+	pr_info("loadtest: struct populated, entering ring loop\n");
 
 	for (i = 0; i < nr_rings; i++) {
 		ret = loadtest_ring_setup(dev, i);
@@ -616,10 +630,9 @@ static int loadtest_probe(struct tb_service *svc, const struct tb_service_id *id
 
 	tb_service_set_drvdata(svc, dev);
 
-	dev_info(&svc->dev, "loadtest: ready, %d ring pair(s) on hops %d..%d. "
-		"Write 1 to debugfs/start to begin TX.\n",
-		dev->nr_rings, LOADTEST_HOP_BASE,
-		LOADTEST_HOP_BASE + dev->nr_rings - 1);
+	dev_info(&svc->dev,
+		"loadtest: ready with %d ring pair(s). Write 1 to debugfs/start to begin TX.\n",
+		dev->nr_rings);
 
 	return 0;
 }
@@ -662,6 +675,17 @@ int usb4_rdma_loadtest_init(struct dentry *parent_dir)
 {
 	struct tb_property_dir *dir;
 	int err;
+
+	pr_info("init: sizeof(loadtest_dev)=%zu, sizeof(loadtest_ring)=%zu, "
+		"offsetof svc=%zu xd=%zu nr_rings=%zu rings=%zu rings_setup=%zu running=%zu\n",
+		sizeof(struct loadtest_dev),
+		sizeof(struct loadtest_ring),
+		offsetof(struct loadtest_dev, svc),
+		offsetof(struct loadtest_dev, xd),
+		offsetof(struct loadtest_dev, nr_rings),
+		offsetof(struct loadtest_dev, rings),
+		offsetof(struct loadtest_dev, rings_setup),
+		offsetof(struct loadtest_dev, running));
 
 	loadtest_root = debugfs_create_dir("loadtest", parent_dir);
 	if (IS_ERR(loadtest_root))
