@@ -40,6 +40,27 @@
 #define U4_DATA_PDF_FRAME_START    1
 #define U4_DATA_PDF_FRAME_END      2
 
+/* Both peers need to agree on the xdomain HopID that wire frames flow
+ * over, otherwise tb_xdomain_enable_paths configures asymmetric routing
+ * and frames sent by peer A arrive at the wrong tag on peer B and get
+ * silently dropped.
+ *
+ * The proper fix is a tb_xdomain_request login dance like
+ * tbnet_login_request does: each side allocates locally, then exchanges
+ * the chosen hopids via xdomain control packets. That's a substantial
+ * piece of work and lands later. For now, we hard-code a single
+ * "rendezvous hop": both peers request the same hopid for both their
+ * TX out path and their RX in path. enable_paths then sees
+ * (local_tx=H, remote_tx=H) on both sides — identical and routable.
+ *
+ * Hopid is well above the TB_PATH_MIN_HOPID=8 floor and above what
+ * thunderbolt_net (which uses 8/9) typically claims, so it's free
+ * regardless of whether thunderbolt_net is loaded.
+ *
+ * If U4_RDV_HOP is already taken on one side, peer attach fails with
+ * EBUSY. Workaround in that case: rmmod thunderbolt_net first. */
+#define U4_RDV_HOP                 16
+
 struct u4_data_frame {
 	struct ring_frame frame;
 	struct u4_data_peer *peer;
@@ -237,9 +258,25 @@ int usb4_rdma_data_attach_peer(struct tb_service *svc)
 	u16 sof_mask = BIT(U4_DATA_PDF_FRAME_START);
 	u16 eof_mask = BIT(U4_DATA_PDF_FRAME_END);
 	int out_hop, in_hop, ret, i;
+	const char *name;
 
 	if (!xd)
 		return -ENODEV;
+
+	/* Deterministic cable selection. The service device name has the
+	 * form "<domain>-<route>.<service>", where domain 0 is the first
+	 * host router and 1 is the second. We always bind to domain 0 so
+	 * both peers pick the same physical cable. Without this, peer A
+	 * might bind on its cable 0 while peer B binds on its cable 1
+	 * (the probes don't fire in a deterministic order across machines)
+	 * and tb_xdomain_enable_paths configures unrelated routes —
+	 * frames sent never arrive. */
+	name = dev_name(&svc->dev);
+	if (name && name[0] != '0') {
+		dev_info(&svc->dev,
+			 "data: skipping non-cable-0 peer (use cable 0 only for now)\n");
+		return 0;
+	}
 
 	write_lock(&the_peer_lock);
 	if (the_peer) {
@@ -256,9 +293,10 @@ int usb4_rdma_data_attach_peer(struct tb_service *svc)
 	p->svc = svc;
 	p->xd = xd;
 
-	out_hop = tb_xdomain_alloc_out_hopid(xd, -1);
+	/* Both peers request the same rendezvous hopid — see U4_RDV_HOP comment. */
+	out_hop = tb_xdomain_alloc_out_hopid(xd, U4_RDV_HOP);
 	if (out_hop < 0) { ret = out_hop; goto err_free; }
-	in_hop = tb_xdomain_alloc_in_hopid(xd, -1);
+	in_hop = tb_xdomain_alloc_in_hopid(xd, U4_RDV_HOP);
 	if (in_hop < 0)  { ret = in_hop; goto err_out; }
 	p->out_hop = out_hop;
 	p->in_hop  = in_hop;
