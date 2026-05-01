@@ -3,7 +3,19 @@
 # By default, builds against the running kernel's headers. Override by
 # setting KDIR=/path/to/linux at make time.
 
-KDIR ?= /lib/modules/$(shell uname -r)/build
+KVER ?= $(shell uname -r)
+KDIR ?= $(shell \
+	if [ -e /lib/modules/$(KVER)/build ]; then \
+		printf '%s\n' /lib/modules/$(KVER)/build; \
+	else \
+		d=$$(find /nix/store -maxdepth 1 -type d \
+			-name '*-linux-$(KVER)-dev' -print -quit 2>/dev/null); \
+		if [ -n "$$d" ]; then \
+			printf '%s\n' "$$d/lib/modules/$(KVER)/build"; \
+		else \
+			printf '%s\n' /lib/modules/$(KVER)/build; \
+		fi; \
+	fi)
 PWD  := $(shell pwd)
 
 obj-m := usb4_rdma.o

@@ -266,6 +266,12 @@ static int __init usb4_rdma_init(void)
 		goto err_debugfs;
 	}
 
+	err = usb4_rdma_data_init(usb4_rdma_debugfs_root);
+	if (err) {
+		pr_err("data path init failed: %d\n", err);
+		goto err_property_dir;
+	}
+
 	/* Register the ib_device before binding existing tb_service devices so
 	 * probe-time peer joins can update the RDMA port state. */
 	if (usb4_rdma_ibdev_init())
@@ -291,6 +297,8 @@ static int __init usb4_rdma_init(void)
 
 err_ibdev:
 	usb4_rdma_ibdev_exit();
+	usb4_rdma_data_exit();
+err_property_dir:
 	usb4_rdma_destroy_property_dir();
 err_debugfs:
 	debugfs_remove_recursive(usb4_rdma_debugfs_root);
@@ -304,6 +312,7 @@ static void __exit usb4_rdma_exit(void)
 	usb4_rdma_loadtest_exit();
 	usb4_rdma_pci_exit();
 	usb4_rdma_ibdev_exit();
+	usb4_rdma_data_exit();
 	usb4_rdma_destroy_property_dir();
 	debugfs_remove_recursive(usb4_rdma_debugfs_root);
 }

@@ -22,7 +22,7 @@
 #include <linux/types.h>
 
 #define U4_WIRE_MAGIC    0x55344452U  /* 'U4DR' */
-#define U4_WIRE_VERSION  2
+#define U4_WIRE_VERSION  3
 
 #define U4_FRAME_SIZE    4096
 #define U4_MAX_PAYLOAD   (U4_FRAME_SIZE - sizeof(struct u4_wire_hdr))
@@ -32,12 +32,15 @@ enum u4_wire_op {
 	U4_OP_SEND_ACK  = 2,  /* ACK from receiver back to sender */
 	U4_OP_RDMA_WRITE = 3, /* one-sided write into peer MR */
 	U4_OP_RDMA_WRITE_WITH_IMM = 4, /* write + receive completion */
-	/* Future: U4_OP_RDMA_READ_REQ/RESP, U4_OP_NAK, ... */
+	U4_OP_RDMA_READ_REQ = 5, /* request remote MR bytes; imm_data=len */
+	U4_OP_RDMA_READ_RESP = 6, /* response payload for one read request */
+	/* Future: U4_OP_NAK, ... */
 };
 
 enum u4_wire_flag {
 	U4_F_LAST    = 1 << 0,  /* last fragment of a multi-frame message */
 	U4_F_SOLICITED = 1 << 1,  /* receiver should generate a completion */
+	U4_F_RAW_STREAM = 1 << 2, /* header-only; following frames are payload */
 };
 
 struct u4_wire_hdr {
@@ -49,7 +52,7 @@ struct u4_wire_hdr {
 	__le32 dest_qp;     /* peer's local QP num */
 	__le32 src_qp;      /* sender's local QP num */
 	__le32 psn;         /* packet sequence number (per-QP) */
-	__le32 length;      /* payload length, bytes */
+	__le32 length;      /* payload length, or next raw-frame length */
 	__le32 imm_data;    /* immediate data as a host-order integer */
 	__le64 remote_addr; /* RDMA remote virtual address */
 	__le32 rkey;        /* RDMA remote key */
