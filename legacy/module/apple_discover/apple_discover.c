@@ -55,7 +55,10 @@ static const char apple_rdma_key[9] = {
 };
 
 /* Apple's RDMA service directory UUID, observed from a macOS 26.3.1 peer. */
-static const uuid_t apple_disc_service_uuid =
+static const uuid_t apple_disc_default_service_uuid =
+	UUID_INIT(0x49bf223e, 0xd4aa, 0x44d7,
+		  0x87, 0x91, 0x50, 0x44, 0x5a, 0xc5, 0x2d, 0x5e);
+static uuid_t apple_disc_service_uuid =
 	UUID_INIT(0x49bf223e, 0xd4aa, 0x44d7,
 		  0x87, 0x91, 0x50, 0x44, 0x5a, 0xc5, 0x2d, 0x5e);
 
@@ -96,6 +99,11 @@ static bool advertise_service;
 module_param(advertise_service, bool, 0444);
 MODULE_PARM_DESC(advertise_service,
 		 "Advertise a local Apple-compatible AD/FA57 service to the peer (default: off)");
+
+static char *service_uuid;
+module_param(service_uuid, charp, 0444);
+MODULE_PARM_DESC(service_uuid,
+		 "Override advertised AD/FA57 service UUID, e.g. the Mac local port UUID");
 
 static bool apple_vendor_only = true;
 module_param(apple_vendor_only, bool, 0444);
@@ -155,6 +163,23 @@ static atomic_t apple_disc_ctrl_logged;
 static atomic_t apple_disc_ctrl_received;
 static DEFINE_SPINLOCK(apple_disc_ctrl_lock);
 static LIST_HEAD(apple_disc_ctrl_list);
+
+static int apple_disc_select_service_uuid(void)
+{
+	apple_disc_service_uuid = apple_disc_default_service_uuid;
+
+	if (service_uuid && *service_uuid) {
+		int ret = uuid_parse(service_uuid, &apple_disc_service_uuid);
+
+		if (ret) {
+			pr_err("invalid service_uuid='%s': %d\n",
+			       service_uuid, ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
 
 static int apple_disc_register_property_dir(void)
 {
@@ -694,6 +719,12 @@ static int __init apple_disc_init(void)
 	if (apple_disc_root)
 		debugfs_create_file("ctrl_log", 0444, apple_disc_root, NULL,
 				    &apple_disc_ctrl_log_fops);
+
+	err = apple_disc_select_service_uuid();
+	if (err) {
+		debugfs_remove_recursive(apple_disc_root);
+		return err;
+	}
 
 	err = apple_disc_register_property_dir();
 	if (err) {
