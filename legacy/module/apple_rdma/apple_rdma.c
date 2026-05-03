@@ -185,6 +185,7 @@ struct ardma_qp {
 	u32 rx_group_base;
 	u32 rx_piece;
 	u32 rx_byte_len;
+	bool rx_tail_pending;
 	bool rx_truncated;
 
 	spinlock_t list_lock;
@@ -510,6 +511,7 @@ static void ardma_complete_rx_wr(struct ardma_qp *qp, enum ib_wc_status status)
 	qp->rx_group_base = 0;
 	qp->rx_piece = 0;
 	qp->rx_byte_len = 0;
+	qp->rx_tail_pending = false;
 	qp->rx_truncated = false;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
 
@@ -527,22 +529,28 @@ static void ardma_complete_rx_wr(struct ardma_qp *qp, enum ib_wc_status status)
 	kfree(r);
 }
 
-static bool ardma_known_piece(u32 piece, u32 len, u32 *offset,
+static bool ardma_known_piece(struct ardma_qp *qp, u32 len, u32 *offset,
 			      bool *group_done)
 {
+	u32 piece = qp->rx_piece;
+
 	*group_done = false;
 
-	if (piece < 15 && len == 252) {
+	if (!qp->rx_tail_pending && piece < 16 && len == 252) {
 		*offset = piece * 0x100;
+		qp->rx_piece++;
 		return true;
 	}
-	if (piece == 15 && len == 12) {
-		*offset = 0x0f00;
+	if (!qp->rx_tail_pending && piece < 16 && len == 12) {
+		*offset = piece * 0x100;
+		qp->rx_tail_pending = true;
 		return true;
 	}
-	if (piece == 16 && len == 240) {
-		*offset = 0x0f10;
+	if (qp->rx_tail_pending && piece < 16 && len == 240) {
+		*offset = piece * 0x100 + 0x10;
 		*group_done = true;
+		qp->rx_tail_pending = false;
+		qp->rx_piece = 0;
 		return true;
 	}
 	return false;
@@ -555,7 +563,7 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	struct ardma_pd *pd;
 	struct ardma_recv_wr *r;
 	unsigned long flags;
-	u32 piece, dst_off, rel_off;
+	u32 dst_off, rel_off;
 	bool group_done;
 	enum ib_wc_status complete_status = IB_WC_SUCCESS;
 	int ret;
@@ -581,22 +589,22 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 		qp->rx_group_base = 0;
 		qp->rx_piece = 0;
 		qp->rx_byte_len = 0;
+		qp->rx_tail_pending = false;
 		qp->rx_truncated = false;
 	}
 
-	if (eof == 1)
+	if (eof == 1) {
 		qp->rx_piece = 0;
+		qp->rx_tail_pending = false;
+	}
 
-	piece = qp->rx_piece;
-	if (ardma_known_piece(piece, len, &rel_off, &group_done)) {
+	if (ardma_known_piece(qp, len, &rel_off, &group_done)) {
 		dst_off = qp->rx_group_base + rel_off;
-		qp->rx_piece++;
-		if (group_done) {
+		if (group_done && eof == 2)
 			qp->rx_group_base += SZ_4K;
-			qp->rx_piece = 0;
-		}
 	} else {
 		dst_off = qp->rx_byte_len;
+		qp->rx_tail_pending = false;
 		atomic64_inc(&peer->rx_bad_shape);
 	}
 	r = qp->rx_wr;
