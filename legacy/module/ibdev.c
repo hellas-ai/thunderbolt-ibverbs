@@ -57,10 +57,12 @@
 #include <linux/netdevice.h>
 #include <linux/mutex.h>
 #include <linux/workqueue.h>
+#include <linux/hardirq.h>
 #include <linux/dma-mapping.h>
 #include <linux/idr.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
+#include <linux/string.h>
 #include <net/addrconf.h>
 #include <net/net_namespace.h>
 
@@ -80,6 +82,13 @@
 #define U4_IB_GRH_NEXT_HDR     0x1b
 #define U4_MAX_READ_CTX        128
 #define U4_SEND_CREDIT_TIMEOUT_MS 5000
+#define U4R_MR_DMA_CACHE_SLOTS 4
+#define U4_DEFERRED_ACK_RETRY_DELAY 1
+
+enum u4r_rail_mode {
+	U4R_RAIL_SINGLE = 0,
+	U4R_RAIL_LANE,
+};
 
 enum {
 	U4_RECV_CREDIT_NONE = 0,
@@ -120,6 +129,11 @@ static bool send_ack_debug;
 module_param(send_ack_debug, bool, 0644);
 MODULE_PARM_DESC(send_ack_debug,
 		 "log RC SEND credit ACK state transitions for debugging");
+
+static char *rail_mode = "single";
+module_param(rail_mode, charp, 0444);
+MODULE_PARM_DESC(rail_mode,
+		 "verbs rail exposure: single = one usb4_rdma device over all lanes; lane = one ib_device per active NHI lane");
 #define U4_QPN_MIN             2
 #define U4_QPN_MAX             0x00ffffff
 #define U4_MAX_MSG_SIZE        SZ_1G
@@ -128,6 +142,12 @@ MODULE_PARM_DESC(send_ack_debug,
 
 struct usb4_rdma_ucontext {
 	struct ib_ucontext base;
+};
+
+struct u4r_mr_dma_cache_entry {
+	struct device *dev;
+	enum dma_data_direction dir;
+	dma_addr_t *addrs;
 };
 
 struct usb4_rdma_mr {
@@ -142,9 +162,7 @@ struct usb4_rdma_mr {
 	int npages;
 	struct page **pages;
 	struct mutex dma_lock;
-	struct device *dma_dev;
-	dma_addr_t *dma_addrs;
-	bool dma_mapped;
+	struct u4r_mr_dma_cache_entry dma_cache[U4R_MR_DMA_CACHE_SLOTS];
 };
 
 struct usb4_rdma_pd {
@@ -206,8 +224,38 @@ struct usb4_rdma_send_ctx {
 	enum ib_wc_opcode opcode;
 };
 
+/* UC SEND deferral.
+ *
+ * u4r_send_one blocks waiting for peer-recv credit. JACCL (and any
+ * pipelined caller) calls ibv_post_send from inside its poll-completion
+ * loop; if post_send blocks there, the caller can't process recv
+ * completions or post new recv WRs, so the peer's credit pool never
+ * refills and both ends deadlock. Standard IB semantics make post_send
+ * non-blocking. We restore that for UC by capturing the WR here and
+ * deferring the actual transmission to a per-QP workqueue. */
+struct u4r_deferred_send {
+	struct list_head list;
+	enum ib_wr_opcode opcode;
+	int send_flags;
+	u64 wr_id;
+	struct ib_cqe *wr_cqe;
+	int num_sge;
+	struct ib_sge sges[U4_MAX_SGE];
+	u64 remote_addr;	/* IB_WR_RDMA_* only */
+	u32 rkey;		/* IB_WR_RDMA_* only */
+	__be32 imm_data;	/* IB_WR_RDMA_WRITE_WITH_IMM only */
+};
+
+struct u4r_deferred_ack {
+	struct list_head list;
+	u32 dest_qp;
+	u32 psn;
+	__be32 status;
+};
+
 struct usb4_rdma_qp {
 	struct ib_qp base;
+	struct u4_data_peer *rail;
 	enum ib_qp_type qp_type;
 	enum ib_qp_state state;
 	struct ib_qp_attr attr;
@@ -241,17 +289,64 @@ struct usb4_rdma_qp {
 	struct usb4_rdma_recv_wr *in_progress_recv;
 	u32 recv_byte_offset;
 	bool recv_truncated;
+
+	/* UC SEND deferral queue + worker (see struct u4r_deferred_send). */
+	struct list_head deferred_sends;
+	spinlock_t deferred_send_lock;
+	struct work_struct deferred_send_work;
+
+	/* RC SEND ACKs generated from irq_work must not disappear when the
+	 * immediate atomic TX path is temporarily full. */
+	struct list_head deferred_acks;
+	spinlock_t deferred_ack_lock;
+	struct delayed_work deferred_ack_work;
+	bool deferred_ack_active;
+	bool deferred_ack_stopping;
 };
 
 struct usb4_rdma_ib_dev {
 	struct ib_device base;
+	struct list_head dev_link;
+	struct u4_data_peer *rail;
 	atomic_t active_peers;
 	struct net_device *netdev;	/* RoCEv2 IP→GID stub; see netdev.c */
 };
 
 static struct usb4_rdma_ib_dev *u4r_dev;
+static LIST_HEAD(u4r_dev_list);
+static DEFINE_MUTEX(u4r_dev_list_lock);
+static enum u4r_rail_mode u4r_mode = U4R_RAIL_SINGLE;
 static atomic_t u4r_lkey_counter = ATOMIC_INIT(1);
 static DEFINE_IDA(u4r_qpn_ida);
+
+static int u4r_parse_rail_mode(void)
+{
+	if (sysfs_streq(rail_mode, "single")) {
+		u4r_mode = U4R_RAIL_SINGLE;
+		return 0;
+	}
+	if (sysfs_streq(rail_mode, "lane")) {
+		u4r_mode = U4R_RAIL_LANE;
+		return 0;
+	}
+	pr_err("invalid rail_mode=%s (expected single or lane)\n", rail_mode);
+	return -EINVAL;
+}
+
+static bool u4r_lane_mode(void)
+{
+	return u4r_mode == U4R_RAIL_LANE;
+}
+
+static bool u4r_warn_process_path_from_atomic(const char *where)
+{
+	if (!WARN_ON_ONCE(in_interrupt()))
+		return false;
+
+	pr_warn_ratelimited("%s called from interrupt context; this path may sleep\n",
+			    where);
+	return true;
+}
 
 /* ----- helpers: PD ↔ MR lookup ------------------------------------ */
 
@@ -299,21 +394,29 @@ static void u4r_mr_put(struct usb4_rdma_mr *mr)
 		wake_up(&mr->ref_wait);
 }
 
+static void u4r_mr_unmap_dma_entry(struct usb4_rdma_mr *mr,
+				   struct u4r_mr_dma_cache_entry *entry)
+{
+	int i;
+
+	if (!entry->dev)
+		return;
+
+	for (i = 0; i < mr->npages; i++)
+		dma_unmap_page(entry->dev, entry->addrs[i], PAGE_SIZE,
+			       entry->dir);
+	kvfree(entry->addrs);
+	put_device(entry->dev);
+	entry->dev = NULL;
+	entry->addrs = NULL;
+}
+
 static void u4r_mr_unmap_dma_locked(struct usb4_rdma_mr *mr)
 {
 	int i;
 
-	if (!mr->dma_mapped)
-		return;
-
-	for (i = 0; i < mr->npages; i++)
-		dma_unmap_page(mr->dma_dev, mr->dma_addrs[i], PAGE_SIZE,
-			       DMA_TO_DEVICE);
-	kvfree(mr->dma_addrs);
-	usb4_rdma_data_dma_dev_put(mr->dma_dev);
-	mr->dma_addrs = NULL;
-	mr->dma_dev = NULL;
-	mr->dma_mapped = false;
+	for (i = 0; i < U4R_MR_DMA_CACHE_SLOTS; i++)
+		u4r_mr_unmap_dma_entry(mr, &mr->dma_cache[i]);
 }
 
 static void u4r_mr_unmap_dma(struct usb4_rdma_mr *mr)
@@ -323,52 +426,65 @@ static void u4r_mr_unmap_dma(struct usb4_rdma_mr *mr)
 	mutex_unlock(&mr->dma_lock);
 }
 
-static int u4r_mr_ensure_dma_mapped(struct usb4_rdma_mr *mr)
+static int u4r_mr_resolve_dma(void *ctx, struct device *dma_dev,
+			      u32 page_idx, u32 page_off, u32 length,
+			      enum dma_data_direction dir,
+			      dma_addr_t *dma_addr)
 {
-	struct device *dma_dev;
+	struct usb4_rdma_mr *mr = ctx;
+	struct u4r_mr_dma_cache_entry *free_entry = NULL;
+	struct u4r_mr_dma_cache_entry *entry;
 	dma_addr_t *addrs;
-	int i, ret = 0;
+	int i;
 
-	dma_dev = usb4_rdma_data_dma_dev_get();
-	if (!dma_dev)
-		return -ENOTCONN;
+	if (u4r_warn_process_path_from_atomic(__func__))
+		return -EWOULDBLOCK;
+	if (!dma_dev || !dma_addr || page_idx >= mr->npages ||
+	    page_off >= PAGE_SIZE || length > PAGE_SIZE - page_off)
+		return -EINVAL;
 
 	mutex_lock(&mr->dma_lock);
-	if (mr->dma_mapped) {
-		if (mr->dma_dev == dma_dev)
-			goto out;
-		u4r_mr_unmap_dma_locked(mr);
+	for (i = 0; i < U4R_MR_DMA_CACHE_SLOTS; i++) {
+		entry = &mr->dma_cache[i];
+		if (entry->dev == dma_dev && entry->dir == dir) {
+			*dma_addr = entry->addrs[page_idx] + page_off;
+			mutex_unlock(&mr->dma_lock);
+			return 0;
+		}
+		if (!entry->dev && !free_entry)
+			free_entry = entry;
+	}
+	if (!free_entry) {
+		mutex_unlock(&mr->dma_lock);
+		return -EAGAIN;
 	}
 
 	addrs = kvcalloc(mr->npages, sizeof(*addrs), GFP_KERNEL);
-	if (!addrs) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	if (!addrs)
+		goto fallback;
 
 	for (i = 0; i < mr->npages; i++) {
 		addrs[i] = dma_map_page(dma_dev, mr->pages[i], 0, PAGE_SIZE,
-					DMA_TO_DEVICE);
+					dir);
 		if (dma_mapping_error(dma_dev, addrs[i])) {
 			while (--i >= 0)
 				dma_unmap_page(dma_dev, addrs[i], PAGE_SIZE,
-					       DMA_TO_DEVICE);
+					       dir);
 			kvfree(addrs);
-			ret = -EIO;
-			goto out;
+			goto fallback;
 		}
 	}
 
-	mr->dma_dev = dma_dev;
-	mr->dma_addrs = addrs;
-	mr->dma_mapped = true;
-	dma_dev = NULL;
-
-out:
+	free_entry->dev = get_device(dma_dev);
+	free_entry->dir = dir;
+	free_entry->addrs = addrs;
+	*dma_addr = addrs[page_idx] + page_off;
 	mutex_unlock(&mr->dma_lock);
-	if (dma_dev)
-		usb4_rdma_data_dma_dev_put(dma_dev);
-	return ret;
+	return 0;
+
+fallback:
+	mutex_unlock(&mr->dma_lock);
+	return -EAGAIN;
 }
 
 static void u4r_qp_get(struct usb4_rdma_qp *qp)
@@ -486,12 +602,20 @@ u4r_find_send_ctx_locked(struct usb4_rdma_qp *qp, u32 psn)
 
 static bool u4r_qp_can_advertise_recv_credits(const struct usb4_rdma_qp *qp)
 {
-	if (qp->qp_type != IB_QPT_RC || !qp->registered ||
+	/* Soft credit flow control was originally RC-only. We extend it to
+	 * UC because Apple's JACCL was designed assuming the wire enforces
+	 * "sender stalls until peer has matching recv WR posted" (TN3205
+	 * docs Apple's hardware behavior); JACCL races and silently drops
+	 * frames on strict-textbook UC. Re-using our RC credit machinery
+	 * for UC fixes the JACCL bench hang without needing wire changes
+	 * — both ends still need to be running this driver to benefit. */
+	if ((qp->qp_type != IB_QPT_RC && qp->qp_type != IB_QPT_UC) ||
+	    !qp->registered ||
 	    !qp->attr.dest_qp_num)
 		return false;
 
-	return qp->state == IB_QPS_RTS || qp->state == IB_QPS_SQD ||
-	       qp->state == IB_QPS_SQE;
+	return qp->state == IB_QPS_RTR || qp->state == IB_QPS_RTS ||
+	       qp->state == IB_QPS_SQD || qp->state == IB_QPS_SQE;
 }
 
 static struct usb4_rdma_recv_wr *
@@ -505,7 +629,7 @@ u4r_pop_recv_wr_locked(struct usb4_rdma_qp *qp)
 		return NULL;
 
 	list_del(&r->list);
-	if (qp->qp_type == IB_QPT_RC) {
+	if (qp->qp_type == IB_QPT_RC || qp->qp_type == IB_QPT_UC) {
 		if (qp->recv_posted_count)
 			qp->recv_posted_count--;
 		if (qp->recv_credits_advertised)
@@ -513,6 +637,9 @@ u4r_pop_recv_wr_locked(struct usb4_rdma_qp *qp)
 	}
 	return r;
 }
+
+static void u4r_deferred_send_work_fn(struct work_struct *w);
+static void u4r_deferred_ack_work_fn(struct work_struct *w);
 
 static void u4r_advertise_recv_credits(struct usb4_rdma_qp *qp)
 {
@@ -534,7 +661,7 @@ static void u4r_advertise_recv_credits(struct usb4_rdma_qp *qp)
 	if (!credits)
 		return;
 
-	ret = usb4_rdma_data_send(U4_OP_RECV_CREDIT, qp->base.qp_num,
+	ret = usb4_rdma_data_send(qp->rail, U4_OP_RECV_CREDIT, qp->base.qp_num,
 				  dest_qp, 0, U4_F_LAST,
 				  cpu_to_be32(credits), 0, 0,
 				  NULL, NULL, 0);
@@ -568,7 +695,14 @@ static int u4r_reserve_remote_recv_credit(struct usb4_rdma_qp *qp)
 			credits = atomic_read(&qp->remote_recv_credits);
 		}
 
-		if (atomic_cmpxchg(&qp->remote_recv_credit_state,
+		/* RC tolerates losing the bootstrap probe because RC ACK/retry
+		 * recovers it. UC has no retry: if we send before the peer has
+		 * a recv WR posted (and thus advertised a credit to us), the
+		 * peer's wire-level RX path silently drops the frame and the
+		 * application hangs. So skip the probe path for UC and wait
+		 * unconditionally for the peer's first credit advertisement. */
+		if (qp->qp_type != IB_QPT_UC &&
+		    atomic_cmpxchg(&qp->remote_recv_credit_state,
 				   U4_RECV_CREDIT_NONE,
 				   U4_RECV_CREDIT_PROBE_USED) ==
 		    U4_RECV_CREDIT_NONE) {
@@ -968,10 +1102,17 @@ static int u4r_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 			 struct ib_udata *udata)
 {
 	struct usb4_rdma_qp *qp = container_of(ibqp, struct usb4_rdma_qp, base);
+	struct usb4_rdma_ib_dev *u4r =
+		container_of(ibqp->device, struct usb4_rdma_ib_dev, base);
 	int qpn, ret;
 
-	if (attr->qp_type != IB_QPT_RC && attr->qp_type != IB_QPT_GSI)
+	if (attr->qp_type != IB_QPT_RC && attr->qp_type != IB_QPT_GSI &&
+	    attr->qp_type != IB_QPT_UC)
 		return -EOPNOTSUPP;
+
+	qp->rail = u4r->rail;
+	if (qp->rail && !usb4_rdma_data_rail_get(qp->rail))
+		return -ENOTCONN;
 
 	qp->qp_type = attr->qp_type;
 	qp->state = attr->qp_type == IB_QPT_GSI ? IB_QPS_RTS : IB_QPS_RESET;
@@ -995,17 +1136,31 @@ static int u4r_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	spin_lock_init(&qp->read_lock);
 	INIT_LIST_HEAD(&qp->read_ctxs);
 	qp->read_depth = 0;
+	spin_lock_init(&qp->deferred_send_lock);
+	INIT_LIST_HEAD(&qp->deferred_sends);
+	INIT_WORK(&qp->deferred_send_work, u4r_deferred_send_work_fn);
+	spin_lock_init(&qp->deferred_ack_lock);
+	INIT_LIST_HEAD(&qp->deferred_acks);
+	INIT_DELAYED_WORK(&qp->deferred_ack_work, u4r_deferred_ack_work_fn);
+	qp->deferred_ack_active = false;
+	qp->deferred_ack_stopping = false;
 	if (attr->qp_type == IB_QPT_GSI) {
 		ibqp->qp_num = 1;
-		ret = usb4_rdma_data_register_qp(ibqp->qp_num, qp);
-		if (ret)
+		ret = usb4_rdma_data_register_qp(ibqp->qp_num, qp, qp->rail);
+		if (ret) {
+			usb4_rdma_data_rail_put(qp->rail);
+			qp->rail = NULL;
 			return ret;
+		}
 		qp->registered = true;
 	} else {
 		qpn = ida_alloc_range(&u4r_qpn_ida, U4_QPN_MIN, U4_QPN_MAX,
 				      GFP_KERNEL);
-		if (qpn < 0)
+		if (qpn < 0) {
+			usb4_rdma_data_rail_put(qp->rail);
+			qp->rail = NULL;
 			return qpn;
+		}
 		ibqp->qp_num = qpn;
 		qp->qpn_allocated = true;
 	}
@@ -1013,7 +1168,8 @@ static int u4r_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	/* Register RC QPs with the data layer on RESET->INIT, matching
 	 * verbs lifetime. QP1 is fixed-numbered and registered immediately. */
 	pr_info("create_qp ok (%s qpn=%u, max_send_wr=%u max_recv_wr=%u)\n",
-		attr->qp_type == IB_QPT_GSI ? "GSI" : "RC",
+		attr->qp_type == IB_QPT_GSI ? "GSI" :
+		(attr->qp_type == IB_QPT_UC ? "UC" : "RC"),
 		ibqp->qp_num, attr->cap.max_send_wr, attr->cap.max_recv_wr);
 	return 0;
 }
@@ -1058,9 +1214,14 @@ static int u4r_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 		if (attr_mask & IB_QP_PATH_MTU)  a->path_mtu = attr->path_mtu;
 	}
 
-	if (qp->qp_type == IB_QPT_RC && !qp->registered &&
+	/* UC and RC follow the same lifecycle from the data-layer's
+	 * perspective: register with the dispatcher on RESET → INIT, unregister
+	 * on RESET/ERR. UC just doesn't generate ACK frames or use credits. */
+	if ((qp->qp_type == IB_QPT_RC || qp->qp_type == IB_QPT_UC) &&
+	    !qp->registered &&
 	    old == IB_QPS_RESET && qp->state == IB_QPS_INIT) {
-		int ret = usb4_rdma_data_register_qp(ibqp->qp_num, qp);
+		int ret = usb4_rdma_data_register_qp(ibqp->qp_num, qp,
+						     qp->rail);
 
 		if (ret)
 			return ret;
@@ -1068,11 +1229,15 @@ static int u4r_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	}
 	if (qp->qp_type == IB_QPT_RC && flush)
 		u4r_flush_qp(qp);
-	if (qp->qp_type == IB_QPT_RC)
+	/* Soft credit flow control runs for both RC and UC. RC needs it for
+	 * RNR semantics; UC needs it because Apple-style JACCL races on
+	 * out-of-order recv-post timing without it (silent drop on the wire). */
+	if (qp->qp_type == IB_QPT_RC || qp->qp_type == IB_QPT_UC)
 		u4r_advertise_recv_credits(qp);
-	if (qp->qp_type == IB_QPT_RC && qp->registered &&
+	if ((qp->qp_type == IB_QPT_RC || qp->qp_type == IB_QPT_UC) &&
+	    qp->registered &&
 	    (qp->state == IB_QPS_RESET || qp->state == IB_QPS_ERR)) {
-		usb4_rdma_data_unregister_qp(ibqp->qp_num);
+		usb4_rdma_data_unregister_qp(ibqp->qp_num, qp->rail);
 		qp->registered = false;
 		atomic_set(&qp->remote_recv_credits, 0);
 		atomic_set(&qp->remote_recv_credit_state, U4_RECV_CREDIT_NONE);
@@ -1112,10 +1277,40 @@ static int u4r_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	unsigned long flags;
 
 	if (qp->registered) {
-		usb4_rdma_data_unregister_qp(ibqp->qp_num);
+		usb4_rdma_data_unregister_qp(ibqp->qp_num, qp->rail);
 		qp->registered = false;
 	}
+	WRITE_ONCE(qp->deferred_ack_stopping, true);
+	cancel_delayed_work_sync(&qp->deferred_ack_work);
+	{
+		struct u4r_deferred_ack *a, *atmp;
+
+		spin_lock_irqsave(&qp->deferred_ack_lock, flags);
+		list_for_each_entry_safe(a, atmp, &qp->deferred_acks, list) {
+			list_del(&a->list);
+			kfree(a);
+		}
+		spin_unlock_irqrestore(&qp->deferred_ack_lock, flags);
+	}
 	wait_event(qp->ref_wait, refcount_read(&qp->refs) == 1);
+
+	/* The deferred-send worker may be blocked on credit reservation
+	 * via wait_event_interruptible_timeout; ERR + wake unblocks it,
+	 * cancel_work_sync waits for the worker to exit. After that
+	 * nothing new can queue and we can free remaining entries. */
+	if (qp->state != IB_QPS_ERR && qp->state != IB_QPS_RESET) {
+		qp->state = IB_QPS_ERR;
+		wake_up(&qp->send_credit_wait);
+	}
+	cancel_work_sync(&qp->deferred_send_work);
+	{
+		struct u4r_deferred_send *d, *dtmp;
+
+		list_for_each_entry_safe(d, dtmp, &qp->deferred_sends, list) {
+			list_del(&d->list);
+			kfree(d);
+		}
+	}
 
 	spin_lock_irqsave(&qp->send_comp_lock, flags);
 	list_for_each_entry_safe(send_ctx, tmp_send_ctx, &qp->send_ctxs, list) {
@@ -1152,6 +1347,8 @@ static int u4r_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	 * immediate QPN reuse lets those stale frames mutate a new QP's credit
 	 * state. The 24-bit QPN space is large enough for debug/runtime use,
 	 * and ida_destroy() releases the bitmap when the module unloads. */
+	usb4_rdma_data_rail_put(qp->rail);
+	qp->rail = NULL;
 	return 0;
 }
 
@@ -1339,7 +1536,7 @@ static int u4r_gsi_send_one(struct usb4_rdma_qp *qp,
 		return ret;
 
 	mutex_lock(&qp->send_lock);
-	ret = usb4_rdma_data_send(U4_OP_SEND, qp->base.qp_num,
+	ret = usb4_rdma_data_send(qp->rail, U4_OP_SEND, qp->base.qp_num,
 				  uwr->remote_qpn, qp->send_psn++,
 				  U4_F_LAST | U4_F_SOLICITED,
 				  0, 0, 0, u4r_fill_gsi_mad, &ctx,
@@ -1438,8 +1635,10 @@ static void u4r_zc_send_cursor_fini(struct u4r_zc_send_cursor *c)
 }
 
 static int u4r_zc_next_send_page(void *opaque, struct page **page,
-				 u32 *page_off, u32 *length,
-				 dma_addr_t *dma_addr, bool *dma_mapped,
+				 u32 *page_idx_out, u32 *page_off,
+				 u32 *length,
+				 usb4_rdma_data_dma_resolve_fn *resolve,
+				 void **resolve_ctx,
 				 usb4_rdma_data_done_fn *done,
 				 void **done_ctx)
 {
@@ -1483,10 +1682,11 @@ static int u4r_zc_next_send_page(void *opaque, struct page **page,
 	/* Hand the done callback an extra MR reference; it'll drop it via
 	 * u4r_mr_put_done when this segment's DMA completes. */
 	refcount_inc(&c->cur_mr->refs);
+	*page_idx_out = page_idx;
+	*resolve = u4r_mr_resolve_dma;
+	*resolve_ctx = c->cur_mr;
 	*done = u4r_mr_put_done;
 	*done_ctx = c->cur_mr;
-	*dma_addr = 0;
-	*dma_mapped = false;
 	return 0;
 }
 
@@ -1506,7 +1706,13 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 		.inline_data = !!(wr->send_flags & IB_SEND_INLINE),
 	};
 	struct usb4_rdma_send_ctx *sctx = NULL;
-	bool ack_req = qp->sq_sig_all || (wr->send_flags & IB_SEND_SIGNALED);
+	bool is_uc = (qp->qp_type == IB_QPT_UC);
+	/* UC has no wire-level ACK and no credit semantics. The caller decides
+	 * whether the WR should generate a CQE; for UC we always post the CQE
+	 * inline in u4r_post_send (see defer_wc logic), so ack_req is irrelevant
+	 * to the UC SEND path. */
+	bool ack_req = !is_uc &&
+		(qp->sq_sig_all || (wr->send_flags & IB_SEND_SIGNALED));
 	bool credit_reserved = false;
 	bool data_started = false;
 	u32 total_len, sent = 0;
@@ -1519,6 +1725,10 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 	if (ret)
 		return ret;
 
+	/* Reserve a recv credit on the peer before transmitting. UC needs
+	 * this too despite being "unreliable" — without it the peer's
+	 * recv queue can be empty when our SEND lands, which causes a
+	 * silent drop (JACCL hang). We re-use RC's credit machinery. */
 	ret = u4r_reserve_remote_recv_credit(qp);
 	if (ret) {
 		if (ret < 0)
@@ -1556,7 +1766,7 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 					qp->base.qp_num, qp->attr.dest_qp_num,
 					psn);
 		}
-		ret = usb4_rdma_data_send(U4_OP_SEND, qp->base.qp_num,
+		ret = usb4_rdma_data_send(qp->rail, U4_OP_SEND, qp->base.qp_num,
 					  qp->attr.dest_qp_num, psn,
 					  U4_F_LAST |
 					  (ack_req ? U4_F_SOLICITED : 0),
@@ -1591,7 +1801,7 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 	 * which serializes through one peer and preserves PSN order.
 	 */
 	if (!cursor.inline_data && u4r_use_tx_zcopy(total_len) &&
-	    usb4_rdma_data_active_lane_count() == 1) {
+	    (qp->rail || usb4_rdma_data_active_lane_count() == 1)) {
 		struct u4r_zc_send_cursor zc;
 		u32 psn = qp->send_psn++;
 
@@ -1608,7 +1818,7 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 					psn, total_len);
 		}
 		u4r_zc_send_cursor_init(&zc, pd, wr->sg_list, wr->num_sge);
-		ret = usb4_rdma_data_send_page_stream(U4_OP_SEND,
+		ret = usb4_rdma_data_send_page_stream(qp->rail, U4_OP_SEND,
 						      qp->base.qp_num,
 						      qp->attr.dest_qp_num,
 						      psn,
@@ -1650,7 +1860,7 @@ static int u4r_send_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 					psn, total_len);
 		}
 
-		ret = usb4_rdma_data_send(U4_OP_SEND, qp->base.qp_num,
+		ret = usb4_rdma_data_send(qp->rail, U4_OP_SEND, qp->base.qp_num,
 					  qp->attr.dest_qp_num,
 					  psn, wire_flags,
 					  0, 0, 0, u4r_fill_from_sges,
@@ -1710,7 +1920,7 @@ static int u4r_write_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 
 	mutex_lock(&qp->send_lock);
 	if (total_len == 0) {
-		ret = usb4_rdma_data_send(opcode, qp->base.qp_num,
+		ret = usb4_rdma_data_send(qp->rail, opcode, qp->base.qp_num,
 					  qp->attr.dest_qp_num,
 					  qp->send_psn++, U4_F_LAST,
 					  imm_data, rwr->remote_addr,
@@ -1722,7 +1932,7 @@ static int u4r_write_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 		struct u4r_zc_send_cursor zc;
 
 		u4r_zc_send_cursor_init(&zc, pd, wr->sg_list, wr->num_sge);
-		ret = usb4_rdma_data_send_page_stream(opcode,
+		ret = usb4_rdma_data_send_page_stream(qp->rail, opcode,
 						      qp->base.qp_num,
 						      qp->attr.dest_qp_num,
 						      qp->send_psn++,
@@ -1740,7 +1950,7 @@ static int u4r_write_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 		bool last = sent + chunk == total_len;
 		u8 flags = last ? U4_F_LAST : 0;
 
-		ret = usb4_rdma_data_send(opcode, qp->base.qp_num,
+		ret = usb4_rdma_data_send(qp->rail, opcode, qp->base.qp_num,
 					  qp->attr.dest_qp_num,
 					  qp->send_psn++, flags, imm_data,
 					  rwr->remote_addr + sent, rwr->rkey,
@@ -1799,7 +2009,7 @@ static int u4r_read_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 	qp->read_depth++;
 	spin_unlock_irqrestore(&qp->read_lock, flags);
 
-	ret = usb4_rdma_data_send(U4_OP_RDMA_READ_REQ, qp->base.qp_num,
+	ret = usb4_rdma_data_send(qp->rail, U4_OP_RDMA_READ_REQ, qp->base.qp_num,
 				  qp->attr.dest_qp_num, ctx->psn,
 				  U4_F_LAST, cpu_to_be32(total_len),
 				  rwr->remote_addr, rwr->rkey,
@@ -1815,6 +2025,257 @@ static int u4r_read_one(struct usb4_rdma_qp *qp, const struct ib_send_wr *wr)
 	}
 	mutex_unlock(&qp->send_lock);
 	return ret;
+}
+
+/* Worker that drains qp->deferred_sends. Runs in process context, so
+ * blocking on credit reservation in u4r_send_one is fine — the user
+ * thread that called post_send returned long ago. */
+static void u4r_deferred_send_work_fn(struct work_struct *w)
+{
+	struct usb4_rdma_qp *qp = container_of(w, struct usb4_rdma_qp,
+					       deferred_send_work);
+	struct usb4_rdma_cq *send_cq =
+		container_of(qp->base.send_cq, struct usb4_rdma_cq, base);
+	struct u4r_deferred_send *d;
+	unsigned long flags;
+
+	for (;;) {
+		struct ib_send_wr swr = {};
+		struct ib_rdma_wr rwr = {};
+		const struct ib_send_wr *wr_ptr;
+		enum ib_wc_opcode wc_opcode;
+		bool signaled;
+		int ret;
+
+		spin_lock_irqsave(&qp->deferred_send_lock, flags);
+		d = list_first_entry_or_null(&qp->deferred_sends,
+					     struct u4r_deferred_send, list);
+		if (d)
+			list_del(&d->list);
+		spin_unlock_irqrestore(&qp->deferred_send_lock, flags);
+
+		if (!d)
+			break;
+
+		signaled = qp->sq_sig_all ||
+			   (d->send_flags & IB_SEND_SIGNALED);
+
+		if (qp->state != IB_QPS_RTS && qp->state != IB_QPS_SQD &&
+		    qp->state != IB_QPS_SQE) {
+			if (signaled) {
+				struct ib_wc wc = {};
+
+				wc.wr_id = d->wr_id;
+				wc.wr_cqe = d->wr_cqe;
+				wc.status = IB_WC_WR_FLUSH_ERR;
+				wc.opcode = (d->opcode == IB_WR_SEND) ?
+					    IB_WC_SEND : IB_WC_RDMA_WRITE;
+				wc.qp = &qp->base;
+				u4r_cq_push_wc(send_cq, &wc);
+			}
+			kfree(d);
+			continue;
+		}
+
+		if (d->opcode == IB_WR_SEND) {
+			swr.wr_id = d->wr_id;
+			swr.wr_cqe = d->wr_cqe;
+			swr.sg_list = d->sges;
+			swr.num_sge = d->num_sge;
+			swr.opcode = d->opcode;
+			swr.send_flags = d->send_flags;
+			wr_ptr = &swr;
+			wc_opcode = IB_WC_SEND;
+			ret = u4r_send_one(qp, wr_ptr);
+		} else {
+			rwr.wr.wr_id = d->wr_id;
+			rwr.wr.wr_cqe = d->wr_cqe;
+			rwr.wr.sg_list = d->sges;
+			rwr.wr.num_sge = d->num_sge;
+			rwr.wr.opcode = d->opcode;
+			rwr.wr.send_flags = d->send_flags;
+			rwr.wr.ex.imm_data = d->imm_data;
+			rwr.remote_addr = d->remote_addr;
+			rwr.rkey = d->rkey;
+			wr_ptr = &rwr.wr;
+			wc_opcode = IB_WC_RDMA_WRITE;
+			ret = u4r_write_one(qp, wr_ptr);
+		}
+
+		if (signaled) {
+			struct ib_wc wc = {};
+
+			wc.wr_id = d->wr_id;
+			wc.wr_cqe = d->wr_cqe;
+			wc.status = ret ? IB_WC_GENERAL_ERR : IB_WC_SUCCESS;
+			wc.opcode = wc_opcode;
+			wc.qp = &qp->base;
+			u4r_cq_push_wc(send_cq, &wc);
+		}
+		if (ret)
+			pr_warn_ratelimited("deferred send[qp=%u]: failed %d\n",
+					    qp->base.qp_num, ret);
+		kfree(d);
+	}
+}
+
+static int u4r_capture_deferred_send(struct usb4_rdma_qp *qp,
+				     const struct ib_send_wr *wr)
+{
+	struct u4r_deferred_send *d;
+	unsigned long flags;
+
+	if (wr->num_sge > U4_MAX_SGE)
+		return -EINVAL;
+	/* Inline data would need a private copy because the user buffer
+	 * can be reused after post_send returns. JACCL doesn't use inline
+	 * (max_inline_data=0); reject if anyone tries it for now. */
+	if (wr->send_flags & IB_SEND_INLINE)
+		return -EOPNOTSUPP;
+
+	d = kzalloc(sizeof(*d), GFP_KERNEL);
+	if (!d)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&d->list);
+	d->opcode = wr->opcode;
+	d->send_flags = wr->send_flags;
+	d->wr_id = wr->wr_id;
+	d->wr_cqe = wr->wr_cqe;
+	d->num_sge = wr->num_sge;
+	if (wr->num_sge && wr->sg_list)
+		memcpy(d->sges, wr->sg_list,
+		       sizeof(d->sges[0]) * wr->num_sge);
+	if (wr->opcode == IB_WR_RDMA_WRITE ||
+	    wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM) {
+		const struct ib_rdma_wr *rwr = rdma_wr(wr);
+
+		d->remote_addr = rwr->remote_addr;
+		d->rkey = rwr->rkey;
+	}
+	if (wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM)
+		d->imm_data = wr->ex.imm_data;
+
+	spin_lock_irqsave(&qp->deferred_send_lock, flags);
+	list_add_tail(&d->list, &qp->deferred_sends);
+	spin_unlock_irqrestore(&qp->deferred_send_lock, flags);
+
+	queue_work(system_unbound_wq, &qp->deferred_send_work);
+	return 0;
+}
+
+static bool u4r_deferred_ack_pending(struct usb4_rdma_qp *qp)
+{
+	unsigned long flags;
+	bool pending;
+
+	spin_lock_irqsave(&qp->deferred_ack_lock, flags);
+	pending = qp->deferred_ack_active ||
+		  !list_empty(&qp->deferred_acks);
+	spin_unlock_irqrestore(&qp->deferred_ack_lock, flags);
+	return pending;
+}
+
+static bool u4r_can_send_deferred_ack(const struct usb4_rdma_qp *qp)
+{
+	enum ib_qp_state state = READ_ONCE(qp->state);
+
+	if (READ_ONCE(qp->deferred_ack_stopping) || !READ_ONCE(qp->registered))
+		return false;
+
+	return state == IB_QPS_RTS || state == IB_QPS_SQD ||
+	       state == IB_QPS_SQE;
+}
+
+static int u4r_queue_deferred_ack(struct usb4_rdma_qp *qp, u32 dest_qp,
+				  u32 psn, __be32 status)
+{
+	struct u4r_deferred_ack *a;
+	unsigned long flags;
+	gfp_t gfp = in_interrupt() ? GFP_ATOMIC : GFP_KERNEL;
+	bool queue_work = false;
+
+	if (READ_ONCE(qp->deferred_ack_stopping))
+		return -ESHUTDOWN;
+
+	a = kzalloc(sizeof(*a), gfp);
+	if (!a)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&a->list);
+	a->dest_qp = dest_qp;
+	a->psn = psn;
+	a->status = status;
+
+	spin_lock_irqsave(&qp->deferred_ack_lock, flags);
+	if (READ_ONCE(qp->deferred_ack_stopping)) {
+		spin_unlock_irqrestore(&qp->deferred_ack_lock, flags);
+		kfree(a);
+		return -ESHUTDOWN;
+	}
+	list_add_tail(&a->list, &qp->deferred_acks);
+	if (!qp->deferred_ack_active) {
+		qp->deferred_ack_active = true;
+		queue_work = true;
+	}
+	spin_unlock_irqrestore(&qp->deferred_ack_lock, flags);
+
+	if (queue_work)
+		queue_delayed_work(system_unbound_wq, &qp->deferred_ack_work, 0);
+	return 0;
+}
+
+static void u4r_deferred_ack_work_fn(struct work_struct *w)
+{
+	struct usb4_rdma_qp *qp =
+		container_of(to_delayed_work(w), struct usb4_rdma_qp,
+			     deferred_ack_work);
+	unsigned long flags;
+
+	for (;;) {
+		struct u4r_deferred_ack *a;
+		int ret;
+
+		spin_lock_irqsave(&qp->deferred_ack_lock, flags);
+		a = list_first_entry_or_null(&qp->deferred_acks,
+					     struct u4r_deferred_ack, list);
+		if (a) {
+			list_del_init(&a->list);
+		} else {
+			qp->deferred_ack_active = false;
+		}
+		spin_unlock_irqrestore(&qp->deferred_ack_lock, flags);
+
+		if (!a)
+			break;
+
+		if (!u4r_can_send_deferred_ack(qp)) {
+			kfree(a);
+			continue;
+		}
+
+		ret = usb4_rdma_data_send_ack_try(qp->rail, qp->base.qp_num, a->dest_qp,
+						  a->psn, a->status);
+		if (ret == -EAGAIN) {
+			spin_lock_irqsave(&qp->deferred_ack_lock, flags);
+			list_add(&a->list, &qp->deferred_acks);
+			spin_unlock_irqrestore(&qp->deferred_ack_lock, flags);
+			if (!READ_ONCE(qp->deferred_ack_stopping))
+				mod_delayed_work(system_unbound_wq,
+						 &qp->deferred_ack_work,
+						 U4_DEFERRED_ACK_RETRY_DELAY);
+			break;
+		}
+
+		if (ret)
+			pr_warn_ratelimited("send_ack deferred[qp=%u]: dest=%u psn=%u failed %d\n",
+					    qp->base.qp_num, a->dest_qp,
+					    a->psn, ret);
+		else if (READ_ONCE(send_ack_debug))
+			pr_info("send_ack deferred[qp=%u]: dest=%u psn=%u sent\n",
+				qp->base.qp_num, a->dest_qp, a->psn);
+		kfree(a);
+	}
 }
 
 static int u4r_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
@@ -1861,10 +2322,25 @@ static int u4r_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
 
 		switch (wr->opcode) {
 		case IB_WR_SEND:
+			/* UC SEND must not block — JACCL calls post_send
+			 * from inside its poll-completion loop and a block
+			 * here deadlocks both peers. Defer the actual TX
+			 * (and its credit reservation) to a workqueue. The
+			 * CQE is generated by the worker on completion. */
+			if (qp->qp_type == IB_QPT_UC) {
+				ret = u4r_capture_deferred_send(qp, wr);
+				if (ret) {
+					u4r_set_bad_wr(bad_wr, wr);
+					return ret;
+				}
+				continue;
+			}
 			ret = u4r_send_one(qp, wr);
 			wc_opcode = IB_WC_SEND;
-			defer_wc = qp->sq_sig_all ||
-				   (wr->send_flags & IB_SEND_SIGNALED);
+			/* RC defers the SEND CQE until the wire ACK arrives. */
+			defer_wc = (qp->qp_type == IB_QPT_RC) &&
+				(qp->sq_sig_all ||
+				 (wr->send_flags & IB_SEND_SIGNALED));
 			break;
 		case IB_WR_RDMA_WRITE:
 		case IB_WR_RDMA_WRITE_WITH_IMM:
@@ -1935,7 +2411,7 @@ static int u4r_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 			r->sge[i] = wr->sg_list[i];
 		spin_lock_irqsave(&qp->recv_lock, flags);
 		list_add_tail(&r->list, &qp->recv_q);
-		if (qp->qp_type == IB_QPT_RC)
+		if (qp->qp_type == IB_QPT_RC || qp->qp_type == IB_QPT_UC)
 			qp->recv_posted_count++;
 		spin_unlock_irqrestore(&qp->recv_lock, flags);
 	}
@@ -2059,16 +2535,35 @@ static void u4r_send_send_ack(struct usb4_rdma_qp *qp,
 			      const struct u4_wire_hdr *hdr,
 			      enum ib_wc_status status)
 {
+	u32 dest_qp = le32_to_cpu(hdr->src_qp);
+	u32 psn = le32_to_cpu(hdr->psn);
+	bool deferred = false;
 	int ret;
 
-	ret = usb4_rdma_data_send(U4_OP_SEND_ACK, qp->base.qp_num,
-				  le32_to_cpu(hdr->src_qp),
-				  le32_to_cpu(hdr->psn), U4_F_LAST,
-				  cpu_to_be32(status), 0, 0, NULL, NULL, 0);
+	if (in_interrupt()) {
+		if (u4r_deferred_ack_pending(qp))
+			ret = -EAGAIN;
+		else
+			ret = usb4_rdma_data_send_ack_atomic(qp->rail, qp->base.qp_num,
+							     dest_qp, psn,
+							     cpu_to_be32(status));
+		if (ret == -EAGAIN || ret == -EOPNOTSUPP) {
+			ret = u4r_queue_deferred_ack(qp, dest_qp, psn,
+						     cpu_to_be32(status));
+			deferred = !ret;
+		}
+	} else {
+		ret = usb4_rdma_data_send(qp->rail, U4_OP_SEND_ACK, qp->base.qp_num,
+					  dest_qp, psn, U4_F_LAST,
+					  cpu_to_be32(status), 0, 0,
+					  NULL, NULL, 0);
+	}
 	if (READ_ONCE(send_ack_debug))
-		pr_info("send_ack tx: qp=%u dest=%u psn=%u status=%u ret=%d\n",
-			qp->base.qp_num, le32_to_cpu(hdr->src_qp),
-			le32_to_cpu(hdr->psn), status, ret);
+		pr_info("send_ack tx: qp=%u dest=%u psn=%u status=%u ret=%d deferred=%d\n",
+			qp->base.qp_num, dest_qp, psn, status, ret, deferred);
+	if (ret && ret != -ENOTCONN && ret != -ESHUTDOWN)
+		pr_warn_ratelimited("send_ack tx[qp=%u]: dest=%u psn=%u status=%u failed %d\n",
+				    qp->base.qp_num, dest_qp, psn, status, ret);
 }
 
 static void u4r_rx_send_handler(struct usb4_rdma_qp *qp,
@@ -2313,21 +2808,21 @@ struct u4r_read_stream_ctx {
 	struct usb4_rdma_mr *mr;
 	u64 addr;
 	u32 remaining;
-	bool allow_dma_cache;
 };
 
 static int u4r_send_read_status_locked(struct usb4_rdma_qp *qp, u32 dest_qp,
 				       u32 req_psn,
 				       enum ib_wc_status status)
 {
-	return usb4_rdma_data_send(U4_OP_RDMA_READ_RESP, qp->base.qp_num,
+	return usb4_rdma_data_send(qp->rail, U4_OP_RDMA_READ_RESP, qp->base.qp_num,
 				   dest_qp, req_psn, U4_F_LAST,
 				   cpu_to_be32(status), 0, 0, NULL, NULL, 0);
 }
 
 static int u4r_next_read_page(void *opaque, struct page **page,
-			      u32 *page_off, u32 *length,
-			      dma_addr_t *dma_addr, bool *dma_mapped,
+			      u32 *page_idx_out, u32 *page_off, u32 *length,
+			      usb4_rdma_data_dma_resolve_fn *resolve,
+			      void **resolve_ctx,
 			      usb4_rdma_data_done_fn *done,
 			      void **done_ctx)
 {
@@ -2342,13 +2837,9 @@ static int u4r_next_read_page(void *opaque, struct page **page,
 	ctx->addr += *length;
 	ctx->remaining -= *length;
 	refcount_inc(&ctx->mr->refs);
-	if (ctx->allow_dma_cache && ctx->mr->dma_mapped) {
-		*dma_addr = ctx->mr->dma_addrs[page_idx] + *page_off;
-		*dma_mapped = true;
-	} else {
-		*dma_addr = 0;
-		*dma_mapped = false;
-	}
+	*page_idx_out = page_idx;
+	*resolve = u4r_mr_resolve_dma;
+	*resolve_ctx = ctx->mr;
 	*done = u4r_mr_put_done;
 	*done_ctx = ctx->mr;
 	return 0;
@@ -2365,6 +2856,9 @@ static void u4r_rdma_read_req_work(struct work_struct *work)
 	struct u4r_read_stream_ctx stream_ctx;
 	enum ib_wc_status err_status = IB_WC_SUCCESS;
 	int ret = 0;
+
+	if (u4r_warn_process_path_from_atomic(__func__))
+		goto out_free;
 
 	if (rw->read_len && rw->remote_addr > U64_MAX - rw->read_len) {
 		err_status = IB_WC_REM_INV_REQ_ERR;
@@ -2388,19 +2882,6 @@ static void u4r_rdma_read_req_work(struct work_struct *work)
 		err_status = IB_WC_REM_ACCESS_ERR;
 		goto send_error;
 	}
-	stream_ctx.allow_dma_cache =
-		usb4_rdma_data_active_lane_count() == 1;
-	if (rw->read_len && stream_ctx.allow_dma_cache) {
-		ret = u4r_mr_ensure_dma_mapped(mr);
-		if (ret) {
-			pr_warn_ratelimited("rdma_read_req[qp=%u]: dma map failed %d rkey=0x%x\n",
-					    qp->base.qp_num, ret, rw->rkey);
-			u4r_mr_put(mr);
-			err_status = IB_WC_REM_OP_ERR;
-			goto send_error;
-		}
-	}
-
 	stream_ctx.mr = mr;
 	stream_ctx.addr = rw->remote_addr;
 	stream_ctx.remaining = rw->read_len;
@@ -2412,7 +2893,7 @@ static void u4r_rdma_read_req_work(struct work_struct *work)
 		goto out;
 	}
 
-	ret = usb4_rdma_data_send_page_stream(U4_OP_RDMA_READ_RESP,
+	ret = usb4_rdma_data_send_page_stream(qp->rail, U4_OP_RDMA_READ_RESP,
 					      qp->base.qp_num, rw->dest_qp,
 					      rw->req_psn, U4_F_LAST,
 					      cpu_to_be32(IB_WC_SUCCESS),
@@ -2438,6 +2919,7 @@ send_error:
 	if (ret)
 		pr_warn_ratelimited("rdma_read_req[qp=%u]: error response failed %d\n",
 				    qp->base.qp_num, ret);
+out_free:
 	u4r_qp_put(qp);
 	kfree(rw);
 }
@@ -2738,8 +3220,12 @@ static int u4r_get_port_immutable(struct ib_device *ibdev, u32 port_num,
 	 * out-of-band handshake, our wire format takes over for data.
 	 * The on-the-wire bytes are NOT actually UDP/IP encapsulated;
 	 * that's an implementation detail libfabric/RCCL/MPI don't see. */
-	immutable->core_cap_flags = RDMA_CORE_PORT_IBA_ROCE
-				  | RDMA_CORE_PORT_IBA_ROCE_UDP_ENCAP;
+	/* RoCEv2 only (UDP-encap), matching RXE's choice. Earlier we also
+	 * advertised RoCEv1 but that confused at least one userspace
+	 * (Apple's JACCL hardcodes sgid_index=1, expecting that to resolve
+	 * to a v2 GID, and our v1+v2 dual advertisement breaks the AH
+	 * validation in the kernel core). */
+	immutable->core_cap_flags = RDMA_CORE_PORT_IBA_ROCE_UDP_ENCAP;
 	immutable->max_mad_size = IB_MGMT_MAD_SIZE;
 	return 0;
 }
@@ -2855,45 +3341,26 @@ static const struct ib_device_ops u4r_dev_ops = {
 	INIT_RDMA_OBJ_SIZE(ib_qp,        usb4_rdma_qp,       base),
 };
 
-void usb4_rdma_ibdev_peer_event(bool joined)
-{
-	int n;
-
-	if (!u4r_dev)
-		return;
-	if (joined) {
-		n = atomic_inc_return(&u4r_dev->active_peers);
-	} else {
-		int old;
-
-		do {
-			old = atomic_read(&u4r_dev->active_peers);
-			if (old <= 0) {
-				atomic_set(&u4r_dev->active_peers, 0);
-				pr_warn("peer left while no peers were active; port count clamped at 0\n");
-				n = 0;
-				goto log;
-			}
-		} while (atomic_cmpxchg(&u4r_dev->active_peers, old, old - 1) != old);
-		n = old - 1;
-	}
-
-log:
-	pr_info("peer %s, %d active — port 1 %s\n",
-		joined ? "joined" : "left", n,
-		n > 0 ? "ACTIVE" : "DOWN");
-}
-
-int usb4_rdma_ibdev_init(void)
+static int u4r_register_ibdev(struct u4_data_peer *rail, bool active,
+			      bool list_device,
+			      struct usb4_rdma_ib_dev **out)
 {
 	struct usb4_rdma_ib_dev *u4r;
+	char name[IB_DEVICE_NAME_MAX];
 	u8 mac[ETH_ALEN];
 	int err;
 
+	if (rail && !usb4_rdma_data_rail_get(rail))
+		return -ENOTCONN;
+
 	u4r = ib_alloc_device(usb4_rdma_ib_dev, base);
-	if (!u4r)
+	if (!u4r) {
+		usb4_rdma_data_rail_put(rail);
 		return -ENOMEM;
-	atomic_set(&u4r->active_peers, 0);
+	}
+	INIT_LIST_HEAD(&u4r->dev_link);
+	u4r->rail = rail;
+	atomic_set(&u4r->active_peers, active ? 1 : 0);
 	u4r->base.phys_port_cnt    = USB4_RDMA_NPORTS;
 	u4r->base.num_comp_vectors = num_possible_cpus();
 	u4r->base.local_dma_lkey   = 0;
@@ -2941,6 +3408,7 @@ int usb4_rdma_ibdev_init(void)
 		pr_err("CM netdev '%s' not found — bring it up first, or set "
 		       "cm_netdev=<iface> at module load\n", cm_netdev);
 		ib_dealloc_device(&u4r->base);
+		usb4_rdma_data_rail_put(rail);
 		return -ENODEV;
 	}
 	pr_info("CM control plane via netdev %s\n", cm_netdev);
@@ -2952,39 +3420,181 @@ int usb4_rdma_ibdev_init(void)
 		pr_err("ib_device_set_netdev failed: %d\n", err);
 		dev_put(u4r->netdev);
 		ib_dealloc_device(&u4r->base);
+		usb4_rdma_data_rail_put(rail);
 		return err;
 	}
 
-	err = ib_register_device(&u4r->base, "usb4_rdma%d", NULL);
+	if (rail) {
+		int idx = usb4_rdma_data_rail_index(rail);
+
+		if (idx < 0) {
+			pr_err("failed to derive deterministic rail name: %d\n",
+			       idx);
+			dev_put(u4r->netdev);
+			ib_dealloc_device(&u4r->base);
+			usb4_rdma_data_rail_put(rail);
+			return idx;
+		}
+		snprintf(name, sizeof(name), "usb4_rdma%d", idx);
+	} else {
+		strscpy(name, "usb4_rdma%d", sizeof(name));
+	}
+
+	err = ib_register_device(&u4r->base, name, NULL);
 	if (err) {
 		pr_err("ib_register_device failed: %d\n", err);
 		dev_put(u4r->netdev);
 		ib_dealloc_device(&u4r->base);
+		usb4_rdma_data_rail_put(rail);
 		return err;
 	}
 
-	u4r_dev = u4r;
+	if (list_device) {
+		mutex_lock(&u4r_dev_list_lock);
+		list_add_tail(&u4r->dev_link, &u4r_dev_list);
+		mutex_unlock(&u4r_dev_list_lock);
+	}
+
+	if (out)
+		*out = u4r;
+	pr_info("registered ib_device %s (1 port%s)\n",
+		dev_name(&u4r->base.dev), rail ? ", lane rail" : "");
+	return 0;
+}
+
+static void u4r_unregister_ibdev(struct usb4_rdma_ib_dev *u4r)
+{
+	struct net_device *ndev;
+	struct u4_data_peer *rail;
+
+	if (!u4r)
+		return;
+
+	ndev = u4r->netdev;
+	rail = u4r->rail;
+	u4r->netdev = NULL;
+	u4r->rail = NULL;
+	atomic_set(&u4r->active_peers, 0);
+	ib_unregister_device(&u4r->base);
+	ib_dealloc_device(&u4r->base);
+	if (ndev)
+		dev_put(ndev);
+	usb4_rdma_data_rail_put(rail);
+}
+
+static struct usb4_rdma_ib_dev *
+u4r_find_rail_dev_locked(struct u4_data_peer *rail)
+{
+	struct usb4_rdma_ib_dev *u4r;
+
+	list_for_each_entry(u4r, &u4r_dev_list, dev_link) {
+		if (u4r->rail == rail)
+			return u4r;
+	}
+	return NULL;
+}
+
+void usb4_rdma_ibdev_rail_event(struct u4_data_peer *rail, bool joined)
+{
+	struct usb4_rdma_ib_dev *u4r;
+	int ret;
+
+	if (!u4r_lane_mode() || !rail)
+		return;
+
+	if (joined) {
+		mutex_lock(&u4r_dev_list_lock);
+		u4r = u4r_find_rail_dev_locked(rail);
+		mutex_unlock(&u4r_dev_list_lock);
+		if (u4r)
+			return;
+		ret = u4r_register_ibdev(rail, true, true, NULL);
+		if (ret)
+			pr_warn("lane rail ib_device registration failed: %d\n",
+				ret);
+		return;
+	}
+
+	mutex_lock(&u4r_dev_list_lock);
+	u4r = u4r_find_rail_dev_locked(rail);
+	if (u4r)
+		list_del_init(&u4r->dev_link);
+	mutex_unlock(&u4r_dev_list_lock);
+	if (u4r)
+		u4r_unregister_ibdev(u4r);
+}
+
+void usb4_rdma_ibdev_peer_event(bool joined)
+{
+	int n;
+
+	if (u4r_lane_mode() || !u4r_dev)
+		return;
+	if (joined) {
+		n = atomic_inc_return(&u4r_dev->active_peers);
+	} else {
+		int old;
+
+		do {
+			old = atomic_read(&u4r_dev->active_peers);
+			if (old <= 0) {
+				atomic_set(&u4r_dev->active_peers, 0);
+				pr_warn("peer left while no peers were active; port count clamped at 0\n");
+				n = 0;
+				goto log;
+			}
+		} while (atomic_cmpxchg(&u4r_dev->active_peers, old, old - 1) != old);
+		n = old - 1;
+	}
+
+log:
+	pr_info("peer %s, %d active — port 1 %s\n",
+		joined ? "joined" : "left", n,
+		n > 0 ? "ACTIVE" : "DOWN");
+}
+
+int usb4_rdma_ibdev_init(void)
+{
+	int err;
+
+	err = u4r_parse_rail_mode();
+	if (err)
+		return err;
+
 	usb4_rdma_data_set_rx_handler(u4r_rx_handler);
 	usb4_rdma_data_set_rx_zcopy_prepare(u4r_rx_zcopy_prepare);
-	pr_info("registered ib_device %s (1 port)\n",
-		dev_name(&u4r->base.dev));
+
+	if (u4r_lane_mode()) {
+		pr_info("rail_mode=lane: ib_devices will be registered per active data lane\n");
+		return 0;
+	}
+
+	err = u4r_register_ibdev(NULL, false, false, &u4r_dev);
+	if (err) {
+		usb4_rdma_data_set_rx_zcopy_prepare(NULL);
+		usb4_rdma_data_set_rx_handler(NULL);
+		return err;
+	}
 	return 0;
 }
 
 void usb4_rdma_ibdev_exit(void)
 {
-	struct net_device *ndev;
+	struct usb4_rdma_ib_dev *u4r, *tmp;
 
-	if (!u4r_dev)
-		return;
-	ndev = u4r_dev->netdev;
-	u4r_dev->netdev = NULL;
 	usb4_rdma_data_set_rx_zcopy_prepare(NULL);
 	usb4_rdma_data_set_rx_handler(NULL);
-	ib_unregister_device(&u4r_dev->base);
-	ib_dealloc_device(&u4r_dev->base);
+
+	mutex_lock(&u4r_dev_list_lock);
+	list_for_each_entry_safe(u4r, tmp, &u4r_dev_list, dev_link) {
+		list_del_init(&u4r->dev_link);
+		mutex_unlock(&u4r_dev_list_lock);
+		u4r_unregister_ibdev(u4r);
+		mutex_lock(&u4r_dev_list_lock);
+	}
+	mutex_unlock(&u4r_dev_list_lock);
+
+	u4r_unregister_ibdev(u4r_dev);
 	u4r_dev = NULL;
-	if (ndev)
-		dev_put(ndev);
 	ida_destroy(&u4r_qpn_ida);
 }

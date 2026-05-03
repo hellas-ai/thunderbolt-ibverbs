@@ -40,6 +40,8 @@
 #include <linux/math64.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/hardirq.h>
+#include <linux/irq_work.h>
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
 #include <linux/kthread.h>
@@ -50,11 +52,12 @@
 #include "wire.h"
 #include "nhi_raw.h"
 
-#define U4_DATA_RING_DEPTH         128
-#define U4_DATA_FRAMES_PER_DIR     96
+#define U4_DATA_RING_DEPTH_DEFAULT 256
+#define U4_DATA_RING_DEPTH_MIN     16
+#define U4_DATA_RING_DEPTH_MAX     4095
+#define U4_DATA_FRAME_SLACK        32
 #define U4_TX_ZCOPY_POOL_DEFAULT   256
 #define U4_TX_ZCOPY_POOL_MAX       4096
-#define U4_TX_STREAM_AFFINITY_MAX  ((U4_DATA_FRAMES_PER_DIR - 1) * U4_FRAME_SIZE)
 #define U4_FRAME_SIZE              4096
 #define U4_DATA_PDF_FRAME_START    1
 #define U4_DATA_PDF_FRAME_END      2
@@ -93,6 +96,16 @@ module_param(rx_drain_test_frames, uint, 0444);
 MODULE_PARM_DESC(rx_drain_test_frames,
 		 "RX descriptors per lane when rx_drain_test=1 (default: 1)");
 
+static uint data_ring_depth = U4_DATA_RING_DEPTH_DEFAULT;
+module_param(data_ring_depth, uint, 0444);
+MODULE_PARM_DESC(data_ring_depth,
+		 "NHI descriptor ring depth for RDMA data rings (default 256, max 4095)");
+
+static uint data_frames_per_dir;
+module_param(data_frames_per_dir, uint, 0444);
+MODULE_PARM_DESC(data_frames_per_dir,
+		 "preallocated staging frames per RDMA data direction; 0 = data_ring_depth - 32 (default)");
+
 static bool rx_zcopy;
 module_param(rx_zcopy, bool, 0444);
 MODULE_PARM_DESC(rx_zcopy,
@@ -106,7 +119,7 @@ MODULE_PARM_DESC(rx_zcopy_min_bytes,
 static uint rx_poll_opportunistic_lanes = 2;
 module_param(rx_poll_opportunistic_lanes, uint, 0644);
 MODULE_PARM_DESC(rx_poll_opportunistic_lanes,
-		 "RX lanes to opportunistically scan from ib_poll_cq when no NHI interrupt is armed (default: 2, 0 = interrupt/workqueue only)");
+		 "RX lanes to opportunistically scan from ib_poll_cq when no NHI interrupt is armed (default: 2, 0 = interrupt/irq_work only)");
 
 static uint tx_zcopy_pool_frames = U4_TX_ZCOPY_POOL_DEFAULT;
 module_param(tx_zcopy_pool_frames, uint, 0444);
@@ -174,6 +187,8 @@ struct u4_data_peer {
 	bool paths_enabled;
 	struct tb_ring *tx_ring;
 	struct tb_ring *rx_ring;
+	unsigned int ring_depth;
+	unsigned int frames_per_dir;
 
 	struct u4_data_frame *tx_frames;
 	struct u4_data_frame *rx_frames;
@@ -190,7 +205,7 @@ struct u4_data_peer {
 	struct mutex tx_lock;
 	wait_queue_head_t tx_wait;
 	wait_queue_head_t ref_wait;
-	struct work_struct rx_poll_work;
+	struct irq_work rx_poll_irq;
 	struct task_struct *rx_poll_task;
 	atomic_t rx_poll_armed;
 	atomic_t rx_poll_busy;
@@ -209,7 +224,7 @@ struct u4_data_peer {
 	atomic64_t rx_invalid_hdr;
 	atomic64_t rx_poll_armed_frames;
 	atomic64_t rx_poll_opportunistic_frames;
-	atomic64_t rx_poll_work_frames;
+	atomic64_t rx_poll_irq_frames;
 	atomic64_t rx_poll_busy_frames;
 	atomic64_t rx_desc_overrun;
 	atomic64_t rx_repost_failed;
@@ -307,6 +322,7 @@ static struct dentry *data_debugfs_root;
 /* QP routing — RX dispatch finds the local QP by qp_num. */
 struct u4_data_qp_entry {
 	u32 qp_num;
+	struct u4_data_peer *rail;	/* NULL = legacy shared device */
 	void *qp;	/* opaque ib_qp; ibdev.c interprets */
 	struct hlist_node node;
 	struct rcu_head rcu;
@@ -321,6 +337,13 @@ static void (*u4_data_rx_handler)(void *qp,
 				  const struct u4_wire_hdr *hdr,
 				  const void *payload, u32 length);
 static usb4_rdma_data_rx_zcopy_prepare_fn u4_data_rx_zcopy_prepare;
+static void u4_data_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
+				bool canceled);
+static void u4_data_rx_complete_one(struct tb_ring *ring,
+				    struct ring_frame *frame, bool canceled,
+				    struct list_head *repost_list);
+static void u4_data_repost_rx_list(struct u4_data_peer *p,
+				   struct list_head *frames);
 
 static atomic64_t rx_poll_calls;
 static atomic64_t rx_poll_armed_scans;
@@ -329,16 +352,33 @@ static atomic64_t rx_poll_skipped;
 static atomic64_t tx_stream_affinity_used;
 static atomic64_t tx_stream_affinity_fallback;
 
+static bool u4_data_warn_process_tx_from_atomic(const char *where)
+{
+	if (!WARN_ON_ONCE(in_interrupt()))
+		return false;
+
+	pr_warn_ratelimited("%s called from interrupt context; process-context TX path would sleep\n",
+			    where);
+	return true;
+}
+
+static void u4_data_tx_wake(struct u4_data_peer *p)
+{
+	if (wq_has_sleeper(&p->tx_wait))
+		wake_up(&p->tx_wait);
+}
+
 static struct u4_data_peer *u4_data_peer_get_at(unsigned int target)
 {
 	struct u4_data_peer *p, *pick = NULL;
+	unsigned long flags;
 	int count = atomic_read(&peer_count);
 	int i = 0;
 
 	if (!count)
 		return NULL;
 
-	read_lock(&peer_lock);
+	read_lock_irqsave(&peer_lock, flags);
 	target %= count;
 	list_for_each_entry(p, &peer_list, list) {
 		if (READ_ONCE(p->closing))
@@ -349,7 +389,7 @@ static struct u4_data_peer *u4_data_peer_get_at(unsigned int target)
 			break;
 		}
 	}
-	read_unlock(&peer_lock);
+	read_unlock_irqrestore(&peer_lock, flags);
 	return pick;
 }
 
@@ -358,8 +398,55 @@ static struct u4_data_peer *u4_data_peer_get(void)
 	return u4_data_peer_get_at(atomic_inc_return(&peer_rr));
 }
 
-static struct u4_data_peer *u4_data_peer_get_by_qp(u32 src_qp, u32 dest_qp)
+static void u4_data_peer_put(struct u4_data_peer *p);
+
+bool usb4_rdma_data_rail_get(struct u4_data_peer *rail)
 {
+	if (!rail)
+		return true;
+	if (READ_ONCE(rail->closing))
+		return false;
+	atomic_inc(&rail->refs);
+	if (READ_ONCE(rail->closing)) {
+		u4_data_peer_put(rail);
+		return false;
+	}
+	return true;
+}
+
+void usb4_rdma_data_rail_put(struct u4_data_peer *rail)
+{
+	if (rail)
+		u4_data_peer_put(rail);
+}
+
+int usb4_rdma_data_rail_index(struct u4_data_peer *rail)
+{
+	const char *name;
+	unsigned int domain;
+
+	if (!rail || !rail->svc)
+		return -ENODEV;
+
+	name = dev_name(&rail->svc->dev);
+	if (sscanf(name, "%u-", &domain) != 1)
+		return -EINVAL;
+	if (rail->lane_idx < 0 || rail->lane_idx >= U4_MAX_LANES_PER_SERVICE)
+		return -EINVAL;
+	if (domain > INT_MAX / U4_MAX_LANES_PER_SERVICE)
+		return -ERANGE;
+
+	return domain * U4_MAX_LANES_PER_SERVICE + rail->lane_idx;
+}
+
+static struct u4_data_peer *u4_data_peer_get_by_qp(struct u4_data_peer *rail,
+						   u32 src_qp, u32 dest_qp)
+{
+	if (rail) {
+		if (!usb4_rdma_data_rail_get(rail))
+			return NULL;
+		return rail;
+	}
 	return u4_data_peer_get_at(hash_32(src_qp ^ dest_qp, 32));
 }
 
@@ -378,9 +465,10 @@ static u32 u4_data_desc_len(u32 desc_size)
 static int u4_data_peers_get(struct u4_data_peer **peers, int max)
 {
 	struct u4_data_peer *p;
+	unsigned long flags;
 	int n = 0;
 
-	read_lock(&peer_lock);
+	read_lock_irqsave(&peer_lock, flags);
 	list_for_each_entry(p, &peer_list, list) {
 		if (READ_ONCE(p->closing))
 			continue;
@@ -389,7 +477,7 @@ static int u4_data_peers_get(struct u4_data_peer **peers, int max)
 		if (n == max)
 			break;
 	}
-	read_unlock(&peer_lock);
+	read_unlock_irqrestore(&peer_lock, flags);
 	return n;
 }
 
@@ -399,24 +487,58 @@ static void u4_data_peer_put(struct u4_data_peer *p)
 		wake_up(&p->ref_wait);
 }
 
-static bool u4_data_tx_room(struct u4_data_peer *p, int needed)
+static unsigned int u4_data_ring_depth(void)
 {
-	return atomic_read(&p->tx_inflight) <= U4_DATA_FRAMES_PER_DIR - needed;
+	return clamp_t(uint, READ_ONCE(data_ring_depth),
+		       U4_DATA_RING_DEPTH_MIN, U4_DATA_RING_DEPTH_MAX);
 }
 
-static int u4_data_initial_rx_frames(void)
+static unsigned int u4_data_auto_frames_per_dir(unsigned int depth)
+{
+	if (depth > U4_DATA_FRAME_SLACK)
+		return depth - U4_DATA_FRAME_SLACK;
+
+	return depth - 1;
+}
+
+static unsigned int u4_data_frames_per_dir(unsigned int depth)
+{
+	uint frames = READ_ONCE(data_frames_per_dir);
+
+	if (!frames)
+		frames = u4_data_auto_frames_per_dir(depth);
+
+	return clamp_t(uint, frames, 2, depth - 1);
+}
+
+static u64 u4_tx_stream_affinity_max(struct u4_data_peer *p)
+{
+	if (p->frames_per_dir <= 1)
+		return 0;
+
+	return (u64)(p->frames_per_dir - 1) * U4_FRAME_SIZE;
+}
+
+static bool u4_data_tx_room(struct u4_data_peer *p, int needed)
+{
+	return atomic_read(&p->tx_inflight) <= p->frames_per_dir - needed;
+}
+
+static int u4_data_initial_rx_frames(struct u4_data_peer *p)
 {
 	if (READ_ONCE(rx_drain_test))
 		return clamp_t(uint, READ_ONCE(rx_drain_test_frames), 1,
-			       U4_DATA_FRAMES_PER_DIR);
+			       p->frames_per_dir);
 	if (READ_ONCE(rx_zcopy))
 		return 1;
-	return U4_DATA_FRAMES_PER_DIR;
+	return p->frames_per_dir;
 }
 
 static int u4_data_poll_rx_peer(struct u4_data_peer *p)
 {
-	struct ring_frame *frame;
+	struct ring_frame *frame, *tmp;
+	LIST_HEAD(done_frames);
+	LIST_HEAD(repost_frames);
 	int done = 0;
 	bool armed;
 
@@ -425,10 +547,18 @@ static int u4_data_poll_rx_peer(struct u4_data_peer *p)
 	if (atomic_cmpxchg(&p->rx_poll_busy, 0, 1))
 		return 0;
 
-	while ((frame = usb4_rdma_nhi_raw_poll(p->rx_ring))) {
-		if (frame->callback)
-			frame->callback(p->rx_ring, frame, false);
-		done++;
+	while (usb4_rdma_nhi_raw_poll_batch(p->rx_ring, &done_frames,
+					    p->ring_depth)) {
+		list_for_each_entry_safe(frame, tmp, &done_frames, list) {
+			list_del_init(&frame->list);
+			if (frame->callback == u4_data_rx_complete)
+				u4_data_rx_complete_one(p->rx_ring, frame,
+							false, &repost_frames);
+			else if (frame->callback)
+				frame->callback(p->rx_ring, frame, false);
+			done++;
+		}
+		u4_data_repost_rx_list(p, &repost_frames);
 	}
 
 	armed = atomic_xchg(&p->rx_poll_armed, 0);
@@ -440,15 +570,15 @@ static int u4_data_poll_rx_peer(struct u4_data_peer *p)
 	return done;
 }
 
-static void u4_data_rx_poll_work(struct work_struct *work)
+static void u4_data_rx_poll_irq(struct irq_work *work)
 {
 	struct u4_data_peer *p =
-		container_of(work, struct u4_data_peer, rx_poll_work);
+		container_of(work, struct u4_data_peer, rx_poll_irq);
 	int done;
 
 	done = u4_data_poll_rx_peer(p);
 	if (done)
-		atomic64_add(done, &p->rx_poll_work_frames);
+		atomic64_add(done, &p->rx_poll_irq_frames);
 }
 
 static void u4_data_start_rx_poll(void *data)
@@ -457,7 +587,7 @@ static void u4_data_start_rx_poll(void *data)
 
 	if (atomic_cmpxchg(&p->rx_poll_armed, 0, 1) == 0)
 		atomic_inc(&rx_poll_armed_count);
-	schedule_work(&p->rx_poll_work);
+	irq_work_queue(&p->rx_poll_irq);
 }
 
 static int u4_data_rx_poll_thread(void *data)
@@ -491,6 +621,24 @@ static int u4_data_zcopy_frame_count(struct list_head *frames)
 	list_for_each_entry(zf, frames, prep_link)
 		count++;
 	return count;
+}
+
+static u32 u4_data_move_zcopy_chunk(struct list_head *from,
+				    struct list_head *to,
+				    int max_frames)
+{
+	struct u4_data_zcopy_frame *zf;
+	u32 length = 0;
+	int count = 0;
+
+	while (count < max_frames && !list_empty(from)) {
+		zf = list_first_entry(from, struct u4_data_zcopy_frame,
+				      prep_link);
+		list_move_tail(&zf->prep_link, to);
+		length += zf->length;
+		count++;
+	}
+	return length;
 }
 
 static void u4_login_fill_header(struct u4_login_header *hdr, u64 route,
@@ -729,7 +877,7 @@ static struct u4_data_frame *u4_data_claim_tx_frame(struct u4_data_peer *p)
 {
 	int i;
 
-	for (i = 0; i < U4_DATA_FRAMES_PER_DIR; i++) {
+	for (i = 0; i < p->frames_per_dir; i++) {
 		struct u4_data_frame *cand = &p->tx_frames[i];
 
 		if (atomic_cmpxchg(&cand->in_use, 0, 1) == 0)
@@ -807,7 +955,7 @@ static void free_frames(struct u4_data_peer *p,
 static void u4_data_init_tx_zcopy_pool(struct u4_data_peer *p)
 {
 	int count = clamp_t(uint, READ_ONCE(tx_zcopy_pool_frames),
-			    U4_DATA_FRAMES_PER_DIR,
+			    p->frames_per_dir,
 			    U4_TX_ZCOPY_POOL_MAX);
 	int i;
 
@@ -897,7 +1045,6 @@ static void u4_data_free_tx_zcopy_frame(struct u4_data_zcopy_frame *zf)
 	}
 
 	p = zf->peer;
-	memset(zf, 0, sizeof(*zf));
 	zf->peer = p;
 	zf->pooled = true;
 	INIT_LIST_HEAD(&zf->prep_link);
@@ -920,7 +1067,7 @@ static void u4_data_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	dma_sync_single_for_cpu(dma_dev, f->dma, U4_FRAME_SIZE, DMA_TO_DEVICE);
 	atomic_dec(&f->peer->tx_inflight);
 	atomic_set(&f->in_use, 0);
-	wake_up(&f->peer->tx_wait);
+	u4_data_tx_wake(f->peer);
 	if (!canceled)
 		atomic64_inc(&f->peer->tx_frames_sent);
 }
@@ -935,7 +1082,7 @@ static void u4_data_zcopy_tx_complete(struct tb_ring *ring,
 	if (zf->unmap_dma)
 		dma_unmap_page(dma_dev, zf->dma, zf->length, DMA_TO_DEVICE);
 	atomic_dec(&zf->peer->tx_inflight);
-	wake_up(&zf->peer->tx_wait);
+	u4_data_tx_wake(zf->peer);
 	if (!canceled)
 		atomic64_inc(&zf->peer->tx_frames_sent);
 	if (zf->done)
@@ -943,15 +1090,20 @@ static void u4_data_zcopy_tx_complete(struct tb_ring *ring,
 	u4_data_free_tx_zcopy_frame(zf);
 }
 
-static void *u4_data_lookup_qp_rcu(u32 qp_num)
+static void *u4_data_lookup_qp_rcu(u32 qp_num, struct u4_data_peer *rail)
 {
 	struct u4_data_qp_entry *qe;
+	void *fallback = NULL;
 
 	hash_for_each_possible_rcu(u4_data_qp_table, qe, node, qp_num) {
-		if (qe->qp_num == qp_num)
+		if (qe->qp_num != qp_num)
+			continue;
+		if (qe->rail == rail)
 			return qe->qp;
+		if (!qe->rail)
+			fallback = qe->qp;
 	}
-	return NULL;
+	return fallback;
 }
 
 static void u4_data_repost_rx_frame(struct u4_data_peer *p,
@@ -967,6 +1119,38 @@ static void u4_data_repost_rx_frame(struct u4_data_peer *p,
 				   DMA_FROM_DEVICE);
 	if (usb4_rdma_nhi_raw_rx(p->rx_ring, &f->frame))
 		atomic64_inc(&p->rx_repost_failed);
+}
+
+static void u4_data_repost_rx_list(struct u4_data_peer *p,
+				   struct list_head *frames)
+{
+	struct ring_frame *frame, *tmp;
+	struct device *dma_dev;
+	int ret;
+
+	if (list_empty(frames))
+		return;
+	if (READ_ONCE(p->closing) || !p->rx_ring)
+		goto drop;
+
+	dma_dev = tb_ring_dma_device(p->rx_ring);
+	list_for_each_entry(frame, frames, list) {
+		struct u4_data_frame *f =
+			container_of(frame, struct u4_data_frame, frame);
+
+		dma_sync_single_for_device(dma_dev, f->dma, U4_FRAME_SIZE,
+					   DMA_FROM_DEVICE);
+	}
+
+	ret = usb4_rdma_nhi_raw_rx_batch(p->rx_ring, frames);
+	if (!ret)
+		return;
+
+drop:
+	list_for_each_entry_safe(frame, tmp, frames, list) {
+		list_del_init(&frame->list);
+		atomic64_inc(&p->rx_repost_failed);
+	}
 }
 
 static void
@@ -1086,7 +1270,7 @@ u4_data_prepare_rx_zcopy(struct u4_data_peer *p, void *target_qp,
 		usb4_rdma_data_done_fn done = NULL;
 		void *done_ctx = NULL;
 
-		if (++frame_count > U4_DATA_FRAMES_PER_DIR) {
+		if (++frame_count > p->frames_per_dir) {
 			ret = -E2BIG;
 			goto err;
 		}
@@ -1167,7 +1351,7 @@ static bool u4_data_try_rx_zcopy(struct u4_data_peer *p,
 
 	dest_qp = le32_to_cpu(hdr->dest_qp);
 	rcu_read_lock();
-	target_qp = u4_data_lookup_qp_rcu(dest_qp);
+	target_qp = u4_data_lookup_qp_rcu(dest_qp, p);
 	if (target_qp)
 		ret = u4_data_prepare_rx_zcopy(p, target_qp, hdr, length,
 					       &frames, &s);
@@ -1223,7 +1407,6 @@ static void u4_data_dispatch_raw(struct u4_data_peer *p, const void *payload,
 				 u32 frame_len)
 {
 	struct u4_wire_hdr hdr = p->raw_hdr;
-	struct u4_data_qp_entry *qe;
 	void *target_qp = NULL;
 	u32 dest_qp;
 	u32 length;
@@ -1248,12 +1431,7 @@ static void u4_data_dispatch_raw(struct u4_data_peer *p, const void *payload,
 
 	dest_qp = le32_to_cpu(hdr.dest_qp);
 	rcu_read_lock();
-	hash_for_each_possible_rcu(u4_data_qp_table, qe, node, dest_qp) {
-		if (qe->qp_num == dest_qp) {
-			target_qp = qe->qp;
-			break;
-		}
-	}
+	target_qp = u4_data_lookup_qp_rcu(dest_qp, p);
 	if (target_qp && u4_data_rx_handler)
 		u4_data_rx_handler(target_qp, &hdr, payload, length);
 	rcu_read_unlock();
@@ -1262,8 +1440,9 @@ static void u4_data_dispatch_raw(struct u4_data_peer *p, const void *payload,
 		atomic64_inc(&p->rx_frames_dropped);
 }
 
-static void u4_data_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
-				bool canceled)
+static void u4_data_rx_complete_one(struct tb_ring *ring,
+				    struct ring_frame *frame, bool canceled,
+				    struct list_head *repost_list)
 {
 	struct u4_data_frame *f = container_of(frame, typeof(*f), frame);
 	struct u4_wire_hdr *hdr;
@@ -1329,7 +1508,7 @@ static void u4_data_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	payload = (u8 *)f->buf + U4_HDR_SIZE;
 
 	rcu_read_lock();
-	target_qp = u4_data_lookup_qp_rcu(dest_qp);
+	target_qp = u4_data_lookup_qp_rcu(dest_qp, f->peer);
 	if (target_qp && u4_data_rx_handler)
 		u4_data_rx_handler(target_qp, hdr, payload, length);
 	rcu_read_unlock();
@@ -1339,7 +1518,16 @@ static void u4_data_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 
 repost:
 	/* Re-queue this RX buffer for the next frame. */
-	u4_data_repost_rx_frame(f->peer, f);
+	if (repost_list)
+		list_add_tail(&f->frame.list, repost_list);
+	else
+		u4_data_repost_rx_frame(f->peer, f);
+}
+
+static void u4_data_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
+				bool canceled)
+{
+	u4_data_rx_complete_one(ring, frame, canceled, NULL);
 }
 
 /* ----- public: peer attach / detach ------------------------------- */
@@ -1361,11 +1549,13 @@ static int u4_data_prepare_lane(struct u4_data_peer *p, struct tb_service *svc,
 	p->lane_idx = lane_idx;
 	p->out_hop = -1;
 	p->in_hop = -1;
+	p->ring_depth = u4_data_ring_depth();
+	p->frames_per_dir = u4_data_frames_per_dir(p->ring_depth);
 	atomic_set(&p->refs, 1);
 	mutex_init(&p->tx_lock);
 	init_waitqueue_head(&p->tx_wait);
 	init_waitqueue_head(&p->ref_wait);
-	INIT_WORK(&p->rx_poll_work, u4_data_rx_poll_work);
+	init_irq_work(&p->rx_poll_irq, u4_data_rx_poll_irq);
 	atomic_set(&p->rx_poll_armed, 0);
 	atomic_set(&p->rx_poll_busy, 0);
 	INIT_LIST_HEAD(&p->list);
@@ -1376,7 +1566,7 @@ static int u4_data_prepare_lane(struct u4_data_peer *p, struct tb_service *svc,
 		return out_hop;
 	p->out_hop = out_hop;
 
-	p->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, U4_DATA_RING_DEPTH,
+	p->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, p->ring_depth,
 				      ring_flags);
 	if (!p->tx_ring) {
 		dev_info(&svc->dev,
@@ -1393,7 +1583,7 @@ static int u4_data_prepare_lane(struct u4_data_peer *p, struct tb_service *svc,
 		goto err_tx;
 	}
 
-	p->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, U4_DATA_RING_DEPTH,
+	p->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, p->ring_depth,
 				      ring_flags,
 				      p->tx_ring->hop, sof_mask, eof_mask,
 				      u4_data_start_rx_poll, p);
@@ -1405,15 +1595,15 @@ static int u4_data_prepare_lane(struct u4_data_peer *p, struct tb_service *svc,
 		goto err_tx;
 	}
 
-	ret = alloc_frames(p, &p->tx_frames, U4_DATA_FRAMES_PER_DIR, true);
+	ret = alloc_frames(p, &p->tx_frames, p->frames_per_dir, true);
 	if (ret) goto err_rx;
-	ret = alloc_frames(p, &p->rx_frames, U4_DATA_FRAMES_PER_DIR, false);
+	ret = alloc_frames(p, &p->rx_frames, p->frames_per_dir, false);
 	if (ret) goto err_tx_frames;
 
 	tb_ring_start(p->tx_ring);
 	tb_ring_start(p->rx_ring);
 
-	p->rx_posted_initial = u4_data_initial_rx_frames();
+	p->rx_posted_initial = u4_data_initial_rx_frames(p);
 	for (i = 0; i < p->rx_posted_initial; i++) {
 		p->rx_frames[i].frame.callback = u4_data_rx_complete;
 		ret = usb4_rdma_nhi_raw_rx(p->rx_ring, &p->rx_frames[i].frame);
@@ -1424,9 +1614,9 @@ static int u4_data_prepare_lane(struct u4_data_peer *p, struct tb_service *svc,
 	}
 
 	dev_info(&svc->dev,
-		 "data: lane %d prepared, ring hops tx=%d rx=%d, local transmit path=%d, rx_posted=%d/%d%s\n",
-		 lane_idx, p->tx_ring->hop, p->rx_ring->hop, p->out_hop,
-		 p->rx_posted_initial, U4_DATA_FRAMES_PER_DIR,
+		 "data: lane %d prepared, ring hops tx=%d rx=%d, depth=%u, local transmit path=%d, rx_posted=%d/%u%s\n",
+		 lane_idx, p->tx_ring->hop, p->rx_ring->hop, p->ring_depth,
+		 p->out_hop, p->rx_posted_initial, p->frames_per_dir,
 		 READ_ONCE(rx_drain_test) ? " (drain-test)" :
 		 READ_ONCE(rx_zcopy) ? " (rx-zcopy)" : "");
 	return 0;
@@ -1434,9 +1624,9 @@ static int u4_data_prepare_lane(struct u4_data_peer *p, struct tb_service *svc,
 err_started:
 	tb_ring_stop(p->tx_ring);
 	tb_ring_stop(p->rx_ring);
-	free_frames(p, p->rx_frames, U4_DATA_FRAMES_PER_DIR, false);
+	free_frames(p, p->rx_frames, p->frames_per_dir, false);
 err_tx_frames:
-	free_frames(p, p->tx_frames, U4_DATA_FRAMES_PER_DIR, true);
+	free_frames(p, p->tx_frames, p->frames_per_dir, true);
 err_rx:
 	tb_ring_free(p->rx_ring);
 err_tx:
@@ -1449,6 +1639,7 @@ err_out:
 
 static int u4_data_enable_lane(struct u4_data_peer *p, int remote_tx_path)
 {
+	unsigned long flags;
 	int ret;
 
 	ret = tb_xdomain_alloc_in_hopid(p->xd, remote_tx_path);
@@ -1474,10 +1665,10 @@ static int u4_data_enable_lane(struct u4_data_peer *p, int remote_tx_path)
 	}
 	p->paths_enabled = true;
 
-	write_lock(&peer_lock);
+	write_lock_irqsave(&peer_lock, flags);
 	list_add_tail(&p->list, &peer_list);
 	atomic_inc(&peer_count);
-	write_unlock(&peer_lock);
+	write_unlock_irqrestore(&peer_lock, flags);
 
 	if (READ_ONCE(rx_busy_poll)) {
 		p->rx_poll_task = kthread_run(u4_data_rx_poll_thread, p,
@@ -1487,7 +1678,7 @@ static int u4_data_enable_lane(struct u4_data_peer *p, int remote_tx_path)
 			ret = PTR_ERR(p->rx_poll_task);
 			p->rx_poll_task = NULL;
 			dev_warn(&p->svc->dev,
-				 "data: lane %d failed to start RX poll thread (%d); falling back to interrupt/work RX\n",
+				 "data: lane %d failed to start RX poll thread (%d); falling back to interrupt/irq_work RX\n",
 				 p->lane_idx, ret);
 		} else {
 			dev_info(&p->svc->dev,
@@ -1497,10 +1688,11 @@ static int u4_data_enable_lane(struct u4_data_peer *p, int remote_tx_path)
 	}
 
 	dev_info(&p->svc->dev,
-		 "data: lane %d attached, ring hops tx=%d rx=%d, local transmit path=%d remote transmit path=%d, rx_posted=%d/%d\n",
+		 "data: lane %d attached, ring hops tx=%d rx=%d, depth=%u, local transmit path=%d remote transmit path=%d, rx_posted=%d/%u\n",
 		 p->lane_idx, p->tx_ring->hop, p->rx_ring->hop,
-		 p->out_hop, p->in_hop, p->rx_posted_initial,
-		 U4_DATA_FRAMES_PER_DIR);
+		 p->ring_depth, p->out_hop, p->in_hop,
+		 p->rx_posted_initial, p->frames_per_dir);
+	usb4_rdma_ibdev_rail_event(p, true);
 	return 0;
 }
 
@@ -1518,12 +1710,12 @@ static void u4_data_teardown_lane(struct u4_data_peer *p)
 	}
 	tb_ring_stop(p->tx_ring);
 	tb_ring_stop(p->rx_ring);
-	cancel_work_sync(&p->rx_poll_work);
+	irq_work_sync(&p->rx_poll_irq);
 	if (atomic_xchg(&p->rx_poll_armed, 0))
 		atomic_dec(&rx_poll_armed_count);
 	u4_data_free_tx_zcopy_pool(p);
-	free_frames(p, p->rx_frames, U4_DATA_FRAMES_PER_DIR, false);
-	free_frames(p, p->tx_frames, U4_DATA_FRAMES_PER_DIR, true);
+	free_frames(p, p->rx_frames, p->frames_per_dir, false);
+	free_frames(p, p->tx_frames, p->frames_per_dir, true);
 	tb_ring_free(p->rx_ring);
 	tb_ring_free(p->tx_ring);
 	if (p->in_hop >= 0)
@@ -1535,20 +1727,24 @@ static void u4_data_teardown_lane(struct u4_data_peer *p)
 
 static void u4_data_deactivate_lane(struct u4_data_peer *p)
 {
-	write_lock(&peer_lock);
+	unsigned long flags;
+
+	write_lock_irqsave(&peer_lock, flags);
 	if (!list_empty(&p->list)) {
 		list_del_init(&p->list);
 		atomic_dec(&peer_count);
 	}
 	WRITE_ONCE(p->closing, true);
-	write_unlock(&peer_lock);
+	write_unlock_irqrestore(&peer_lock, flags);
 
+	usb4_rdma_ibdev_rail_event(p, false);
 	u4_data_teardown_lane(p);
 }
 
 static int u4_data_stats_show(struct seq_file *m, void *unused)
 {
 	struct u4_data_peer *p;
+	unsigned long flags;
 	int idx = 0;
 
 	seq_printf(m, "rx_busy_poll:         %u\n", READ_ONCE(rx_busy_poll));
@@ -1556,6 +1752,9 @@ static int u4_data_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "rx_drain_test:        %u\n", READ_ONCE(rx_drain_test));
 	seq_printf(m, "rx_drain_test_frames: %u\n",
 		   READ_ONCE(rx_drain_test_frames));
+	seq_printf(m, "data_ring_depth:      %u\n", u4_data_ring_depth());
+	seq_printf(m, "data_frames_per_dir:  %u\n",
+		   u4_data_frames_per_dir(u4_data_ring_depth()));
 	seq_printf(m, "rx_zcopy:             %u\n", READ_ONCE(rx_zcopy));
 	seq_printf(m, "rx_zcopy_min_bytes:   %u\n",
 		   READ_ONCE(rx_zcopy_min_bytes));
@@ -1583,7 +1782,7 @@ static int u4_data_stats_show(struct seq_file *m, void *unused)
 		   usb4_rdma_data_active_lane_count());
 	usb4_rdma_nhi_raw_stats_show(m);
 
-	read_lock(&peer_lock);
+	read_lock_irqsave(&peer_lock, flags);
 	list_for_each_entry(p, &peer_list, list) {
 		seq_printf(m, "\nlane[%d]:\n", idx++);
 		seq_printf(m, "  service:            %s\n",
@@ -1623,8 +1822,8 @@ static int u4_data_stats_show(struct seq_file *m, void *unused)
 			   (long long)atomic64_read(&p->rx_poll_armed_frames));
 		seq_printf(m, "  rx_poll_opportunistic_frames: %lld\n",
 			   (long long)atomic64_read(&p->rx_poll_opportunistic_frames));
-		seq_printf(m, "  rx_poll_work_frames: %lld\n",
-			   (long long)atomic64_read(&p->rx_poll_work_frames));
+		seq_printf(m, "  rx_poll_irq_frames: %lld\n",
+			   (long long)atomic64_read(&p->rx_poll_irq_frames));
 		seq_printf(m, "  rx_poll_busy_frames: %lld\n",
 			   (long long)atomic64_read(&p->rx_poll_busy_frames));
 		seq_printf(m, "  rx_desc_overrun:    %lld\n",
@@ -1646,7 +1845,7 @@ static int u4_data_stats_show(struct seq_file *m, void *unused)
 		seq_printf(m, "  tx_zcopy_pool_misses: %lld\n",
 			   (long long)atomic64_read(&p->tx_zcopy_pool_misses));
 	}
-	read_unlock(&peer_lock);
+	read_unlock_irqrestore(&peer_lock, flags);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(u4_data_stats);
@@ -1882,7 +2081,77 @@ bool usb4_rdma_data_detach_peer(struct tb_service *svc)
 
 /* ----- public: TX submit (called from post_send) ------------------ */
 
-int usb4_rdma_data_send(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
+static int u4_data_send_ack_try(struct u4_data_peer *rail, u32 src_qp,
+				u32 dest_qp, u32 psn,
+				__be32 status, bool allow_fallback)
+{
+	struct u4_data_peer *p;
+	struct u4_data_frame *f;
+	u32 actual_len = U4_HDR_SIZE;
+	u32 desc_len;
+	int ret;
+
+	p = u4_data_peer_get_by_qp(rail, src_qp, dest_qp);
+	if (!p)
+		return -ENOTCONN;
+	if (READ_ONCE(p->closing)) {
+		u4_data_peer_put(p);
+		return -ENOTCONN;
+	}
+
+	f = u4_data_claim_tx_frame(p);
+	if (!f) {
+		u4_data_peer_put(p);
+		return -EAGAIN;
+	}
+
+	u4_wire_hdr_init((struct u4_wire_hdr *)f->buf, U4_OP_SEND_ACK,
+			 dest_qp, src_qp, psn, 0, U4_F_LAST, status, 0, 0);
+	f->frame.size = u4_data_tx_desc_size(actual_len);
+	desc_len = u4_data_desc_len(f->frame.size);
+	if (desc_len > actual_len)
+		memset((u8 *)f->buf + actual_len, 0, desc_len - actual_len);
+	f->frame.callback = u4_data_tx_complete;
+	f->frame.sof = U4_DATA_PDF_FRAME_START;
+	f->frame.eof = U4_DATA_PDF_FRAME_END;
+
+	dma_sync_single_for_device(tb_ring_dma_device(p->tx_ring), f->dma,
+				   U4_FRAME_SIZE, DMA_TO_DEVICE);
+	atomic_inc(&p->tx_inflight);
+	if (allow_fallback)
+		ret = usb4_rdma_nhi_raw_tx(p->tx_ring, &f->frame);
+	else
+		ret = usb4_rdma_nhi_raw_tx_atomic(p->tx_ring, &f->frame);
+	if (ret) {
+		dma_sync_single_for_cpu(tb_ring_dma_device(p->tx_ring), f->dma,
+					U4_FRAME_SIZE, DMA_TO_DEVICE);
+		atomic_dec(&p->tx_inflight);
+		atomic_set(&f->in_use, 0);
+		u4_data_tx_wake(p);
+		u4_data_peer_put(p);
+		return ret;
+	}
+
+	u4_data_peer_put(p);
+	return 0;
+}
+
+int usb4_rdma_data_send_ack_atomic(struct u4_data_peer *rail,
+				   u32 src_qp, u32 dest_qp, u32 psn,
+				   __be32 status)
+{
+	return u4_data_send_ack_try(rail, src_qp, dest_qp, psn, status, false);
+}
+
+int usb4_rdma_data_send_ack_try(struct u4_data_peer *rail,
+				u32 src_qp, u32 dest_qp, u32 psn,
+				__be32 status)
+{
+	return u4_data_send_ack_try(rail, src_qp, dest_qp, psn, status, true);
+}
+
+int usb4_rdma_data_send(struct u4_data_peer *rail, u8 opcode,
+			u32 src_qp, u32 dest_qp, u32 psn,
 			u8 flags, __be32 imm_data, u64 remote_addr, u32 rkey,
 			usb4_rdma_data_fill_fn fill, void *fill_ctx,
 			u32 length)
@@ -1897,8 +2166,10 @@ int usb4_rdma_data_send(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
 		return -EMSGSIZE;
 	if (length && !fill)
 		return -EINVAL;
+	if (u4_data_warn_process_tx_from_atomic(__func__))
+		return -EWOULDBLOCK;
 
-	p = u4_data_peer_get_by_qp(src_qp, dest_qp);
+	p = u4_data_peer_get_by_qp(rail, src_qp, dest_qp);
 	if (!p)
 		return -ENOTCONN;
 
@@ -1912,7 +2183,7 @@ int usb4_rdma_data_send(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
 	if (READ_ONCE(p->closing)) {
 		if (f) {
 			atomic_set(&f->in_use, 0);
-			wake_up(&p->tx_wait);
+			u4_data_tx_wake(p);
 		}
 		mutex_unlock(&p->tx_lock);
 		u4_data_peer_put(p);
@@ -1925,7 +2196,7 @@ int usb4_rdma_data_send(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
 		ret = fill((u8 *)f->buf + U4_HDR_SIZE, length, fill_ctx);
 		if (ret) {
 			atomic_set(&f->in_use, 0);
-			wake_up(&p->tx_wait);
+			u4_data_tx_wake(p);
 			mutex_unlock(&p->tx_lock);
 			u4_data_peer_put(p);
 			return ret;
@@ -1942,7 +2213,7 @@ int usb4_rdma_data_send(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
 
 	if (READ_ONCE(p->closing)) {
 		atomic_set(&f->in_use, 0);
-		wake_up(&p->tx_wait);
+		u4_data_tx_wake(p);
 		mutex_unlock(&p->tx_lock);
 		u4_data_peer_put(p);
 		return -ENOTCONN;
@@ -1957,7 +2228,7 @@ int usb4_rdma_data_send(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
 					U4_FRAME_SIZE, DMA_TO_DEVICE);
 		atomic_dec(&p->tx_inflight);
 		atomic_set(&f->in_use, 0);
-		wake_up(&p->tx_wait);
+		u4_data_tx_wake(p);
 		mutex_unlock(&p->tx_lock);
 		u4_data_peer_put(p);
 		return ret;
@@ -1967,7 +2238,8 @@ int usb4_rdma_data_send(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
 	return 0;
 }
 
-int usb4_rdma_data_send_page(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
+int usb4_rdma_data_send_page(struct u4_data_peer *rail, u8 opcode,
+			     u32 src_qp, u32 dest_qp, u32 psn,
 			     u8 flags, __be32 imm_data, u64 remote_addr,
 			     u32 rkey, struct page *page, u32 page_off,
 			     u32 length, usb4_rdma_data_done_fn done,
@@ -1982,8 +2254,16 @@ int usb4_rdma_data_send_page(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
 	if (!page || !length || length > U4_FRAME_SIZE ||
 	    page_off > PAGE_SIZE || length > PAGE_SIZE - page_off)
 		return -EINVAL;
+	if (u4_data_warn_process_tx_from_atomic(__func__))
+		return -EWOULDBLOCK;
 
-	p = u4_data_peer_get();
+	if (rail) {
+		if (!usb4_rdma_data_rail_get(rail))
+			return -ENOTCONN;
+		p = rail;
+	} else {
+		p = u4_data_peer_get();
+	}
 	if (!p)
 		return -ENOTCONN;
 	dma_dev = tb_ring_dma_device(p->tx_ring);
@@ -2036,7 +2316,7 @@ int usb4_rdma_data_send_page(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
 					DMA_TO_DEVICE);
 		atomic_dec(&p->tx_inflight);
 		atomic_set(&hdrf->in_use, 0);
-		wake_up(&p->tx_wait);
+		u4_data_tx_wake(p);
 		goto err_unlock;
 	}
 	hdrf = NULL;
@@ -2052,7 +2332,7 @@ int usb4_rdma_data_send_page(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
 	ret = usb4_rdma_nhi_raw_tx(p->tx_ring, &zf->frame);
 	if (ret) {
 		atomic_dec(&p->tx_inflight);
-		wake_up(&p->tx_wait);
+		u4_data_tx_wake(p);
 		goto err_unlock;
 	}
 
@@ -2063,7 +2343,7 @@ int usb4_rdma_data_send_page(u8 opcode, u32 src_qp, u32 dest_qp, u32 psn,
 err_unlock:
 	if (hdrf) {
 		atomic_set(&hdrf->in_use, 0);
-		wake_up(&p->tx_wait);
+		u4_data_tx_wake(p);
 	}
 	mutex_unlock(&p->tx_lock);
 	dma_unmap_page(dma_dev, zf->dma, zf->length, DMA_TO_DEVICE);
@@ -2100,7 +2380,11 @@ static int u4_data_submit_zcopy_stream(struct u4_data_peer *p,
 	struct u4_data_zcopy_frame *zf, *tmp;
 	struct u4_data_frame *hdrf = NULL;
 	struct device *dma_dev = tb_ring_dma_device(p->tx_ring);
+	struct ring_frame *frame, *frame_tmp;
+	LIST_HEAD(submit);
 	u8 hdr_flags = (flags | U4_F_RAW_STREAM);
+	bool hdrf_dma_synced = false;
+	int unsubmitted;
 	int needed;
 	long wait;
 	int ret;
@@ -2110,7 +2394,7 @@ static int u4_data_submit_zcopy_stream(struct u4_data_peer *p,
 	if (!final_stream)
 		hdr_flags &= ~U4_F_LAST;
 	needed = 1 + u4_data_zcopy_frame_count(frames);
-	if (needed > U4_DATA_FRAMES_PER_DIR)
+	if (needed > p->frames_per_dir)
 		return -E2BIG;
 
 	mutex_lock(&p->tx_lock);
@@ -2145,17 +2429,9 @@ static int u4_data_submit_zcopy_stream(struct u4_data_peer *p,
 
 	dma_sync_single_for_device(dma_dev, hdrf->dma, U4_FRAME_SIZE,
 				   DMA_TO_DEVICE);
-	atomic_inc(&p->tx_inflight);
-	ret = usb4_rdma_nhi_raw_tx(p->tx_ring, &hdrf->frame);
-	if (ret) {
-		dma_sync_single_for_cpu(dma_dev, hdrf->dma, U4_FRAME_SIZE,
-					DMA_TO_DEVICE);
-		atomic_dec(&p->tx_inflight);
-		atomic_set(&hdrf->in_use, 0);
-		wake_up(&p->tx_wait);
-		goto out_unlock;
-	}
-	hdrf = NULL;
+	hdrf_dma_synced = true;
+	INIT_LIST_HEAD(&hdrf->frame.list);
+	list_add_tail(&hdrf->frame.list, &submit);
 
 	list_for_each_entry_safe(zf, tmp, frames, prep_link) {
 		list_del(&zf->prep_link);
@@ -2165,34 +2441,65 @@ static int u4_data_submit_zcopy_stream(struct u4_data_peer *p,
 		zf->frame.sof = U4_DATA_PDF_FRAME_START;
 		zf->frame.eof = U4_DATA_PDF_FRAME_END;
 		INIT_LIST_HEAD(&zf->frame.list);
-
-		if (READ_ONCE(p->closing)) {
-			list_add(&zf->prep_link, frames);
-			ret = -ENOTCONN;
-			goto out_unlock;
-		}
-
-		atomic_inc(&p->tx_inflight);
-		ret = usb4_rdma_nhi_raw_tx(p->tx_ring, &zf->frame);
-		if (ret) {
-			atomic_dec(&p->tx_inflight);
-			wake_up(&p->tx_wait);
-			list_add(&zf->prep_link, frames);
-			goto out_unlock;
-		}
+		list_add_tail(&zf->frame.list, &submit);
 	}
+
+	if (READ_ONCE(p->closing)) {
+		list_for_each_entry_safe(frame, frame_tmp, &submit, list) {
+			list_del_init(&frame->list);
+			if (frame != &hdrf->frame) {
+				zf = container_of(frame,
+						  struct u4_data_zcopy_frame,
+						  frame);
+				list_add(&zf->prep_link, frames);
+			}
+		}
+		ret = -ENOTCONN;
+		goto out_unlock;
+	}
+
+	atomic_add(needed, &p->tx_inflight);
+	ret = usb4_rdma_nhi_raw_tx_batch(p->tx_ring, &submit);
+	if (ret) {
+		unsubmitted = 0;
+		list_for_each_entry_safe(frame, frame_tmp, &submit, list) {
+			list_del_init(&frame->list);
+			atomic_dec(&p->tx_inflight);
+			unsubmitted++;
+			if (frame == &hdrf->frame) {
+				dma_sync_single_for_cpu(dma_dev, hdrf->dma,
+							U4_FRAME_SIZE,
+							DMA_TO_DEVICE);
+				atomic_set(&hdrf->in_use, 0);
+			} else {
+				zf = container_of(frame,
+						  struct u4_data_zcopy_frame,
+						  frame);
+				list_add(&zf->prep_link, frames);
+			}
+		}
+		if (unsubmitted)
+			u4_data_tx_wake(p);
+		hdrf = NULL;
+		goto out_unlock;
+	}
+	hdrf = NULL;
 	ret = 0;
 
 out_unlock:
 	if (hdrf) {
+		if (hdrf_dma_synced)
+			dma_sync_single_for_cpu(dma_dev, hdrf->dma,
+						U4_FRAME_SIZE, DMA_TO_DEVICE);
 		atomic_set(&hdrf->in_use, 0);
-		wake_up(&p->tx_wait);
+		u4_data_tx_wake(p);
 	}
 	mutex_unlock(&p->tx_lock);
 	return ret;
 }
 
-int usb4_rdma_data_send_page_stream(u8 opcode, u32 src_qp, u32 dest_qp,
+int usb4_rdma_data_send_page_stream(struct u4_data_peer *rail, u8 opcode,
+				    u32 src_qp, u32 dest_qp,
 				    u32 psn, u8 flags, __be32 imm_data,
 				    u64 remote_addr, u32 rkey,
 				    u32 total_length,
@@ -2202,7 +2509,6 @@ int usb4_rdma_data_send_page_stream(u8 opcode, u32 src_qp, u32 dest_qp,
 	struct list_head stripes[U4_MAX_ACTIVE_LANES];
 	struct u4_data_peer *peers[U4_MAX_ACTIVE_LANES];
 	u32 stripe_off[U4_MAX_ACTIVE_LANES];
-	u32 stripe_len[U4_MAX_ACTIVE_LANES];
 	bool stripe_seen[U4_MAX_ACTIVE_LANES];
 	u32 prepared = 0;
 	int last_stripe = -1;
@@ -2213,12 +2519,21 @@ int usb4_rdma_data_send_page_stream(u8 opcode, u32 src_qp, u32 dest_qp,
 
 	if (!total_length || !next)
 		return -EINVAL;
+	if (u4_data_warn_process_tx_from_atomic(__func__))
+		return -EWOULDBLOCK;
 
-	npeers = u4_data_peers_get(peers, U4_MAX_ACTIVE_LANES);
+	if (rail) {
+		if (!usb4_rdma_data_rail_get(rail))
+			return -ENOTCONN;
+		peers[0] = rail;
+		npeers = 1;
+	} else {
+		npeers = u4_data_peers_get(peers, U4_MAX_ACTIVE_LANES);
+	}
 	if (!npeers)
 		return -ENOTCONN;
 	if (READ_ONCE(tx_stream_affinity)) {
-		if (total_length <= U4_TX_STREAM_AFFINITY_MAX) {
+		if (total_length <= u4_tx_stream_affinity_max(peers[0])) {
 			affine_lane = hash_32(src_qp ^ dest_qp ^ psn, 32) %
 				      npeers;
 			atomic64_inc(&tx_stream_affinity_used);
@@ -2230,7 +2545,6 @@ int usb4_rdma_data_send_page_stream(u8 opcode, u32 src_qp, u32 dest_qp,
 	for (i = 0; i < U4_MAX_ACTIVE_LANES; i++) {
 		INIT_LIST_HEAD(&stripes[i]);
 		stripe_off[i] = 0;
-		stripe_len[i] = 0;
 		stripe_seen[i] = false;
 	}
 
@@ -2238,20 +2552,22 @@ int usb4_rdma_data_send_page_stream(u8 opcode, u32 src_qp, u32 dest_qp,
 		struct u4_data_zcopy_frame *zf;
 		struct device *dma_dev;
 		struct page *page;
+		u32 page_idx = 0;
 		u32 page_off, length;
 		dma_addr_t dma_addr = 0;
 		bool dma_mapped = false;
+		usb4_rdma_data_dma_resolve_fn resolve = NULL;
+		void *resolve_ctx = NULL;
 		usb4_rdma_data_done_fn done = NULL;
 		void *done_ctx = NULL;
 		u64 stripe;
 		int lane;
 
-		ret = next(next_ctx, &page, &page_off, &length,
-			   &dma_addr, &dma_mapped, &done, &done_ctx);
+		ret = next(next_ctx, &page, &page_idx, &page_off, &length,
+			   &resolve, &resolve_ctx,
+			   &done, &done_ctx);
 		if (ret)
 			goto err_prepared;
-		if (dma_mapped && npeers > 1)
-			dma_mapped = false;
 
 		if (affine_lane >= 0) {
 			lane = affine_lane;
@@ -2280,10 +2596,22 @@ int usb4_rdma_data_send_page_stream(u8 opcode, u32 src_qp, u32 dest_qp,
 			goto err_prepared;
 		}
 		zf->length = length;
-		zf->unmap_dma = !dma_mapped;
 		zf->done = done;
 		zf->done_ctx = done_ctx;
 		dma_dev = tb_ring_dma_device(zf->peer->tx_ring);
+		if (resolve) {
+			ret = resolve(resolve_ctx, dma_dev, page_idx, page_off,
+				      length, DMA_TO_DEVICE, &dma_addr);
+			if (!ret)
+				dma_mapped = true;
+			else if (ret != -EAGAIN) {
+				if (done)
+					done(done_ctx);
+				u4_data_free_tx_zcopy_frame(zf);
+				goto err_prepared;
+			}
+		}
+		zf->unmap_dma = !dma_mapped;
 		if (dma_mapped) {
 			zf->dma = dma_addr;
 			dma_sync_single_for_device(dma_dev, zf->dma, length,
@@ -2304,7 +2632,6 @@ int usb4_rdma_data_send_page_stream(u8 opcode, u32 src_qp, u32 dest_qp,
 			stripe_seen[lane] = true;
 			stripe_off[lane] = prepared;
 		}
-		stripe_len[lane] += length;
 		list_add_tail(&zf->prep_link, &stripes[lane]);
 		prepared += length;
 	}
@@ -2315,16 +2642,31 @@ int usb4_rdma_data_send_page_stream(u8 opcode, u32 src_qp, u32 dest_qp,
 	}
 
 	for (i = 0; i < npeers; i++) {
+		u32 chunk_off;
+
 		if (!stripe_seen[i])
 			continue;
-		ret = u4_data_submit_zcopy_stream(peers[i], opcode, src_qp,
-						  dest_qp, psn, flags,
-						  imm_data, remote_addr, rkey,
-						  stripe_off[i], stripe_len[i],
-						  &stripes[i],
-						  i == last_stripe);
-		if (ret)
-			goto err_prepared;
+		chunk_off = stripe_off[i];
+		while (!list_empty(&stripes[i])) {
+			LIST_HEAD(chunk);
+			u32 chunk_len;
+			bool final_chunk;
+
+			chunk_len = u4_data_move_zcopy_chunk(
+				&stripes[i], &chunk,
+				peers[i]->frames_per_dir - 1);
+			final_chunk = i == last_stripe &&
+				      list_empty(&stripes[i]);
+			ret = u4_data_submit_zcopy_stream(
+				peers[i], opcode, src_qp, dest_qp, psn,
+				flags, imm_data, remote_addr, rkey,
+				chunk_off, chunk_len, &chunk, final_chunk);
+			if (ret) {
+				u4_data_free_zcopy_list(&chunk);
+				goto err_prepared;
+			}
+			chunk_off += chunk_len;
+		}
 	}
 	goto out_put;
 
@@ -2339,7 +2681,8 @@ out_put:
 
 /* ----- public: QP table registration ------------------------------ */
 
-int usb4_rdma_data_register_qp(u32 qp_num, void *qp)
+int usb4_rdma_data_register_qp(u32 qp_num, void *qp,
+			       struct u4_data_peer *rail)
 {
 	struct u4_data_qp_entry *qe, *cur;
 	unsigned long flags;
@@ -2349,11 +2692,12 @@ int usb4_rdma_data_register_qp(u32 qp_num, void *qp)
 	if (!qe)
 		return -ENOMEM;
 	qe->qp_num = qp_num;
+	qe->rail = rail;
 	qe->qp = qp;
 
 	spin_lock_irqsave(&u4_data_qp_lock, flags);
 	hash_for_each_possible(u4_data_qp_table, cur, node, qp_num) {
-		if (cur->qp_num == qp_num) {
+		if (cur->qp_num == qp_num && cur->rail == rail) {
 			ret = -EEXIST;
 			goto out_unlock;
 		}
@@ -2366,7 +2710,7 @@ out_unlock:
 	return ret;
 }
 
-void usb4_rdma_data_unregister_qp(u32 qp_num)
+void usb4_rdma_data_unregister_qp(u32 qp_num, struct u4_data_peer *rail)
 {
 	struct u4_data_qp_entry *qe;
 	struct u4_data_qp_entry *dead = NULL;
@@ -2377,7 +2721,7 @@ void usb4_rdma_data_unregister_qp(u32 qp_num)
 	head = &u4_data_qp_table[hash_min(qp_num, U4_DATA_QP_HASH_BITS)];
 	spin_lock_irqsave(&u4_data_qp_lock, flags);
 	hlist_for_each_entry_safe(qe, tmp, head, node) {
-		if (qe->qp_num == qp_num) {
+		if (qe->qp_num == qp_num && qe->rail == rail) {
 			hash_del_rcu(&qe->node);
 			dead = qe;
 			break;
