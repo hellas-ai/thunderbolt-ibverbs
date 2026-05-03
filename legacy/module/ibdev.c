@@ -134,7 +134,13 @@ static char *rail_mode = "single";
 module_param(rail_mode, charp, 0444);
 MODULE_PARM_DESC(rail_mode,
 		 "verbs rail exposure: single = one usb4_rdma device over all lanes; lane = one ib_device per active NHI lane");
-#define U4_QPN_MIN             2
+/*
+ * AppleThunderboltRDMA starts user UC QPs at 0x900. macOS accepts a local
+ * self-RTR to QPN 0x900 but rejects RTR when the peer advertises Linux's
+ * old QPN 2 with EBUSY, so keep our user-visible QPN range Apple-shaped.
+ * QPN 1 remains reserved for the synthetic GSI QP above.
+ */
+#define U4_QPN_MIN             0x900
 #define U4_QPN_MAX             0x00ffffff
 #define U4_MAX_MSG_SIZE        SZ_1G
 
