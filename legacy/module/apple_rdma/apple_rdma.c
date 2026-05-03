@@ -33,6 +33,7 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/dma-mapping.h>
+#include <linux/crc32.h>
 #include <linux/io.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -127,6 +128,11 @@ static bool tx_enabled;
 module_param(tx_enabled, bool, 0644);
 MODULE_PARM_DESC(tx_enabled,
 		 "Allow experimental Linux -> Mac Apple-shaped SEND descriptors (default: false)");
+
+static bool tx_raw_mode;
+module_param(tx_raw_mode, bool, 0444);
+MODULE_PARM_DESC(tx_raw_mode,
+		 "Use raw NHI TX rings and append Apple's 4-byte end-of-group trailer (default: false)");
 
 static bool rx_raw_mode = true;
 module_param(rx_raw_mode, bool, 0444);
@@ -771,11 +777,19 @@ static int ardma_submit_tx_piece(struct ardma_peer *peer,
 				 struct ardma_send_ctx *ctx,
 				 struct ardma_pd *pd,
 				 const struct ib_sge *sg_list, int num_sge,
-				 u32 app_off, u32 len, u8 eof)
+				 u32 app_off, u32 payload_len,
+				 u32 wire_len, u8 eof,
+				 bool append_crc, u32 crc)
 {
 	struct device *dma_dev = tb_ring_dma_device(peer->tx_ring);
 	struct ardma_tx_frame *tf;
+	__le32 crc_le;
 	int ret;
+
+	if (payload_len > ARDMA_FRAME_SIZE ||
+	    wire_len > ARDMA_FRAME_SIZE ||
+	    (append_crc && payload_len + sizeof(crc_le) > ARDMA_FRAME_SIZE))
+		return -EINVAL;
 
 	tf = kzalloc(sizeof(*tf), GFP_KERNEL);
 	if (!tf)
@@ -786,11 +800,16 @@ static int ardma_submit_tx_piece(struct ardma_peer *peer,
 		return -ENOMEM;
 	}
 	ret = ardma_copy_sges_to_buf(pd, sg_list, num_sge, app_off,
-				     tf->data, len);
+				     tf->data, payload_len);
 	if (ret) {
 		kfree(tf->data);
 		kfree(tf);
 		return ret;
+	}
+	if (append_crc) {
+		crc_le = cpu_to_le32(crc);
+		memcpy((u8 *)tf->data + payload_len, &crc_le,
+		       sizeof(crc_le));
 	}
 
 	tf->peer = peer;
@@ -805,7 +824,7 @@ static int ardma_submit_tx_piece(struct ardma_peer *peer,
 
 	tf->frame.buffer_phy = tf->dma;
 	tf->frame.callback = ardma_tx_callback;
-	tf->frame.size = len;
+	tf->frame.size = wire_len;
 	tf->frame.sof = 0;
 	tf->frame.eof = eof;
 	INIT_LIST_HEAD(&tf->frame.list);
@@ -822,6 +841,24 @@ static int ardma_submit_tx_piece(struct ardma_peer *peer,
 	}
 	atomic64_inc(&peer->tx_frames);
 	return 0;
+}
+
+static int ardma_crc32c_sges(struct ardma_pd *pd,
+			     const struct ib_sge *sg_list, int num_sge,
+			     u32 src_off, u32 len, u32 *crc_out)
+{
+	void *buf;
+	int ret;
+
+	buf = kmalloc(len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	ret = ardma_copy_sges_to_buf(pd, sg_list, num_sge, src_off, buf, len);
+	if (!ret)
+		*crc_out = crc32c(~0u, buf, len) ^ ~0u;
+	kfree(buf);
+	return ret;
 }
 
 static int ardma_wr_total_len(const struct ib_send_wr *wr, u32 *total)
@@ -878,23 +915,41 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 	for (block = 0; block < blocks; block++) {
 		u32 base = block * SZ_4K;
 		u32 piece;
+		u32 crc = 0;
+
+		if (READ_ONCE(tx_raw_mode)) {
+			ret = ardma_crc32c_sges(pd, wr->sg_list, wr->num_sge,
+						base, SZ_4K, &crc);
+			if (ret)
+				goto fail;
+		}
 
 		for (piece = 0; piece < 15; piece++) {
 			ret = ardma_submit_tx_piece(peer, ctx, pd, wr->sg_list,
 						    wr->num_sge,
 						    base + piece * 0x100,
-						    252, piece ? 0 : 1);
+						    READ_ONCE(tx_raw_mode) ?
+							256 : 252,
+						    READ_ONCE(tx_raw_mode) ?
+							256 : 252,
+						    piece ? 0 : 1,
+						    false, 0);
 			if (ret)
 				goto fail;
 		}
 		ret = ardma_submit_tx_piece(peer, ctx, pd, wr->sg_list,
 					    wr->num_sge, base + 0x0f00,
-					    12, 0);
+					    READ_ONCE(tx_raw_mode) ? 16 : 12,
+					    READ_ONCE(tx_raw_mode) ? 16 : 12,
+					    0, false, 0);
 		if (ret)
 			goto fail;
 		ret = ardma_submit_tx_piece(peer, ctx, pd, wr->sg_list,
 					    wr->num_sge, base + 0x0f10,
-					    240, block + 1 == blocks ? 3 : 2);
+					    240,
+					    READ_ONCE(tx_raw_mode) ? 244 : 240,
+					    block + 1 == blocks ? 3 : 2,
+					    READ_ONCE(tx_raw_mode), crc);
 		if (ret)
 			goto fail;
 	}
@@ -1638,11 +1693,13 @@ static void ardma_free_rx_frames(struct ardma_peer *peer)
 static int ardma_setup_rings(struct ardma_peer *peer)
 {
 	struct tb_xdomain *xd = peer->xd;
-	unsigned int tx_ring_flags = RING_FLAG_FRAME | RING_FLAG_E2E;
+	unsigned int tx_ring_flags = RING_FLAG_E2E;
 	unsigned int rx_ring_flags = RING_FLAG_E2E;
 	int e2e_tx_hop;
 	int ret, i;
 
+	if (!READ_ONCE(tx_raw_mode))
+		tx_ring_flags |= RING_FLAG_FRAME;
 	if (!READ_ONCE(rx_raw_mode))
 		rx_ring_flags |= RING_FLAG_FRAME;
 
