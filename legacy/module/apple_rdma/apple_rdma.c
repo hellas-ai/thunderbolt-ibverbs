@@ -58,6 +58,7 @@
 #define ARDMA_MAX_SGE		4
 #define ARDMA_MAX_CQE		4096
 #define ARDMA_MAX_MSG_SIZE	SZ_16M
+#define ARDMA_PENDING_RX_BYTES	SZ_64K
 #define ARDMA_UVERBS_ABI	1
 #define ARDMA_QPN_MIN		0x900
 #define ARDMA_QPN_MAX		0x00ffffff
@@ -221,6 +222,11 @@ struct ardma_qp {
 	u32 rx_byte_len;
 	bool rx_tail_pending;
 	bool rx_truncated;
+	u8 *rx_pending_buf;
+	u32 rx_pending_len;
+	bool rx_pending_active;
+	bool rx_pending_ready;
+	bool rx_pending_truncated;
 
 	spinlock_t list_lock;
 	struct list_head qps_link;
@@ -556,18 +562,67 @@ static struct ardma_recv_wr *ardma_pop_recv_locked(struct ardma_qp *qp)
 	return r;
 }
 
-static void ardma_complete_rx_wr(struct ardma_qp *qp, enum ib_wc_status status)
+static void ardma_push_rx_wc(struct ardma_qp *qp, struct ardma_recv_wr *r,
+			     u32 byte_len, enum ib_wc_status status)
 {
 	struct ardma_cq *recv_cq =
 		container_of(qp->base.recv_cq, struct ardma_cq, base);
-	struct ardma_recv_wr *r;
 	struct ib_wc wc = {};
+
+	wc.wr_id = r->wr_id;
+	wc.wr_cqe = r->wr_cqe;
+	wc.byte_len = byte_len;
+	wc.status = status;
+	wc.opcode = IB_WC_RECV;
+	wc.qp = &qp->base;
+	wc.src_qp = qp->attr.dest_qp_num;
+	wc.port_num = 1;
+	ardma_cq_push_wc(recv_cq, &wc);
+	kfree(r);
+}
+
+static struct ardma_recv_wr *
+ardma_flush_pending_locked(struct ardma_qp *qp, u32 *byte_len,
+			   enum ib_wc_status *status)
+{
+	struct ardma_pd *pd = container_of(qp->base.pd, struct ardma_pd, base);
+	struct ardma_recv_wr *r;
+	int ret;
+
+	if (!qp->rx_pending_ready)
+		return NULL;
+
+	r = ardma_pop_recv_locked(qp);
+	if (!r)
+		return NULL;
+
+	*byte_len = qp->rx_pending_len;
+	*status = qp->rx_pending_truncated ? IB_WC_LOC_LEN_ERR :
+					     IB_WC_SUCCESS;
+	ret = ardma_recv_scatter(pd, r, 0, qp->rx_pending_buf,
+				 qp->rx_pending_len);
+	if (ret == -ERANGE)
+		*status = IB_WC_LOC_LEN_ERR;
+	else if (ret)
+		*status = IB_WC_LOC_PROT_ERR;
+
+	qp->rx_pending_active = false;
+	qp->rx_pending_ready = false;
+	qp->rx_pending_len = 0;
+	qp->rx_pending_truncated = false;
+	return r;
+}
+
+static void ardma_complete_rx_wr(struct ardma_qp *qp, enum ib_wc_status status)
+{
+	struct ardma_recv_wr *r;
+	u32 byte_len;
 	unsigned long flags;
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
 	r = qp->rx_wr;
 	qp->rx_wr = NULL;
-	wc.byte_len = qp->rx_byte_len;
+	byte_len = qp->rx_byte_len;
 	qp->rx_group_base = 0;
 	qp->rx_piece = 0;
 	qp->rx_byte_len = 0;
@@ -578,15 +633,7 @@ static void ardma_complete_rx_wr(struct ardma_qp *qp, enum ib_wc_status status)
 	if (!r)
 		return;
 
-	wc.wr_id = r->wr_id;
-	wc.wr_cqe = r->wr_cqe;
-	wc.status = status;
-	wc.opcode = IB_WC_RECV;
-	wc.qp = &qp->base;
-	wc.src_qp = qp->attr.dest_qp_num;
-	wc.port_num = 1;
-	ardma_cq_push_wc(recv_cq, &wc);
-	kfree(r);
+	ardma_push_rx_wc(qp, r, byte_len, status);
 }
 
 static bool ardma_known_piece(struct ardma_qp *qp, u32 len, u32 *offset,
@@ -622,11 +669,14 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	struct ardma_qp *qp;
 	struct ardma_pd *pd;
 	struct ardma_recv_wr *r;
+	struct ardma_recv_wr *pending_r = NULL;
 	unsigned long flags;
 	u32 dst_off, rel_off;
 	u32 copy_len = len;
+	u32 pending_byte_len = 0;
 	bool group_done;
 	enum ib_wc_status complete_status = IB_WC_SUCCESS;
+	enum ib_wc_status pending_status = IB_WC_SUCCESS;
 	int ret;
 
 	qp = ardma_lookup_qp(qpn);
@@ -641,6 +691,48 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	if (!qp->rx_wr) {
 		r = ardma_pop_recv_locked(qp);
 		if (!r) {
+			if (READ_ONCE(rx_raw_mode) && qp->rx_pending_buf &&
+			    !qp->rx_pending_ready) {
+				if (!qp->rx_pending_active || eof == 1) {
+					qp->rx_pending_active = true;
+					qp->rx_pending_len = 0;
+					qp->rx_pending_truncated = false;
+				}
+				copy_len = len;
+				if (eof == 2 || eof == 3) {
+					if (len < 4) {
+						copy_len = 0;
+						qp->rx_pending_truncated = true;
+						atomic64_inc(&peer->rx_bad_shape);
+					} else {
+						copy_len = len - 4;
+					}
+				}
+				if (qp->rx_pending_len + copy_len >
+				    ARDMA_PENDING_RX_BYTES) {
+					copy_len = ARDMA_PENDING_RX_BYTES -
+						   qp->rx_pending_len;
+					qp->rx_pending_truncated = true;
+				}
+				memcpy(qp->rx_pending_buf + qp->rx_pending_len,
+				       payload, copy_len);
+				qp->rx_pending_len += copy_len;
+				if (eof == 3) {
+					qp->rx_pending_active = false;
+					qp->rx_pending_ready = true;
+					atomic64_inc(&peer->rx_messages);
+					pending_r = ardma_flush_pending_locked(qp,
+						&pending_byte_len,
+						&pending_status);
+				}
+				spin_unlock_irqrestore(&qp->recv_lock, flags);
+				if (pending_r)
+					ardma_push_rx_wc(qp, pending_r,
+							 pending_byte_len,
+							 pending_status);
+				ardma_qp_put(qp);
+				return;
+			}
 			spin_unlock_irqrestore(&qp->recv_lock, flags);
 			atomic64_inc(&peer->rx_drops);
 			ardma_qp_put(qp);
@@ -1189,6 +1281,14 @@ static int ardma_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	spin_lock_init(&qp->recv_lock);
 	INIT_LIST_HEAD(&qp->recv_q);
 	INIT_LIST_HEAD(&qp->qps_link);
+	if (attr->qp_type == IB_QPT_UC) {
+		qp->rx_pending_buf = kzalloc(ARDMA_PENDING_RX_BYTES,
+					     GFP_KERNEL);
+		if (!qp->rx_pending_buf) {
+			ardma_peer_put(peer);
+			return -ENOMEM;
+		}
+	}
 
 	if (attr->qp_type == IB_QPT_GSI) {
 		ibqp->qp_num = 1;
@@ -1196,6 +1296,8 @@ static int ardma_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 		qpn = ida_alloc_range(&ardma_qpn_ida, ARDMA_QPN_MIN,
 				      ARDMA_QPN_MAX, GFP_KERNEL);
 		if (qpn < 0) {
+			kfree(qp->rx_pending_buf);
+			qp->rx_pending_buf = NULL;
 			ardma_peer_put(peer);
 			return qpn;
 		}
@@ -1298,6 +1400,8 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	kfree(qp->rx_wr);
 	qp->rx_wr = NULL;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
+	kfree(qp->rx_pending_buf);
+	qp->rx_pending_buf = NULL;
 
 	if (qp->qpn_allocated)
 		ida_free(&ardma_qpn_ida, ibqp->qp_num);
@@ -1345,6 +1449,18 @@ static int ardma_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 		spin_lock_irqsave(&qp->recv_lock, flags);
 		list_add_tail(&r->list, &qp->recv_q);
 		spin_unlock_irqrestore(&qp->recv_lock, flags);
+	}
+	for (;;) {
+		struct ardma_recv_wr *r;
+		enum ib_wc_status status;
+		u32 byte_len;
+
+		spin_lock_irqsave(&qp->recv_lock, flags);
+		r = ardma_flush_pending_locked(qp, &byte_len, &status);
+		spin_unlock_irqrestore(&qp->recv_lock, flags);
+		if (!r)
+			break;
+		ardma_push_rx_wc(qp, r, byte_len, status);
 	}
 	return 0;
 }
