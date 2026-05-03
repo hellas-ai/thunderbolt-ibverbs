@@ -34,6 +34,7 @@
 #include <linux/seq_file.h>
 #include <linux/dma-mapping.h>
 #include <linux/crc32.h>
+#include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -60,6 +61,8 @@
 #define ARDMA_MAX_MSG_SIZE	SZ_16M
 #define ARDMA_PENDING_RX_BYTES	SZ_512K
 #define ARDMA_PENDING_RX_SLOTS	16
+#define ARDMA_RX_MARKER_LOG_ENTRIES	64
+#define ARDMA_RX_MARKER_PREFIX	16
 #define ARDMA_UVERBS_ABI	1
 #define ARDMA_QPN_MIN		0x900
 #define ARDMA_QPN_MAX		0x00ffffff
@@ -121,6 +124,11 @@ module_param(apple_vendor_only, bool, 0444);
 MODULE_PARM_DESC(apple_vendor_only,
 		 "Bind only peers whose xdomain vendor_name is Apple Inc.");
 
+static char *peer_device_name;
+module_param(peer_device_name, charp, 0444);
+MODULE_PARM_DESC(peer_device_name,
+		 "Bind only a peer whose xdomain device_name exactly matches this value");
+
 static char *cm_netdev = "thunderbolt0";
 module_param(cm_netdev, charp, 0444);
 MODULE_PARM_DESC(cm_netdev,
@@ -145,6 +153,29 @@ static bool rx_raw_mode = true;
 module_param(rx_raw_mode, bool, 0444);
 MODULE_PARM_DESC(rx_raw_mode,
 		 "Use raw NHI RX rings and trim Apple's 4-byte end-of-group trailer (default: true)");
+
+enum {
+	ARDMA_TX_MARKER_APPLE_EOF = 0,
+	ARDMA_TX_MARKER_GEMINI_SOF = 1,
+	ARDMA_TX_MARKER_BOTH_START = 2,
+	ARDMA_TX_MARKER_EVERY_DESC = 3,
+	ARDMA_TX_MARKER_EVERY_SOF_APPLE_EOF = 4,
+};
+
+static unsigned int tx_marker_mode = ARDMA_TX_MARKER_APPLE_EOF;
+module_param(tx_marker_mode, uint, 0644);
+MODULE_PARM_DESC(tx_marker_mode,
+		 "TX marker mode: 0=apple_eof, 1=gemini_sof, 2=both_start, 3=every_desc, 4=every_sof_apple_eof (default: 0)");
+
+/* Diagnostic-only pacing knobs. Default 0 (no pacing). When nonzero,
+ * ardma_send_apple sleeps tx_pace_us microseconds between 4 KiB blocks
+ * - used to test whether the JACCL bracket-transition failure is a
+ * software-timing overrun (would be fixed by enabling raw+E2E hardware
+ * flow control). Settable at runtime via sysfs. */
+static unsigned int tx_pace_us;
+module_param(tx_pace_us, uint, 0644);
+MODULE_PARM_DESC(tx_pace_us,
+		 "Sleep N microseconds between 4 KiB TX blocks in ardma_send_apple (diagnostic; default: 0)");
 
 struct ardma_peer;
 struct ardma_qp;
@@ -271,6 +302,17 @@ struct ardma_tx_frame {
 	dma_addr_t dma;
 };
 
+struct ardma_rx_marker_log_entry {
+	u64 seq;
+	u32 len;
+	u32 meta;
+	u16 flags;
+	u8 sof;
+	u8 eof;
+	u8 prefix_len;
+	u8 prefix[ARDMA_RX_MARKER_PREFIX];
+};
+
 struct ardma_peer {
 	struct tb_service *svc;
 	struct tb_xdomain *xd;
@@ -288,6 +330,11 @@ struct ardma_peer {
 	bool tx_ring_running;
 
 	struct dentry *debugfs_dir;
+	spinlock_t rx_marker_lock;
+	u64 rx_marker_seq;
+	u32 rx_marker_pos;
+	struct ardma_rx_marker_log_entry
+		rx_marker_log[ARDMA_RX_MARKER_LOG_ENTRIES];
 	atomic64_t rx_frame_count;
 	atomic64_t rx_eof[4];
 	atomic64_t rx_eof_other;
@@ -881,6 +928,38 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	ardma_qp_put(qp);
 }
 
+static u32 ardma_rx_frame_meta(const struct ring_frame *frame, u32 len)
+{
+	return (len & 0xfff) |
+	       ((frame->eof & 0xf) << 12) |
+	       ((frame->sof & 0xf) << 16) |
+	       ((frame->flags & 0xfff) << ARDMA_DESC_FLAGS_SHIFT);
+}
+
+static void ardma_rx_marker_log(struct ardma_peer *peer,
+				const struct ring_frame *frame,
+				const void *payload, u32 len)
+{
+	struct ardma_rx_marker_log_entry *e;
+	unsigned long flags;
+	u32 pos;
+
+	spin_lock_irqsave(&peer->rx_marker_lock, flags);
+	pos = peer->rx_marker_pos;
+	e = &peer->rx_marker_log[pos];
+	memset(e, 0, sizeof(*e));
+	e->seq = ++peer->rx_marker_seq;
+	e->len = len;
+	e->meta = ardma_rx_frame_meta(frame, len);
+	e->flags = frame->flags;
+	e->sof = frame->sof;
+	e->eof = frame->eof;
+	e->prefix_len = min_t(u32, len, ARDMA_RX_MARKER_PREFIX);
+	memcpy(e->prefix, payload, e->prefix_len);
+	peer->rx_marker_pos = (pos + 1) % ARDMA_RX_MARKER_LOG_ENTRIES;
+	spin_unlock_irqrestore(&peer->rx_marker_lock, flags);
+}
+
 static void ardma_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
 			      bool canceled)
 {
@@ -902,6 +981,7 @@ static void ardma_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
 		atomic64_inc(&peer->rx_eof[frame->eof]);
 	else
 		atomic64_inc(&peer->rx_eof_other);
+	ardma_rx_marker_log(peer, frame, rf->data, len);
 
 	/* The incoming path is the destination HopID. Apple's visible QPN is
 	 * HopID << 8 for the first QP shape we have observed. */
@@ -947,15 +1027,69 @@ static void ardma_tx_callback(struct tb_ring *ring, struct ring_frame *frame,
 {
 	struct ardma_tx_frame *tf = container_of(frame, typeof(*tf), frame);
 	struct device *dma_dev = tb_ring_dma_device(ring);
+	struct ardma_peer *peer = tf->peer;
 
 	dma_unmap_single(dma_dev, tf->dma, ARDMA_FRAME_SIZE, DMA_TO_DEVICE);
 	if (canceled)
-		atomic64_inc(&tf->peer->tx_errors);
+		atomic64_inc(&peer->tx_errors);
 	else
-		atomic64_inc(&tf->peer->tx_completions);
+		atomic64_inc(&peer->tx_completions);
 	ardma_tx_ctx_put(tf->ctx, canceled);
 	kfree(tf->data);
 	kfree(tf);
+	/* Drop the per-tx-frame peer ref taken in ardma_submit_tx_piece.
+	 * Done after kfree(tf) so we don't deref tf->peer post-free. */
+	ardma_peer_put(peer);
+}
+
+enum ardma_tx_piece_kind {
+	ARDMA_TX_PIECE_FIRST,
+	ARDMA_TX_PIECE_MID,
+	ARDMA_TX_PIECE_SPLIT,
+	ARDMA_TX_PIECE_TAIL,
+};
+
+static void ardma_tx_markers(unsigned int mode, enum ardma_tx_piece_kind kind,
+			     u8 tail_eof, u8 *sof, u8 *eof)
+{
+	bool first = kind == ARDMA_TX_PIECE_FIRST;
+	bool tail = kind == ARDMA_TX_PIECE_TAIL;
+
+	if (mode > ARDMA_TX_MARKER_EVERY_SOF_APPLE_EOF)
+		mode = ARDMA_TX_MARKER_APPLE_EOF;
+
+	*sof = 0;
+	*eof = 0;
+
+	switch (mode) {
+	case ARDMA_TX_MARKER_GEMINI_SOF:
+		if (first)
+			*sof = 1;
+		break;
+	case ARDMA_TX_MARKER_BOTH_START:
+		if (first) {
+			*sof = 1;
+			*eof = 1;
+		}
+		break;
+	case ARDMA_TX_MARKER_EVERY_DESC:
+		*sof = 1;
+		*eof = tail ? tail_eof : 1;
+		break;
+	case ARDMA_TX_MARKER_EVERY_SOF_APPLE_EOF:
+		*sof = 1;
+		if (first)
+			*eof = 1;
+		break;
+	case ARDMA_TX_MARKER_APPLE_EOF:
+	default:
+		if (first)
+			*eof = 1;
+		break;
+	}
+
+	if (tail && mode != ARDMA_TX_MARKER_EVERY_DESC)
+		*eof = tail_eof;
 }
 
 static int ardma_submit_tx_piece(struct ardma_peer *peer,
@@ -963,7 +1097,7 @@ static int ardma_submit_tx_piece(struct ardma_peer *peer,
 				 struct ardma_pd *pd,
 				 const struct ib_sge *sg_list, int num_sge,
 				 u32 app_off, u32 payload_len,
-				 u32 wire_len, u8 eof,
+				 u32 wire_len, u8 sof, u8 eof,
 				 bool append_crc, u32 crc)
 {
 	struct device *dma_dev = tb_ring_dma_device(peer->tx_ring);
@@ -999,9 +1133,15 @@ static int ardma_submit_tx_piece(struct ardma_peer *peer,
 
 	tf->peer = peer;
 	tf->ctx = ctx;
+	/* Per-tx-frame peer ref so ardma_tx_callback (IRQ context) can
+	 * safely deref tf->peer for stat increments without racing
+	 * against ardma_remove freeing the peer. Dropped in the
+	 * callback after the last use. */
+	refcount_inc(&peer->refs);
 	tf->dma = dma_map_single(dma_dev, tf->data, ARDMA_FRAME_SIZE,
 				 DMA_TO_DEVICE);
 	if (dma_mapping_error(dma_dev, tf->dma)) {
+		ardma_peer_put(peer);
 		kfree(tf->data);
 		kfree(tf);
 		return -EIO;
@@ -1010,7 +1150,7 @@ static int ardma_submit_tx_piece(struct ardma_peer *peer,
 	tf->frame.buffer_phy = tf->dma;
 	tf->frame.callback = ardma_tx_callback;
 	tf->frame.size = wire_len;
-	tf->frame.sof = 0;
+	tf->frame.sof = sof;
 	tf->frame.eof = eof;
 	INIT_LIST_HEAD(&tf->frame.list);
 
@@ -1022,6 +1162,7 @@ static int ardma_submit_tx_piece(struct ardma_peer *peer,
 				 DMA_TO_DEVICE);
 		kfree(tf->data);
 		kfree(tf);
+		ardma_peer_put(peer);
 		return ret;
 	}
 	atomic64_inc(&peer->tx_frames);
@@ -1066,6 +1207,7 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 	struct ardma_peer *peer = qp->peer;
 	struct ardma_send_ctx *ctx;
 	u32 total, block, blocks;
+	unsigned int marker_mode;
 	int ret;
 
 	if (!READ_ONCE(tx_enabled))
@@ -1095,12 +1237,23 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 	atomic_set(&ctx->pending, 1);
 	atomic_set(&ctx->failed, 0);
 	ardma_qp_get(qp);
+	marker_mode = READ_ONCE(tx_marker_mode);
 
 	blocks = total / SZ_4K;
 	for (block = 0; block < blocks; block++) {
 		u32 base = block * SZ_4K;
 		u32 piece;
 		u32 crc = 0;
+		unsigned int pace_us;
+		u8 sof, eof;
+
+		/* Diagnostic pacing: sleep between 4 KiB blocks if asked.
+		 * Used to test the overrun hypothesis without changing the
+		 * wire path. block==0 skips so the first block doesn't pay
+		 * the latency cost. */
+		pace_us = READ_ONCE(tx_pace_us);
+		if (block && pace_us)
+			usleep_range(pace_us, pace_us + 10);
 
 		if (READ_ONCE(tx_raw_mode)) {
 			ret = ardma_crc32c_sges(pd, wr->sg_list, wr->num_sge,
@@ -1110,6 +1263,10 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 		}
 
 		for (piece = 0; piece < 15; piece++) {
+			ardma_tx_markers(marker_mode,
+					 piece ? ARDMA_TX_PIECE_MID :
+						 ARDMA_TX_PIECE_FIRST,
+					 0, &sof, &eof);
 			ret = ardma_submit_tx_piece(peer, ctx, pd, wr->sg_list,
 						    wr->num_sge,
 						    base + piece * 0x100,
@@ -1117,23 +1274,28 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 							256 : 252,
 						    READ_ONCE(tx_raw_mode) ?
 							256 : 252,
-						    piece ? 0 : 1,
+						    sof, eof,
 						    false, 0);
 			if (ret)
 				goto fail;
 		}
+		ardma_tx_markers(marker_mode, ARDMA_TX_PIECE_SPLIT, 0,
+				 &sof, &eof);
 		ret = ardma_submit_tx_piece(peer, ctx, pd, wr->sg_list,
 					    wr->num_sge, base + 0x0f00,
 					    READ_ONCE(tx_raw_mode) ? 16 : 12,
 					    READ_ONCE(tx_raw_mode) ? 16 : 12,
-					    0, false, 0);
+					    sof, eof,
+					    false, 0);
 		if (ret)
 			goto fail;
+		ardma_tx_markers(marker_mode, ARDMA_TX_PIECE_TAIL,
+				 block + 1 == blocks ? 3 : 2, &sof, &eof);
 		ret = ardma_submit_tx_piece(peer, ctx, pd, wr->sg_list,
 					    wr->num_sge, base + 0x0f10,
 					    240,
 					    READ_ONCE(tx_raw_mode) ? 244 : 240,
-					    block + 1 == blocks ? 3 : 2,
+					    sof, eof,
 					    READ_ONCE(tx_raw_mode), crc);
 		if (ret)
 			goto fail;
@@ -1487,8 +1649,20 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	if (!wait_event_timeout(qp->ref_wait,
 				refcount_read(&qp->refs) == 1,
 				msecs_to_jiffies(5000))) {
-		pr_warn("destroy_qp[0x%x]: timed out waiting for refs=%u\n",
+		pr_warn("destroy_qp[0x%x]: timed out waiting for refs=%u; "
+			"releasing peer ref to avoid hot-unplug hang (leaks QP)\n",
 			ibqp->qp_num, refcount_read(&qp->refs));
+		/* Critical: drop the peer ref even on timeout. Otherwise
+		 * ardma_remove's unbounded wait_event(refs==1) hangs the
+		 * tb_service remove path forever (D-state kworker on cable
+		 * unplug). We accept the QP-level memory leak (recv_q,
+		 * rx_wr, rx_pending, qpn) over a system-level wedge. */
+		if (qp->qpn_allocated) {
+			ida_free(&ardma_qpn_ida, ibqp->qp_num);
+			qp->qpn_allocated = false;
+		}
+		ardma_peer_put(qp->peer);
+		qp->peer = NULL;
 		return -ETIMEDOUT;
 	}
 
@@ -2054,6 +2228,7 @@ static int ardma_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "rx_hop: %d\n", peer->rx_ring ? peer->rx_ring->hop : -1);
 	seq_printf(m, "local_out_hop: %d\n", peer->local_out_hop);
 	seq_printf(m, "tx_hop: %d\n", peer->tx_ring ? peer->tx_ring->hop : -1);
+	seq_printf(m, "tx_marker_mode: %u\n", READ_ONCE(tx_marker_mode));
 	seq_printf(m, "rx_frames: %lld\n",
 		   (long long)atomic64_read(&peer->rx_frame_count));
 	seq_printf(m, "rx_eof0: %lld\n",
@@ -2215,6 +2390,7 @@ static int ardma_nhi_stall_dump_show(struct seq_file *m, void *unused)
 	seq_printf(m, "paths_enabled: %u\n", peer->paths_enabled);
 	seq_printf(m, "local_in_hop: %d\n", peer->local_in_hop);
 	seq_printf(m, "local_out_hop: %d\n", peer->local_out_hop);
+	seq_printf(m, "tx_marker_mode: %u\n", READ_ONCE(tx_marker_mode));
 	seq_printf(m, "rx_frames: %lld\n",
 		   (long long)atomic64_read(&peer->rx_frame_count));
 	seq_printf(m, "rx_eof0: %lld\n",
@@ -2241,6 +2417,55 @@ static int ardma_nhi_stall_dump_show(struct seq_file *m, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(ardma_nhi_stall_dump);
+
+static int ardma_rx_marker_log_show(struct seq_file *m, void *unused)
+{
+	struct ardma_rx_marker_log_entry *entries;
+	struct ardma_peer *peer = m->private;
+	unsigned long flags;
+	u64 total;
+	u32 count;
+	u32 start;
+	u32 pos;
+	int i, j;
+
+	if (!peer)
+		return -ENODEV;
+
+	entries = kcalloc(ARDMA_RX_MARKER_LOG_ENTRIES, sizeof(*entries),
+			  GFP_KERNEL);
+	if (!entries)
+		return -ENOMEM;
+
+	spin_lock_irqsave(&peer->rx_marker_lock, flags);
+	total = peer->rx_marker_seq;
+	pos = peer->rx_marker_pos;
+	count = min_t(u64, total, ARDMA_RX_MARKER_LOG_ENTRIES);
+	start = (pos + ARDMA_RX_MARKER_LOG_ENTRIES - count) %
+		ARDMA_RX_MARKER_LOG_ENTRIES;
+	for (i = 0; i < count; i++)
+		entries[i] = peer->rx_marker_log[
+			(start + i) % ARDMA_RX_MARKER_LOG_ENTRIES];
+	spin_unlock_irqrestore(&peer->rx_marker_lock, flags);
+
+	seq_printf(m, "rx marker entries logged: %llu (showing %u)\n\n",
+		   total, count);
+	for (i = 0; i < count; i++) {
+		struct ardma_rx_marker_log_entry *e = &entries[i];
+
+		seq_printf(m,
+			   "seq=%llu len=%u sof=%u eof=%u flags=0x%03x meta=0x%08x prefix=",
+			   e->seq, e->len, e->sof, e->eof, e->flags, e->meta);
+		for (j = 0; j < e->prefix_len; j++)
+			seq_printf(m, "%02x%s", e->prefix[j],
+				   j + 1 == e->prefix_len ? "" : " ");
+		seq_putc(m, '\n');
+	}
+
+	kfree(entries);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(ardma_rx_marker_log);
 
 static int ardma_ctrl_log_show(struct seq_file *m, void *unused)
 {
@@ -2281,6 +2506,14 @@ static int ardma_probe(struct tb_service *svc, const struct tb_service_id *id)
 			 xd->vendor_name ? xd->vendor_name : "(null)");
 		return -ENODEV;
 	}
+	if (peer_device_name && *peer_device_name &&
+	    (!xd->device_name || strcmp(xd->device_name, peer_device_name))) {
+		dev_info(&svc->dev,
+			 "skipping AD/FA57 peer device='%s' wanted='%s'\n",
+			 xd->device_name ? xd->device_name : "(null)",
+			 peer_device_name);
+		return -ENODEV;
+	}
 
 	mutex_lock(&ardma_peer_lock);
 	if (ardma_active_peer) {
@@ -2298,6 +2531,7 @@ static int ardma_probe(struct tb_service *svc, const struct tb_service_id *id)
 	refcount_set(&peer->refs, 1);
 	init_waitqueue_head(&peer->ref_wait);
 	mutex_init(&peer->tx_lock);
+	spin_lock_init(&peer->rx_marker_lock);
 	peer->local_in_hop = -1;
 	peer->local_out_hop = -1;
 
@@ -2317,6 +2551,9 @@ static int ardma_probe(struct tb_service *svc, const struct tb_service_id *id)
 	if (!IS_ERR_OR_NULL(peer->debugfs_dir))
 		debugfs_create_file("nhi_stall_dump", 0444, peer->debugfs_dir,
 				    peer, &ardma_nhi_stall_dump_fops);
+	if (!IS_ERR_OR_NULL(peer->debugfs_dir))
+		debugfs_create_file("rx_marker_log", 0444, peer->debugfs_dir,
+				    peer, &ardma_rx_marker_log_fops);
 
 	tb_service_set_drvdata(svc, peer);
 	mutex_lock(&ardma_peer_lock);
