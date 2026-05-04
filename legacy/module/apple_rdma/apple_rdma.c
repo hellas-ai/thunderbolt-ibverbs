@@ -82,6 +82,8 @@
 #define ARDMA_UVERBS_ABI	1
 #define ARDMA_QPN_MIN		0x900
 #define ARDMA_QPN_MAX		0x00ffffff
+#define ARDMA_QPN_STRIDE	0x100
+#define ARDMA_QPN_BASE_SHIFT	8
 
 #define ARDMA_RX_SOF_MASK	0xffff
 #define ARDMA_RX_EOF_MASK	0xffff
@@ -182,6 +184,11 @@ module_param(tx_e2e, bool, 0444);
 MODULE_PARM_DESC(tx_e2e,
 		 "Enable E2E flow control on TX rings (default: true)");
 
+static bool tx_honor_path_mtu;
+module_param(tx_honor_path_mtu, bool, 0644);
+MODULE_PARM_DESC(tx_honor_path_mtu,
+		 "Honor QP path_mtu for FRAME TX segmentation instead of using active_mtu (default: false)");
+
 static bool rx_raw_mode = true;
 module_param(rx_raw_mode, bool, 0444);
 MODULE_PARM_DESC(rx_raw_mode,
@@ -205,10 +212,15 @@ enum {
 	ARDMA_TX_MARKER_EVERY_SOF_APPLE_EOF = 4,
 };
 
-static unsigned int tx_marker_mode = ARDMA_TX_MARKER_APPLE_EOF;
+static unsigned int tx_marker_mode = ARDMA_TX_MARKER_GEMINI_SOF;
 module_param(tx_marker_mode, uint, 0644);
 MODULE_PARM_DESC(tx_marker_mode,
-		 "TX marker mode: 0=apple_eof, 1=gemini_sof, 2=both_start, 3=every_desc, 4=every_sof_apple_eof (default: 0)");
+		 "TX marker mode: 0=apple_eof, 1=gemini_sof, 2=both_start, 3=every_desc, 4=every_sof_apple_eof (default: 1)");
+
+static unsigned int tx_terminal_eof = 3;
+module_param(tx_terminal_eof, uint, 0644);
+MODULE_PARM_DESC(tx_terminal_eof,
+		 "FRAME TX EOF marker for the final chunk of a SEND (default: 3; diagnostic: try 2 for back-to-back SENDs)");
 
 /* Diagnostic-only pacing knobs. Default 0 (no pacing). When nonzero,
  * ardma_send_apple sleeps tx_pace_us microseconds between negotiated MTU chunks
@@ -220,10 +232,25 @@ module_param(tx_pace_us, uint, 0644);
 MODULE_PARM_DESC(tx_pace_us,
 		 "Sleep N microseconds between negotiated TX chunks in ardma_send_apple (diagnostic; default: 0)");
 
+static unsigned int tx_inter_wr_gap_us;
+module_param(tx_inter_wr_gap_us, uint, 0644);
+MODULE_PARM_DESC(tx_inter_wr_gap_us,
+		 "Minimum per-QP delay between SEND WR submissions in microseconds (diagnostic; default: 0)");
+
 static bool event_log = true;
 module_param(event_log, bool, 0644);
 MODULE_PARM_DESC(event_log,
 		 "Record per-peer TX/RX debugfs event rings with timestamps (default: true)");
+
+static bool tx_force_drain_on_destroy;
+module_param(tx_force_drain_on_destroy, bool, 0644);
+MODULE_PARM_DESC(tx_force_drain_on_destroy,
+		 "On destroy_qp ref-wait timeout, stop+restart the peer TX ring to cancel stuck NHI descriptors. Cleanly drops QP refs on Linux but observed to wedge Mac libthunderboltrdma recv-credit state for subsequent sessions; opt-in only. Default: false.");
+
+static bool enable_paths_on_setup = true;
+module_param(enable_paths_on_setup, bool, 0444);
+MODULE_PARM_DESC(enable_paths_on_setup,
+		 "Call tb_xdomain_enable_paths in ardma_setup_rings (allocates DMA tunnel via tb_approve_xdomain_paths). Disable to test whether the tunnel allocation breaks tbnet's IP path. Default: true.");
 
 struct ardma_peer;
 struct ardma_qp;
@@ -316,6 +343,9 @@ struct ardma_qp {
 	u8 rx_pending_tail;
 	u8 rx_pending_ready_count;
 	int rx_pending_active;
+
+	spinlock_t send_lock;
+	u64 last_post_send_ns;
 
 	spinlock_t list_lock;
 	struct list_head qps_link;
@@ -521,7 +551,7 @@ static struct dentry *ardma_debugfs_root;
 static DEFINE_MUTEX(ardma_peer_lock);
 static struct ardma_peer *ardma_active_peer;
 static struct ardma_ibdev *ardma_ibdev;
-static DEFINE_IDA(ardma_qpn_ida);
+static DEFINE_IDA(ardma_qpn_slots);
 static LIST_HEAD(ardma_qp_list);
 static DEFINE_SPINLOCK(ardma_qp_lock);
 static atomic_t ardma_ctrl_logged;
@@ -904,6 +934,32 @@ static struct ardma_qp *ardma_lookup_qp(u32 qpn)
 	}
 	spin_unlock_irqrestore(&ardma_qp_lock, flags);
 	return NULL;
+}
+
+static int ardma_alloc_qpn(void)
+{
+	int base = receive_path << ARDMA_QPN_BASE_SHIFT;
+	int max_slots = (ARDMA_QPN_MAX - base) / ARDMA_QPN_STRIDE;
+	int slot;
+
+	if (base < ARDMA_QPN_MIN || base > ARDMA_QPN_MAX)
+		return -ENOSPC;
+
+	slot = ida_alloc_range(&ardma_qpn_slots, 0, max_slots, GFP_KERNEL);
+	if (slot < 0)
+		return slot;
+	return base + slot * ARDMA_QPN_STRIDE;
+}
+
+static void ardma_free_qpn(u32 qpn)
+{
+	int base = receive_path << ARDMA_QPN_BASE_SHIFT;
+	int slot;
+
+	if (qpn < (u32)base || (qpn - base) % ARDMA_QPN_STRIDE)
+		return;
+	slot = (qpn - base) / ARDMA_QPN_STRIDE;
+	ida_free(&ardma_qpn_slots, slot);
 }
 
 /* ----- CQ helpers ------------------------------------------------ */
@@ -1454,13 +1510,16 @@ enum ardma_tx_piece_kind {
 	ARDMA_TX_PIECE_MID,
 	ARDMA_TX_PIECE_SPLIT,
 	ARDMA_TX_PIECE_TAIL,
+	ARDMA_TX_PIECE_ONLY,
 };
 
 static void ardma_tx_markers(unsigned int mode, enum ardma_tx_piece_kind kind,
 			     u8 tail_eof, u8 *sof, u8 *eof)
 {
-	bool first = kind == ARDMA_TX_PIECE_FIRST;
-	bool tail = kind == ARDMA_TX_PIECE_TAIL;
+	bool first = kind == ARDMA_TX_PIECE_FIRST ||
+		     kind == ARDMA_TX_PIECE_ONLY;
+	bool tail = kind == ARDMA_TX_PIECE_TAIL ||
+		    kind == ARDMA_TX_PIECE_ONLY;
 
 	if (mode > ARDMA_TX_MARKER_EVERY_SOF_APPLE_EOF)
 		mode = ARDMA_TX_MARKER_APPLE_EOF;
@@ -1647,6 +1706,13 @@ static int ardma_tx_chunk_user_len(bool raw_mode, u32 path_mtu,
 	return 0;
 }
 
+static u8 ardma_tx_terminal_eof(void)
+{
+	unsigned int eof = READ_ONCE(tx_terminal_eof);
+
+	return eof <= 0xf ? eof : 3;
+}
+
 static int ardma_send_apple_chunk(struct ardma_peer *peer,
 				  struct ardma_send_ctx *ctx,
 				  struct ardma_pd *pd,
@@ -1705,6 +1771,73 @@ static int ardma_send_apple_chunk(struct ardma_peer *peer,
 					       ARDMA_TAIL_USER_SIZE,
 				    sof, eof, append_crc, crc);
 	return ret;
+}
+
+static int ardma_send_apple_frame_chunk(struct ardma_peer *peer,
+					struct ardma_send_ctx *ctx,
+					struct ardma_pd *pd,
+					const struct ib_sge *sg_list,
+					int num_sge, u32 chunk, u32 base,
+					u32 user_len,
+					unsigned int marker_mode,
+					bool group_first, u8 tail_eof)
+{
+	u32 max_user = ARDMA_FRAME_SLOT_USER_SIZE *
+		       (ARDMA_FRAME_SIZE / ARDMA_SLOT_WIRE_SIZE);
+	u32 remaining = user_len;
+	u32 pos = 0;
+	u32 piece = 0;
+	bool first_piece = true;
+	u8 sof, eof;
+	int ret;
+
+	if (!user_len || user_len > max_user)
+		return -EINVAL;
+
+	while (remaining > ARDMA_FRAME_SLOT_USER_SIZE) {
+		ardma_tx_markers(marker_mode,
+				 group_first && first_piece ?
+				 ARDMA_TX_PIECE_FIRST : ARDMA_TX_PIECE_MID,
+				 0, &sof, &eof);
+		ret = ardma_submit_tx_piece(peer, ctx, pd, sg_list, num_sge,
+					    chunk, piece, base + pos,
+					    ARDMA_FRAME_SLOT_USER_SIZE,
+					    ARDMA_FRAME_SLOT_USER_SIZE,
+					    sof, eof, false, 0);
+		if (ret)
+			return ret;
+		pos += ARDMA_FRAME_SLOT_USER_SIZE;
+		remaining -= ARDMA_FRAME_SLOT_USER_SIZE;
+		piece++;
+		first_piece = false;
+	}
+
+	if (remaining > ARDMA_TAIL_USER_SIZE) {
+		u32 split_len = remaining - ARDMA_TAIL_USER_SIZE;
+
+		ardma_tx_markers(marker_mode,
+				 group_first && first_piece ?
+				 ARDMA_TX_PIECE_FIRST : ARDMA_TX_PIECE_SPLIT,
+				 0, &sof, &eof);
+		ret = ardma_submit_tx_piece(peer, ctx, pd, sg_list, num_sge,
+					    chunk, piece, base + pos,
+					    split_len, split_len, sof, eof,
+					    false, 0);
+		if (ret)
+			return ret;
+		pos += split_len;
+		remaining -= split_len;
+		piece++;
+		first_piece = false;
+	}
+
+	ardma_tx_markers(marker_mode,
+			 group_first && first_piece ? ARDMA_TX_PIECE_ONLY :
+						      ARDMA_TX_PIECE_TAIL,
+			 tail_eof, &sof, &eof);
+	return ardma_submit_tx_piece(peer, ctx, pd, sg_list, num_sge, chunk,
+				     piece, base + pos, remaining, remaining,
+				     sof, eof, false, 0);
 }
 
 static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
@@ -1768,20 +1901,22 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 	}
 
 	raw_mode = READ_ONCE(tx_raw_mode);
+	if (!raw_mode && !READ_ONCE(tx_honor_path_mtu))
+		path_mtu = ardma_active_mtu_bytes();
+
 	ret = ardma_tx_chunk_user_len(raw_mode, path_mtu, &chunk_len, &slots);
 	if (ret) {
 		pr_warn_ratelimited("send_apple[qp=0x%x]: unsupported path_mtu=%u raw=%u -> EMSGSIZE\n",
 			qp->base.qp_num, path_mtu, raw_mode);
 		return -EMSGSIZE;
 	}
-	if (total % chunk_len) {
-		pr_warn_ratelimited("send_apple[qp=0x%x]: total=%u is not a multiple of tx_chunk=%u (path_mtu=%u raw=%u slots=%u) -> EMSGSIZE\n",
-			qp->base.qp_num, total, chunk_len, path_mtu,
-			raw_mode, slots);
+	if (raw_mode && total % chunk_len) {
+		pr_warn_ratelimited("send_apple[qp=0x%x]: raw total=%u is not a multiple of tx_chunk=%u (path_mtu=%u slots=%u) -> EMSGSIZE\n",
+			qp->base.qp_num, total, chunk_len, path_mtu, slots);
 		return -EMSGSIZE;
 	}
 
-	chunks = total / chunk_len;
+	chunks = raw_mode ? total / chunk_len : DIV_ROUND_UP(total, chunk_len);
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
 		return -ENOMEM;
@@ -1802,6 +1937,32 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 			   0, chunk_len, path_mtu, 0, 0,
 			   atomic_read(&ctx->pending), 0,
 			   ctx->signaled, false);
+
+	if (!raw_mode) {
+		u8 terminal_eof = ardma_tx_terminal_eof();
+
+		for (chunk = 0; chunk < chunks; chunk++) {
+			u32 base = chunk * chunk_len;
+			u32 this_len = min_t(u32, chunk_len, total - base);
+			u8 tail_eof = chunk == chunks - 1 ? terminal_eof : 2;
+			unsigned int pace_us;
+
+			pace_us = READ_ONCE(tx_pace_us);
+			if (chunk && pace_us)
+				usleep_range(pace_us, pace_us + 10);
+
+			ret = ardma_send_apple_frame_chunk(peer, ctx, pd,
+							   wr->sg_list,
+							   wr->num_sge, chunk,
+							   base, this_len,
+							   marker_mode,
+							   chunk == 0,
+							   tail_eof);
+			if (ret)
+				goto fail;
+		}
+		goto posted;
+	}
 
 	for (chunk = 0; chunk < chunks;) {
 		u32 group_max = raw_mode ? ARDMA_FRAME_SIZE :
@@ -1856,6 +2017,7 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 		}
 	}
 
+posted:
 	ardma_log_tx_event(peer, ARDMA_TX_EVT_WR_POSTED, ctx->qpn,
 			   ctx->dest_qpn, ctx->wr_id, total, 0, chunks, 0,
 			   0, chunk_len, path_mtu, 0, 0,
@@ -1872,6 +2034,37 @@ fail:
 			   ctx->signaled, true);
 	ardma_tx_ctx_put(ctx, true);
 	return ret;
+}
+
+static void ardma_tx_apply_inter_wr_gap(struct ardma_qp *qp)
+{
+	unsigned int gap_us = READ_ONCE(tx_inter_wr_gap_us);
+	u64 gap_ns, now, last, target, delay_ns, delay_us;
+	unsigned long flags;
+
+	if (!gap_us)
+		return;
+
+	gap_ns = (u64)gap_us * NSEC_PER_USEC;
+	for (;;) {
+		spin_lock_irqsave(&qp->send_lock, flags);
+		now = ktime_get_ns();
+		last = qp->last_post_send_ns;
+		if (!last || now - last >= gap_ns) {
+			qp->last_post_send_ns = now;
+			spin_unlock_irqrestore(&qp->send_lock, flags);
+			return;
+		}
+		target = last + gap_ns;
+		spin_unlock_irqrestore(&qp->send_lock, flags);
+
+		delay_ns = target - now;
+		delay_us = DIV_ROUND_UP_ULL(delay_ns, NSEC_PER_USEC);
+		if (delay_us > UINT_MAX - 10)
+			delay_us = UINT_MAX - 10;
+		usleep_range((unsigned int)delay_us,
+			     (unsigned int)delay_us + 10);
+	}
 }
 
 /* ----- verbs object ops ------------------------------------------ */
@@ -2093,6 +2286,7 @@ static int ardma_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	refcount_set(&qp->refs, 1);
 	init_waitqueue_head(&qp->ref_wait);
 	spin_lock_init(&qp->recv_lock);
+	spin_lock_init(&qp->send_lock);
 	INIT_LIST_HEAD(&qp->recv_q);
 	INIT_LIST_HEAD(&qp->qps_link);
 	qp->rx_pending_active = -1;
@@ -2114,8 +2308,7 @@ static int ardma_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	if (attr->qp_type == IB_QPT_GSI) {
 		ibqp->qp_num = 1;
 	} else {
-		qpn = ida_alloc_range(&ardma_qpn_ida, ARDMA_QPN_MIN,
-				      ARDMA_QPN_MAX, GFP_KERNEL);
+		qpn = ardma_alloc_qpn();
 		if (qpn < 0) {
 			int i;
 
@@ -2242,21 +2435,54 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	if (!wait_event_timeout(qp->ref_wait,
 				refcount_read(&qp->refs) == 1,
 				msecs_to_jiffies(5000))) {
-		pr_warn("destroy_qp[0x%x]: timed out waiting for refs=%u; "
-			"releasing peer ref to avoid hot-unplug hang (leaks QP)\n",
-			ibqp->qp_num, refcount_read(&qp->refs));
-		/* Critical: drop the peer ref even on timeout. Otherwise
-		 * ardma_remove's unbounded wait_event(refs==1) hangs the
-		 * tb_service remove path forever (D-state kworker on cable
-		 * unplug). We accept the QP-level memory leak (recv_q,
-		 * rx_wr, rx_pending, qpn) over a system-level wedge. */
-		if (qp->qpn_allocated) {
-			ida_free(&ardma_qpn_ida, ibqp->qp_num);
-			qp->qpn_allocated = false;
+		bool drained = false;
+
+		if (READ_ONCE(tx_force_drain_on_destroy) && qp->peer &&
+		    qp->peer->tx_ring) {
+			/* Force-cancel stuck NHI descriptors. tb_ring_stop
+			 * triggers ardma_tx_callback(canceled=true) for every
+			 * pending tx_frame, which decrements ctx pending counts
+			 * and ultimately runs ardma_qp_put() on QPs whose WRs
+			 * never naturally completed (e.g., Mac never returned
+			 * E2E credits). This kills any in-flight TX on OTHER
+			 * QPs sharing the same peer ring -- accept that vs
+			 * leaking QP state and wedging the module-unload path. */
+			pr_warn("destroy_qp[0x%x]: forcing TX ring drain to clear refs=%u\n",
+				ibqp->qp_num, refcount_read(&qp->refs));
+			ardma_stop_tx_ring(qp->peer);
+			drained = wait_event_timeout(qp->ref_wait,
+						     refcount_read(&qp->refs) == 1,
+						     msecs_to_jiffies(2000)) > 0;
+			/* Restart the ring so future post_sends on other QPs
+			 * (or a fresh QP create on this peer) don't get
+			 * permanent ESHUTDOWN. */
+			mutex_lock(&qp->peer->tx_lock);
+			if (qp->peer->tx_ring && !qp->peer->tx_ring_running) {
+				tb_ring_start(qp->peer->tx_ring);
+				qp->peer->tx_ring_running = true;
+			}
+			mutex_unlock(&qp->peer->tx_lock);
 		}
-		ardma_peer_put(qp->peer);
-		qp->peer = NULL;
-		return -ETIMEDOUT;
+
+		if (!drained) {
+			pr_warn("destroy_qp[0x%x]: timed out waiting for refs=%u; "
+				"releasing peer ref to avoid hot-unplug hang (leaks QP)\n",
+				ibqp->qp_num, refcount_read(&qp->refs));
+			/* Critical: drop the peer ref even on timeout. Otherwise
+			 * ardma_remove's unbounded wait_event(refs==1) hangs the
+			 * tb_service remove path forever (D-state kworker on cable
+			 * unplug). We accept the QP-level memory leak (recv_q,
+			 * rx_wr, rx_pending) over a system-level wedge. */
+			if (qp->qpn_allocated) {
+				ardma_free_qpn(ibqp->qp_num);
+				qp->qpn_allocated = false;
+			}
+			ardma_peer_put(qp->peer);
+			qp->peer = NULL;
+			return -ETIMEDOUT;
+		}
+		pr_info("destroy_qp[0x%x]: TX ring drain completed; clean cleanup\n",
+			ibqp->qp_num);
 	}
 
 	spin_lock_irqsave(&qp->recv_lock, flags);
@@ -2272,8 +2498,10 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 		qp->rx_pending[i].buf = NULL;
 	}
 
-	if (qp->qpn_allocated)
-		ida_free(&ardma_qpn_ida, ibqp->qp_num);
+	if (qp->qpn_allocated) {
+		ardma_free_qpn(ibqp->qp_num);
+		qp->qpn_allocated = false;
+	}
 	ardma_peer_put(qp->peer);
 	qp->peer = NULL;
 	return 0;
@@ -2364,6 +2592,7 @@ static int ardma_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
 				*bad_wr = wr;
 			return -EOPNOTSUPP;
 		}
+		ardma_tx_apply_inter_wr_gap(qp);
 		ret = ardma_send_apple(qp, wr);
 		if (ret) {
 			if (bad_wr)
@@ -2909,19 +3138,24 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 		}
 	}
 
-	ret = tb_xdomain_enable_paths(xd, peer->local_out_hop,
-				      peer->tx_ring->hop,
-				      peer->local_in_hop,
-				      peer->rx_ring->hop);
-	if (ret) {
-		pr_warn("enable_paths failed: %d\n", ret);
-		goto err_started;
+	if (READ_ONCE(enable_paths_on_setup)) {
+		ret = tb_xdomain_enable_paths(xd, peer->local_out_hop,
+					      peer->tx_ring->hop,
+					      peer->local_in_hop,
+					      peer->rx_ring->hop);
+		if (ret) {
+			pr_warn("enable_paths failed: %d\n", ret);
+			goto err_started;
+		}
+		peer->paths_enabled = true;
+	} else {
+		pr_info("enable_paths_on_setup=0: skipping tb_xdomain_enable_paths\n");
 	}
-	peer->paths_enabled = true;
 
-	pr_info("rings active: in_path=%d rx_hop=%d out_path=%d tx_hop=%d\n",
+	pr_info("rings active: in_path=%d rx_hop=%d out_path=%d tx_hop=%d (paths_enabled=%d)\n",
 		peer->local_in_hop, peer->rx_ring->hop,
-		peer->local_out_hop, peer->tx_ring->hop);
+		peer->local_out_hop, peer->tx_ring->hop,
+		peer->paths_enabled);
 	return 0;
 
 err_started:
@@ -4057,7 +4291,27 @@ static void ardma_remove(struct tb_service *svc)
 	if (ardma_ibdev)
 		atomic_set(&ardma_ibdev->active_peers, 0);
 	ardma_unregister_remote_ad_protocol(peer);
-	wait_event(peer->ref_wait, refcount_read(&peer->refs) == 1);
+	if (!wait_event_timeout(peer->ref_wait,
+				refcount_read(&peer->refs) == 1,
+				msecs_to_jiffies(5000))) {
+		/* Stuck refs at module unload typically come from leaked QPs
+		 * (destroy_qp's tx_force_drain_on_destroy=false path). The
+		 * tx ring still holds in-flight tx_frame callbacks that will
+		 * never naturally complete (Mac never returned credits). Force
+		 * a ring stop here -- whole module is going away so collateral
+		 * damage to other in-flight TX is irrelevant. tb_ring_stop()
+		 * synchronously fires all pending callbacks with canceled=true,
+		 * which decrements ctx->pending and finally drops the QP refs
+		 * that hold the peer ref. */
+		pr_warn("ardma_remove: peer refs=%u after 5s; force-stopping TX ring to drain stuck descriptors\n",
+			refcount_read(&peer->refs));
+		ardma_stop_tx_ring(peer);
+		if (!wait_event_timeout(peer->ref_wait,
+					refcount_read(&peer->refs) == 1,
+					msecs_to_jiffies(2000)))
+			pr_warn("ardma_remove: peer refs=%u still nonzero after drain; proceeding (callback-vs-free race possible)\n",
+				refcount_read(&peer->refs));
+	}
 	ardma_teardown_rings(peer);
 	debugfs_remove_recursive(peer->debugfs_dir);
 	kvfree(peer->tx_event_log);
@@ -4209,6 +4463,11 @@ static int __init ardma_init(void)
 		pr_err("invalid service_uuid '%s'\n", service_uuid);
 		return ret;
 	}
+	if (receive_path <= 0 || receive_path > (ARDMA_QPN_MAX >> 8)) {
+		pr_err("invalid receive_path %d for Apple-shaped QPNs\n",
+		       receive_path);
+		return -EINVAL;
+	}
 
 	ardma_debugfs_root = debugfs_create_dir(ARDMA_DRV_NAME, NULL);
 	if (IS_ERR(ardma_debugfs_root))
@@ -4260,7 +4519,7 @@ static void __exit ardma_exit(void)
 	ardma_unregister_property_dir();
 	ardma_free_ctrl_log();
 	debugfs_remove_recursive(ardma_debugfs_root);
-	ida_destroy(&ardma_qpn_ida);
+	ida_destroy(&ardma_qpn_slots);
 	pr_info("unloaded\n");
 }
 
