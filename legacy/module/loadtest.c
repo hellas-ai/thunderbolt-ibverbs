@@ -52,6 +52,7 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/uuid.h>
+#include <linux/bitops.h>
 #include <linux/thunderbolt.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
@@ -61,8 +62,10 @@
 #include <linux/atomic.h>
 #include <linux/ktime.h>
 #include <linux/delay.h>
+#include <linux/io.h>
 
 #include "usb4_rdma.h"
+#include "nhi_raw.h"
 
 #define LOADTEST_PROTO_KEY        "u4lt"
 #define LOADTEST_PROTO_ID         1
@@ -77,8 +80,31 @@
 #define LOADTEST_PDF_FRAME_END    2
 
 #define LOADTEST_FRAME_SIZE       SZ_4K
-#define LOADTEST_RING_DEPTH       128
-#define LOADTEST_FRAMES_PER_RING  96   /* outstanding frames */
+#define LOADTEST_RING_DEPTH_DEFAULT      256
+#define LOADTEST_RING_DEPTH_MIN          16
+#define LOADTEST_RING_DEPTH_MAX          4095
+#define LOADTEST_FRAMES_PER_RING_SLACK   32
+#define LOADTEST_RAW_BATCH_MAX    128
+
+#define LOADTEST_NHI_REG_TX_RING_BASE  0x00000
+#define LOADTEST_NHI_REG_RX_RING_BASE  0x08000
+#define LOADTEST_NHI_RING_SLOT_SIZE    16
+
+#define LOADTEST_NHI_DESC_LENGTH_MASK  GENMASK(11, 0)
+#define LOADTEST_NHI_DESC_EOF_SHIFT    12
+#define LOADTEST_NHI_DESC_EOF_MASK     GENMASK(15, 12)
+#define LOADTEST_NHI_DESC_SOF_SHIFT    16
+#define LOADTEST_NHI_DESC_SOF_MASK     GENMASK(19, 16)
+#define LOADTEST_NHI_DESC_FLAGS_SHIFT  20
+#define LOADTEST_NHI_DESC_FLAGS_MASK   GENMASK(31, 20)
+
+struct loadtest_nhi_desc {
+	u64 phys;
+	u32 meta;
+	u32 time;
+} __packed;
+
+static_assert(sizeof(struct loadtest_nhi_desc) == 16);
 
 static bool enable;
 module_param(enable, bool, 0444);
@@ -94,6 +120,51 @@ MODULE_PARM_DESC(nr_rings, "Number of ring pairs to open (1..5; default 4)");
 static int frame_size = LOADTEST_FRAME_SIZE;
 module_param(frame_size, int, 0644);
 MODULE_PARM_DESC(frame_size, "Frame size in bytes (default 4096)");
+
+static uint ring_depth = LOADTEST_RING_DEPTH_DEFAULT;
+module_param(ring_depth, uint, 0444);
+MODULE_PARM_DESC(ring_depth,
+	"NHI descriptor ring depth for loadtest rings (default 256, max 4095)");
+
+static uint frames_per_ring;
+module_param(frames_per_ring, uint, 0444);
+MODULE_PARM_DESC(frames_per_ring,
+	"Outstanding frame buffers per loadtest ring; 0 = ring_depth - 32 (default)");
+
+static bool loadtest_raw_batch = true;
+module_param(loadtest_raw_batch, bool, 0644);
+MODULE_PARM_DESC(loadtest_raw_batch,
+	"Use raw-NHI batch post/poll in loadtest when raw_nhi=1 (default true)");
+
+static bool loadtest_raw_unlocked;
+module_param(loadtest_raw_unlocked, bool, 0644);
+MODULE_PARM_DESC(loadtest_raw_unlocked,
+	"Use unsafe unlocked raw-NHI helpers in loadtest; requires one software owner per ring (default false)");
+
+static bool loadtest_flood;
+module_param(loadtest_flood, bool, 0444);
+MODULE_PARM_DESC(loadtest_flood,
+	"Use experimental descriptor-flood loadtest path: fixed descriptor-slot buffers, no ring lists, callbacks, or per-frame atomics; requires raw_nhi=1 raw_nhi_desc_irq=0 (default false)");
+
+static unsigned int loadtest_flood_doorbell_batch;
+module_param(loadtest_flood_doorbell_batch, uint, 0444);
+MODULE_PARM_DESC(loadtest_flood_doorbell_batch,
+	"Flood path minimum free descriptors before producer-index write; 0 reposts any free descriptors immediately (default 0)");
+
+static bool loadtest_tx = true;
+module_param(loadtest_tx, bool, 0644);
+MODULE_PARM_DESC(loadtest_tx,
+	"Start loadtest TX threads when debugfs/start is written (default true; set false for RX-only peer)");
+
+static bool loadtest_rx = true;
+module_param(loadtest_rx, bool, 0644);
+MODULE_PARM_DESC(loadtest_rx,
+	"Start raw loadtest RX poll threads when debugfs/start is written (default true; set false for TX-only peer)");
+
+static bool loadtest_e2e = true;
+module_param(loadtest_e2e, bool, 0444);
+MODULE_PARM_DESC(loadtest_e2e,
+	"Enable E2E flow control on loadtest rings (default true)");
 
 /* Service UUID (uuidgen -r): 96f4dde0-3e3a-4f4b-9b81-2c5d4f1c8a99 */
 static const uuid_t loadtest_uuid =
@@ -132,8 +203,20 @@ struct loadtest_ring {
 	atomic64_t rx_bytes;
 	atomic64_t tx_packets;
 	atomic64_t rx_packets;
+	atomic64_t tx_errors;
+	atomic64_t rx_repost_errors;
+
+	u64 flood_tx_bytes;
+	u64 flood_rx_bytes;
+	u64 flood_tx_packets;
+	u64 flood_rx_packets;
+	u64 flood_tx_errors;
+	u64 flood_rx_errors;
+	u64 flood_tx_doorbells;
+	u64 flood_rx_doorbells;
 
 	struct task_struct *tx_thread;
+	struct task_struct *rx_thread;
 };
 
 struct loadtest_dev {
@@ -152,6 +235,118 @@ struct loadtest_dev {
 static inline struct device *ring_dev(struct loadtest_ring *lr)
 {
 	return tb_ring_dma_device(lr->tx_ring ?: lr->rx_ring);
+}
+
+static bool loadtest_use_raw_batch(void)
+{
+	return READ_ONCE(loadtest_raw_batch) && usb4_rdma_nhi_raw_enabled();
+}
+
+static bool loadtest_use_flood(void)
+{
+	return READ_ONCE(loadtest_flood) && loadtest_use_raw_batch();
+}
+
+static unsigned int loadtest_ring_depth(void)
+{
+	return clamp_t(uint, READ_ONCE(ring_depth), LOADTEST_RING_DEPTH_MIN,
+		       LOADTEST_RING_DEPTH_MAX);
+}
+
+static unsigned int loadtest_auto_frames_per_ring(unsigned int depth)
+{
+	if (depth > LOADTEST_FRAMES_PER_RING_SLACK)
+		return depth - LOADTEST_FRAMES_PER_RING_SLACK;
+
+	return depth - 1;
+}
+
+static unsigned int loadtest_frames_per_ring(unsigned int depth, bool flood)
+{
+	uint frames;
+
+	if (flood)
+		return depth;
+
+	frames = READ_ONCE(frames_per_ring);
+	if (!frames)
+		frames = loadtest_auto_frames_per_ring(depth);
+
+	return clamp_t(uint, frames, 1, depth - 1);
+}
+
+static void __iomem *loadtest_nhi_desc_base(const struct tb_ring *ring)
+{
+	void __iomem *io = ring->nhi->iobase;
+
+	io += ring->is_tx ? LOADTEST_NHI_REG_TX_RING_BASE :
+			    LOADTEST_NHI_REG_RX_RING_BASE;
+	io += ring->hop * LOADTEST_NHI_RING_SLOT_SIZE;
+	return io;
+}
+
+static void loadtest_nhi_write_index(const struct tb_ring *ring, u16 index)
+{
+	void __iomem *reg = loadtest_nhi_desc_base(ring) + 8;
+
+	if (ring->is_tx)
+		iowrite32((u32)index << 16, reg);
+	else
+		iowrite32(index, reg);
+}
+
+static bool loadtest_ring_empty(const struct tb_ring *ring)
+{
+	return ring->head == ring->tail;
+}
+
+static unsigned int loadtest_ring_free(const struct tb_ring *ring)
+{
+	if (ring->head >= ring->tail)
+		return ring->size - (ring->head - ring->tail) - 1;
+
+	return ring->tail - ring->head - 1;
+}
+
+static u32 loadtest_desc_flags(u32 meta)
+{
+	return (meta & LOADTEST_NHI_DESC_FLAGS_MASK) >>
+	       LOADTEST_NHI_DESC_FLAGS_SHIFT;
+}
+
+static u32 loadtest_desc_length(u32 meta)
+{
+	return meta & LOADTEST_NHI_DESC_LENGTH_MASK;
+}
+
+static u32 loadtest_flood_tx_meta(void)
+{
+	u32 flags = RING_DESC_POSTED;
+	u32 meta = flags << LOADTEST_NHI_DESC_FLAGS_SHIFT;
+
+	meta |= frame_size & LOADTEST_NHI_DESC_LENGTH_MASK;
+	meta |= (LOADTEST_PDF_FRAME_END << LOADTEST_NHI_DESC_EOF_SHIFT) &
+		LOADTEST_NHI_DESC_EOF_MASK;
+	meta |= (LOADTEST_PDF_FRAME_START << LOADTEST_NHI_DESC_SOF_SHIFT) &
+		LOADTEST_NHI_DESC_SOF_MASK;
+	return meta;
+}
+
+static u32 loadtest_flood_rx_meta(void)
+{
+	return RING_DESC_POSTED << LOADTEST_NHI_DESC_FLAGS_SHIFT;
+}
+
+static u32 loadtest_flood_wire_bytes(u32 desc_len)
+{
+	if (desc_len)
+		return desc_len;
+	return min_t(u32, frame_size, SZ_4K);
+}
+
+static u32 loadtest_flood_tx_bytes_per_frame(void)
+{
+	return min_t(u32, frame_size, SZ_4K);
 }
 
 /* ----- frame pool helpers ----------------------------------------- */
@@ -252,6 +447,13 @@ static void tx_callback(struct tb_ring *ring, struct ring_frame *frame,
 	atomic_dec(&lr->tx_inflight);
 }
 
+static void loadtest_account_rx(struct loadtest_ring *lr,
+				const struct ring_frame *frame)
+{
+	atomic64_add(frame_actual_bytes(frame), &lr->rx_bytes);
+	atomic64_inc(&lr->rx_packets);
+}
+
 static void rx_callback(struct tb_ring *ring, struct ring_frame *frame,
 			bool canceled)
 {
@@ -261,8 +463,7 @@ static void rx_callback(struct tb_ring *ring, struct ring_frame *frame,
 	if (canceled)
 		return;
 
-	atomic64_add(frame_actual_bytes(frame), &lr->rx_bytes);
-	atomic64_inc(&lr->rx_packets);
+	loadtest_account_rx(lr, frame);
 
 	/* Re-post the frame for another receive. */
 	tb_ring_rx(lr->rx_ring, &lf->frame);
@@ -270,12 +471,104 @@ static void rx_callback(struct tb_ring *ring, struct ring_frame *frame,
 
 /* ----- TX kthread -------------------------------------------------- */
 
+static bool loadtest_poll_tx_raw(struct loadtest_ring *lr)
+{
+	struct ring_frame *frame, *tmp;
+	LIST_HEAD(done);
+	unsigned int n;
+
+	if (READ_ONCE(loadtest_raw_unlocked))
+		n = usb4_rdma_nhi_raw_poll_batch_unlocked(lr->tx_ring, &done,
+							  LOADTEST_RAW_BATCH_MAX);
+	else
+		n = usb4_rdma_nhi_raw_poll_batch(lr->tx_ring, &done,
+						 LOADTEST_RAW_BATCH_MAX);
+	list_for_each_entry_safe(frame, tmp, &done, list) {
+		list_del_init(&frame->list);
+		if (frame->callback)
+			frame->callback(lr->tx_ring, frame, false);
+	}
+	return n > 0;
+}
+
+static void loadtest_cancel_unposted_tx(struct loadtest_ring *lr,
+					struct list_head *frames)
+{
+	struct ring_frame *frame, *tmp;
+
+	list_for_each_entry_safe(frame, tmp, frames, list) {
+		list_del_init(&frame->list);
+		atomic_dec(&lr->tx_inflight);
+		atomic64_inc(&lr->tx_errors);
+	}
+}
+
+static bool loadtest_post_tx_raw(struct loadtest_ring *lr, int *slot)
+{
+	LIST_HEAD(submit);
+	int avail, count = 0;
+	int ret;
+
+	avail = lr->frames_per_side - atomic_read(&lr->tx_inflight);
+	while (avail-- > 0 && count < LOADTEST_RAW_BATCH_MAX) {
+		struct loadtest_frame *lf = &lr->tx_frames[*slot];
+
+		if (WARN_ON_ONCE(!list_empty(&lf->frame.list)))
+			break;
+
+		lf->frame.callback = tx_callback;
+		lf->frame.sof = LOADTEST_PDF_FRAME_START;
+		lf->frame.eof = LOADTEST_PDF_FRAME_END;
+		lf->frame.flags = 0;
+		lf->frame.size = frame_size;
+
+		list_add_tail(&lf->frame.list, &submit);
+		atomic_inc(&lr->tx_inflight);
+		*slot = (*slot + 1) % lr->frames_per_side;
+		count++;
+	}
+
+	if (list_empty(&submit))
+		return false;
+
+	if (READ_ONCE(loadtest_raw_unlocked))
+		ret = usb4_rdma_nhi_raw_tx_batch_unlocked(lr->tx_ring,
+							  &submit);
+	else
+		ret = usb4_rdma_nhi_raw_tx_batch_atomic(lr->tx_ring,
+							&submit);
+	if (ret && ret != -EAGAIN)
+		atomic64_inc(&lr->tx_errors);
+	if (!list_empty(&submit))
+		loadtest_cancel_unposted_tx(lr, &submit);
+
+	return true;
+}
+
 static int tx_thread_fn(void *data)
 {
 	struct loadtest_ring *lr = data;
 	int slot = 0;
+	unsigned int empty = 0;
 
 	while (!kthread_should_stop()) {
+		if (loadtest_use_raw_batch()) {
+			bool work;
+
+			work = loadtest_poll_tx_raw(lr);
+			work |= loadtest_post_tx_raw(lr, &slot);
+			if (!work) {
+				cpu_relax();
+				if (++empty >= 4096) {
+					empty = 0;
+					cond_resched();
+				}
+			} else {
+				empty = 0;
+			}
+			continue;
+		}
+
 		if (atomic_read(&lr->tx_inflight) >= lr->frames_per_side) {
 			/* Saturated — nothing to do until completions free
 			 * a slot. */
@@ -305,23 +598,288 @@ static int tx_thread_fn(void *data)
 	return 0;
 }
 
+static void loadtest_repost_rx_raw(struct loadtest_ring *lr,
+				   struct list_head *frames)
+{
+	struct ring_frame *frame, *tmp;
+	int ret;
+
+	while (!list_empty(frames)) {
+		if (READ_ONCE(loadtest_raw_unlocked))
+			ret = usb4_rdma_nhi_raw_rx_batch_unlocked(lr->rx_ring,
+								  frames);
+		else
+			ret = usb4_rdma_nhi_raw_rx_batch_atomic(lr->rx_ring,
+								frames);
+		if (!ret)
+			return;
+		if (ret == -EAGAIN) {
+			cpu_relax();
+			cond_resched();
+			continue;
+		}
+
+		list_for_each_entry_safe(frame, tmp, frames, list) {
+			list_del_init(&frame->list);
+			atomic64_inc(&lr->rx_repost_errors);
+		}
+		break;
+	}
+}
+
+static bool loadtest_poll_rx_raw(struct loadtest_ring *lr)
+{
+	struct ring_frame *frame, *tmp;
+	LIST_HEAD(done);
+	LIST_HEAD(repost);
+	unsigned int n;
+
+	if (READ_ONCE(loadtest_raw_unlocked))
+		n = usb4_rdma_nhi_raw_poll_batch_unlocked(lr->rx_ring, &done,
+							  LOADTEST_RAW_BATCH_MAX);
+	else
+		n = usb4_rdma_nhi_raw_poll_batch(lr->rx_ring, &done,
+						 LOADTEST_RAW_BATCH_MAX);
+	list_for_each_entry_safe(frame, tmp, &done, list) {
+		list_del_init(&frame->list);
+		loadtest_account_rx(lr, frame);
+		frame->callback = rx_callback;
+		list_add_tail(&frame->list, &repost);
+	}
+
+	loadtest_repost_rx_raw(lr, &repost);
+	return n > 0;
+}
+
+static int rx_thread_fn(void *data)
+{
+	struct loadtest_ring *lr = data;
+	unsigned int empty = 0;
+
+	while (!kthread_should_stop()) {
+		if (loadtest_poll_rx_raw(lr)) {
+			empty = 0;
+			continue;
+		}
+
+		cpu_relax();
+		if (++empty >= 4096) {
+			empty = 0;
+			cond_resched();
+		}
+	}
+
+	return 0;
+}
+
+/* ----- descriptor-flood loadtest path ----------------------------- */
+
+static unsigned int loadtest_flood_post(struct loadtest_ring *lr,
+					struct tb_ring *ring,
+					struct loadtest_frame *frames,
+					bool tx)
+{
+	struct loadtest_nhi_desc *descs =
+		(struct loadtest_nhi_desc *)ring->descriptors;
+	u32 meta = tx ? loadtest_flood_tx_meta() : loadtest_flood_rx_meta();
+	unsigned int posted = 0;
+	unsigned int batch = READ_ONCE(loadtest_flood_doorbell_batch);
+	unsigned int free;
+
+	if (WARN_ON_ONCE(lr->frames_per_side < ring->size))
+		return 0;
+	if (!ring->running)
+		return 0;
+	if (batch >= ring->size)
+		batch = ring->size - 1;
+
+	free = loadtest_ring_free(ring);
+	if (!free)
+		return 0;
+	if (batch && free < batch)
+		return 0;
+
+	while (posted < free) {
+		struct loadtest_frame *lf = &frames[ring->head];
+
+		descs[ring->head].phys = lf->frame.buffer_phy;
+		descs[ring->head].meta = meta;
+		descs[ring->head].time = 0;
+
+		ring->head = (ring->head + 1) % ring->size;
+		posted++;
+	}
+
+	if (posted) {
+		dma_wmb();
+		loadtest_nhi_write_index(ring, ring->head);
+		if (tx)
+			lr->flood_tx_doorbells++;
+		else
+			lr->flood_rx_doorbells++;
+	}
+
+	return posted;
+}
+
+static int loadtest_flood_prime_rx(struct loadtest_ring *lr)
+{
+	unsigned int posted;
+
+	posted = loadtest_flood_post(lr, lr->rx_ring, lr->rx_frames, false);
+	if (!posted)
+		return -EAGAIN;
+
+	pr_info("ring %d: flood-primed %u RX descriptors\n", lr->idx,
+		posted);
+	return 0;
+}
+
+static unsigned int loadtest_flood_poll_tx(struct loadtest_ring *lr)
+{
+	struct tb_ring *ring = lr->tx_ring;
+	struct loadtest_nhi_desc *descs =
+		(struct loadtest_nhi_desc *)ring->descriptors;
+	unsigned int done = 0;
+
+	if (!ring->running)
+		return 0;
+
+	while (!loadtest_ring_empty(ring)) {
+		u32 meta = READ_ONCE(descs[ring->tail].meta);
+
+		if (!(loadtest_desc_flags(meta) & RING_DESC_COMPLETED))
+			break;
+
+		ring->tail = (ring->tail + 1) % ring->size;
+		done++;
+	}
+
+	if (done) {
+		lr->flood_tx_packets += done;
+		lr->flood_tx_bytes += (u64)done *
+				      loadtest_flood_tx_bytes_per_frame();
+	}
+
+	return done;
+}
+
+static unsigned int loadtest_flood_poll_rx(struct loadtest_ring *lr)
+{
+	struct tb_ring *ring = lr->rx_ring;
+	struct loadtest_nhi_desc *descs =
+		(struct loadtest_nhi_desc *)ring->descriptors;
+	unsigned int done = 0;
+	u64 bytes = 0;
+
+	if (!ring->running)
+		return 0;
+
+	while (!loadtest_ring_empty(ring)) {
+		u32 meta = READ_ONCE(descs[ring->tail].meta);
+		u32 flags = loadtest_desc_flags(meta);
+
+		if (!(flags & RING_DESC_COMPLETED))
+			break;
+
+		if (flags & (RING_DESC_CRC_ERROR | RING_DESC_BUFFER_OVERRUN))
+			lr->flood_rx_errors++;
+		bytes += loadtest_flood_wire_bytes(loadtest_desc_length(meta));
+		ring->tail = (ring->tail + 1) % ring->size;
+		done++;
+	}
+
+	if (done) {
+		lr->flood_rx_packets += done;
+		lr->flood_rx_bytes += bytes;
+	}
+
+	return done;
+}
+
+static int flood_tx_thread_fn(void *data)
+{
+	struct loadtest_ring *lr = data;
+	unsigned int empty = 0;
+
+	while (!kthread_should_stop()) {
+		bool work = false;
+
+		work |= loadtest_flood_poll_tx(lr) > 0;
+		work |= loadtest_flood_post(lr, lr->tx_ring,
+					    lr->tx_frames, true) > 0;
+
+		if (!work) {
+			cpu_relax();
+			if (++empty >= 4096) {
+				empty = 0;
+				cond_resched();
+			}
+		} else {
+			empty = 0;
+		}
+	}
+
+	return 0;
+}
+
+static int flood_rx_thread_fn(void *data)
+{
+	struct loadtest_ring *lr = data;
+	unsigned int empty = 0;
+
+	while (!kthread_should_stop()) {
+		bool work = false;
+
+		work |= loadtest_flood_poll_rx(lr) > 0;
+		work |= loadtest_flood_post(lr, lr->rx_ring,
+					    lr->rx_frames, false) > 0;
+
+		if (!work) {
+			cpu_relax();
+			if (++empty >= 4096) {
+				empty = 0;
+				cond_resched();
+			}
+		} else {
+			empty = 0;
+		}
+	}
+
+	return 0;
+}
+
 /* ----- ring setup / teardown -------------------------------------- */
 
 static int loadtest_ring_setup(struct loadtest_dev *dev, int idx)
 {
 	struct loadtest_ring *lr = &dev->rings[idx];
 	struct tb_xdomain *xd = dev->xd;
+	unsigned int depth = loadtest_ring_depth();
 	int out_hop, in_hop;
 	u16 sof_mask = BIT(LOADTEST_PDF_FRAME_START);
 	u16 eof_mask = BIT(LOADTEST_PDF_FRAME_END);
+	unsigned int ring_flags = RING_FLAG_FRAME;
 	int ret, i;
 
 	lr->dev = dev;
 	lr->idx = idx;
-	lr->frames_per_side = LOADTEST_FRAMES_PER_RING;
+	lr->frames_per_side = loadtest_frames_per_ring(depth,
+						       READ_ONCE(loadtest_flood));
 	atomic_set(&lr->tx_inflight, 0);
 	atomic64_set(&lr->tx_bytes, 0);
 	atomic64_set(&lr->rx_bytes, 0);
+
+	if (READ_ONCE(loadtest_flood) && !loadtest_use_flood()) {
+		pr_warn("ring %d: loadtest_flood requires raw_nhi=1 and loadtest_raw_batch=1\n",
+			idx);
+		return -EINVAL;
+	}
+	if (READ_ONCE(loadtest_flood) && frame_size > SZ_4K) {
+		pr_warn("ring %d: loadtest_flood refuses frame_size=%d; NHI frame descriptors are limited to 4096 bytes\n",
+			idx, frame_size);
+		return -EINVAL;
+	}
 
 	/* Auto-allocate hop IDs (>= TB_PATH_MIN_HOPID = 8). */
 	out_hop = tb_xdomain_alloc_out_hopid(xd, -1);
@@ -347,24 +905,28 @@ static int loadtest_ring_setup(struct loadtest_dev *dev, int idx)
 	 * loss in the no-E2E baseline). thunderbolt_net always sets E2E
 	 * on its data ring; we mirror it. The RX ring's e2e_tx_hop arg
 	 * is paired with the local TX ring's hop. */
-	lr->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, LOADTEST_RING_DEPTH,
-				       RING_FLAG_FRAME | RING_FLAG_E2E);
+	if (READ_ONCE(loadtest_e2e))
+		ring_flags |= RING_FLAG_E2E;
+
+	lr->tx_ring = tb_ring_alloc_tx(xd->tb->nhi, -1, depth, ring_flags);
 	if (!lr->tx_ring) {
 		ret = -ENOMEM;
 		goto err_hopid;
 	}
 
-	lr->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, LOADTEST_RING_DEPTH,
-				       RING_FLAG_FRAME | RING_FLAG_E2E,
-				       lr->tx_ring->hop,
+	lr->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, -1, depth,
+				       ring_flags,
+				       READ_ONCE(loadtest_e2e) ?
+				       lr->tx_ring->hop : 0,
 				       sof_mask, eof_mask, NULL, NULL);
 	if (!lr->rx_ring) {
 		ret = -ENOMEM;
 		goto err_tx_ring;
 	}
 
-	pr_info("ring %d: tx_ring->hop=%d rx_ring->hop=%d\n",
-		idx, lr->tx_ring->hop, lr->rx_ring->hop);
+	pr_info("ring %d: tx_ring->hop=%d rx_ring->hop=%d depth=%u frames=%d\n",
+		idx, lr->tx_ring->hop, lr->rx_ring->hop, depth,
+		lr->frames_per_side);
 
 	ret = alloc_frames(lr, &lr->tx_frames, lr->frames_per_side, true);
 	if (ret)
@@ -380,14 +942,48 @@ static int loadtest_ring_setup(struct loadtest_dev *dev, int idx)
 	tb_ring_start(lr->tx_ring);
 	tb_ring_start(lr->rx_ring);
 
-	for (i = 0; i < lr->frames_per_side; i++) {
-		struct loadtest_frame *lf = &lr->rx_frames[i];
-		lf->frame.callback = rx_callback;
-		ret = tb_ring_rx(lr->rx_ring, &lf->frame);
+	if (loadtest_use_flood()) {
+		ret = loadtest_flood_prime_rx(lr);
 		if (ret) {
-			pr_warn("ring %d: tb_ring_rx() returned %d at slot %d\n",
-				idx, ret, i);
+			pr_warn("ring %d: flood RX prime failed: %d\n",
+				idx, ret);
 			goto err_rings_started;
+		}
+	} else if (loadtest_use_raw_batch()) {
+		LIST_HEAD(rx_submit);
+
+		for (i = 0; i < lr->frames_per_side; i++) {
+			struct loadtest_frame *lf = &lr->rx_frames[i];
+
+			lf->frame.callback = rx_callback;
+			list_add_tail(&lf->frame.list, &rx_submit);
+		}
+		if (READ_ONCE(loadtest_raw_unlocked))
+			ret = usb4_rdma_nhi_raw_rx_batch_unlocked(lr->rx_ring,
+								  &rx_submit);
+		else
+			ret = usb4_rdma_nhi_raw_rx_batch_atomic(lr->rx_ring,
+								&rx_submit);
+		if (ret || !list_empty(&rx_submit)) {
+			struct ring_frame *frame, *tmp;
+
+			pr_warn("ring %d: raw RX batch post failed: ret=%d remaining=%d\n",
+				idx, ret, !list_empty(&rx_submit));
+			list_for_each_entry_safe(frame, tmp, &rx_submit, list)
+				list_del_init(&frame->list);
+			goto err_rings_started;
+		}
+	} else {
+		for (i = 0; i < lr->frames_per_side; i++) {
+			struct loadtest_frame *lf = &lr->rx_frames[i];
+
+			lf->frame.callback = rx_callback;
+			ret = tb_ring_rx(lr->rx_ring, &lf->frame);
+			if (ret) {
+				pr_warn("ring %d: tb_ring_rx() returned %d at slot %d\n",
+					idx, ret, i);
+				goto err_rings_started;
+			}
 		}
 	}
 
@@ -433,6 +1029,10 @@ static void loadtest_ring_teardown(struct loadtest_dev *dev, int idx)
 		kthread_stop(lr->tx_thread);
 		lr->tx_thread = NULL;
 	}
+	if (lr->rx_thread) {
+		kthread_stop(lr->rx_thread);
+		lr->rx_thread = NULL;
+	}
 
 	if (lr->tx_ring) {
 		tb_ring_stop(lr->tx_ring);
@@ -476,13 +1076,51 @@ static int loadtest_start(struct loadtest_dev *dev)
 		atomic64_set(&lr->rx_bytes, 0);
 		atomic64_set(&lr->tx_packets, 0);
 		atomic64_set(&lr->rx_packets, 0);
+		atomic64_set(&lr->tx_errors, 0);
+		atomic64_set(&lr->rx_repost_errors, 0);
+		lr->flood_tx_bytes = 0;
+		lr->flood_rx_bytes = 0;
+		lr->flood_tx_packets = 0;
+		lr->flood_rx_packets = 0;
+		lr->flood_tx_errors = 0;
+		lr->flood_rx_errors = 0;
+		lr->flood_tx_doorbells = 0;
+		lr->flood_rx_doorbells = 0;
 	}
 
 	dev->start_time = ktime_get();
 
+	if (loadtest_use_raw_batch() && READ_ONCE(loadtest_rx)) {
+		for (i = 0; i < dev->nr_rings; i++) {
+			struct loadtest_ring *lr = &dev->rings[i];
+
+			lr->rx_thread = kthread_run(loadtest_use_flood() ?
+						    flood_rx_thread_fn :
+						    rx_thread_fn,
+						    lr, "u4lt-rx-%d", i);
+			if (IS_ERR(lr->rx_thread)) {
+				int err = PTR_ERR(lr->rx_thread);
+
+				lr->rx_thread = NULL;
+				while (--i >= 0) {
+					kthread_stop(dev->rings[i].rx_thread);
+					dev->rings[i].rx_thread = NULL;
+				}
+				return err;
+			}
+		}
+	}
+
+	if (!READ_ONCE(loadtest_tx)) {
+		dev->running = true;
+		return 0;
+	}
+
 	for (i = 0; i < dev->nr_rings; i++) {
 		struct loadtest_ring *lr = &dev->rings[i];
-		lr->tx_thread = kthread_run(tx_thread_fn, lr,
+		lr->tx_thread = kthread_run(loadtest_use_flood() ?
+					    flood_tx_thread_fn : tx_thread_fn,
+					    lr,
 					    "u4lt-tx-%d", i);
 		if (IS_ERR(lr->tx_thread)) {
 			int err = PTR_ERR(lr->tx_thread);
@@ -490,6 +1128,14 @@ static int loadtest_start(struct loadtest_dev *dev)
 			while (--i >= 0) {
 				kthread_stop(dev->rings[i].tx_thread);
 				dev->rings[i].tx_thread = NULL;
+			}
+			if (loadtest_use_raw_batch()) {
+				for (i = 0; i < dev->nr_rings; i++) {
+					if (dev->rings[i].rx_thread) {
+						kthread_stop(dev->rings[i].rx_thread);
+						dev->rings[i].rx_thread = NULL;
+					}
+				}
 			}
 			return err;
 		}
@@ -511,6 +1157,10 @@ static void loadtest_stop(struct loadtest_dev *dev)
 			kthread_stop(dev->rings[i].tx_thread);
 			dev->rings[i].tx_thread = NULL;
 		}
+		if (dev->rings[i].rx_thread) {
+			kthread_stop(dev->rings[i].rx_thread);
+			dev->rings[i].rx_thread = NULL;
+		}
 	}
 
 	dev->running = false;
@@ -523,6 +1173,7 @@ static int stats_show(struct seq_file *m, void *unused)
 	struct loadtest_dev *dev = m->private;
 	u64 total_tx_bytes = 0, total_rx_bytes = 0;
 	u64 total_tx_pkts = 0, total_rx_pkts = 0;
+	u64 total_tx_doorbells = 0, total_rx_doorbells = 0;
 	u64 elapsed_ns;
 	int i;
 
@@ -537,35 +1188,61 @@ static int stats_show(struct seq_file *m, void *unused)
 
 	seq_printf(m, "nr_rings:    %d\n", dev->nr_rings);
 	seq_printf(m, "frame_size:  %d bytes\n", frame_size);
+	seq_printf(m, "ring_depth:  %u\n", loadtest_ring_depth());
+	seq_printf(m, "frames/ring: %d\n",
+		   dev->nr_rings > 0 ? dev->rings[0].frames_per_side : 0);
+	seq_printf(m, "raw_batch:   %d\n", loadtest_use_raw_batch());
+	seq_printf(m, "raw_unlocked:%d\n", READ_ONCE(loadtest_raw_unlocked));
+	seq_printf(m, "flood:       %d\n", loadtest_use_flood());
+	seq_printf(m, "flood_db_batch:%u\n",
+		   READ_ONCE(loadtest_flood_doorbell_batch));
+	seq_printf(m, "tx_enabled:  %d\n", READ_ONCE(loadtest_tx));
+	seq_printf(m, "rx_enabled:  %d\n", READ_ONCE(loadtest_rx));
+	seq_printf(m, "e2e:         %d\n", READ_ONCE(loadtest_e2e));
 	seq_printf(m, "elapsed:     %llu ms\n", elapsed_ns / 1000000);
 	seq_puts(m, "\n");
 
-	seq_printf(m, "  %-4s %-10s %-12s %-12s %-12s %-12s %-12s\n",
+	seq_printf(m, "  %-4s %-10s %-12s %-12s %-12s %-12s %-12s %-12s %-12s\n",
 		   "ring", "hop", "tx_bytes", "rx_bytes",
-		   "tx_pkts", "rx_pkts", "rx_Gbps");
-	seq_puts(m, "  --------------------------------------------------------------------------\n");
+		   "tx_pkts", "rx_pkts", "rx_Gbps", "tx_err",
+		   "rx_err");
+	seq_puts(m, "  ------------------------------------------------------------------------------------------------------\n");
 
 	for (i = 0; i < dev->nr_rings; i++) {
 		struct loadtest_ring *lr = &dev->rings[i];
-		u64 tb = atomic64_read(&lr->tx_bytes);
-		u64 rb = atomic64_read(&lr->rx_bytes);
-		u64 tp = atomic64_read(&lr->tx_packets);
-		u64 rp = atomic64_read(&lr->rx_packets);
-		u64 gbps_x100 = (rb * 8 * 100 * 1000000000ULL) /
-				(elapsed_ns * 1000000000ULL);
-		/* Simpler: rx Gbps = rx_bytes * 8 / elapsed_ns */
-		u64 gbps_int = (rb * 8) / elapsed_ns;
-		u64 gbps_frac = ((rb * 8) % elapsed_ns) * 100 / elapsed_ns;
+		u64 tb, rb, tp, rp, te, re;
+		u64 gbps_int;
+		u64 gbps_frac;
 
-		(void)gbps_x100;
-		seq_printf(m, "  %-4d %-10d %-12llu %-12llu %-12llu %-12llu %llu.%02llu\n",
+		if (loadtest_use_flood()) {
+			tb = READ_ONCE(lr->flood_tx_bytes);
+			rb = READ_ONCE(lr->flood_rx_bytes);
+			tp = READ_ONCE(lr->flood_tx_packets);
+			rp = READ_ONCE(lr->flood_rx_packets);
+			te = READ_ONCE(lr->flood_tx_errors);
+			re = READ_ONCE(lr->flood_rx_errors);
+		} else {
+			tb = atomic64_read(&lr->tx_bytes);
+			rb = atomic64_read(&lr->rx_bytes);
+			tp = atomic64_read(&lr->tx_packets);
+			rp = atomic64_read(&lr->rx_packets);
+			te = atomic64_read(&lr->tx_errors);
+			re = atomic64_read(&lr->rx_repost_errors);
+		}
+
+		gbps_int = (rb * 8) / elapsed_ns;
+		gbps_frac = ((rb * 8) % elapsed_ns) * 100 / elapsed_ns;
+
+		seq_printf(m, "  %-4d %-10d %-12llu %-12llu %-12llu %-12llu %llu.%02llu      %-12llu %-12llu\n",
 			   i, lr->hop, tb, rb, tp, rp,
-			   gbps_int, gbps_frac);
+			   gbps_int, gbps_frac, te, re);
 
 		total_tx_bytes += tb;
 		total_rx_bytes += rb;
 		total_tx_pkts += tp;
 		total_rx_pkts += rp;
+		total_tx_doorbells += READ_ONCE(lr->flood_tx_doorbells);
+		total_rx_doorbells += READ_ONCE(lr->flood_rx_doorbells);
 	}
 
 	{
@@ -581,6 +1258,9 @@ static int stats_show(struct seq_file *m, void *unused)
 		seq_printf(m, "AGGREGATE RX: %llu bytes, %llu pkts, %llu.%02llu Gbps\n",
 			   total_rx_bytes, total_rx_pkts,
 			   rx_gbps_int, rx_gbps_frac);
+		if (loadtest_use_flood())
+			seq_printf(m, "FLOOD DOORBELLS: TX %llu, RX %llu\n",
+				   total_tx_doorbells, total_rx_doorbells);
 	}
 	return 0;
 }

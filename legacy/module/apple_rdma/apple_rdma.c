@@ -3324,6 +3324,83 @@ static int ardma_nhi_rings_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(ardma_nhi_rings);
 
+static int ardma_nhi_all_rings_show(struct seq_file *m, void *unused)
+{
+	struct ardma_peer *peer = m->private;
+	struct tb_nhi *nhi;
+	u32 hop_count;
+	int active;
+	u32 i;
+
+	if (!peer || !peer->xd || !peer->xd->tb || !peer->xd->tb->nhi)
+		return -ENODEV;
+
+	nhi = peer->xd->tb->nhi;
+	hop_count = READ_ONCE(nhi->hop_count);
+
+	seq_printf(m,
+		   "peer=%s receive_path=%d paths_enabled=%u local_in_hop=%d local_out_hop=%d hop_count=%u tx_raw_mode=%u tx_e2e=%u rx_raw_mode=%u rx_poll_mode=%u tx_marker_mode=%u\n",
+		   dev_name(&peer->svc->dev), receive_path, peer->paths_enabled,
+		   peer->local_in_hop, peer->local_out_hop, hop_count,
+		   READ_ONCE(tx_raw_mode), READ_ONCE(tx_e2e),
+		   READ_ONCE(rx_raw_mode), READ_ONCE(rx_poll_mode),
+		   READ_ONCE(tx_marker_mode));
+	seq_puts(m, "# All active NHI rings on this controller, including thunderbolt-net.\n");
+	seq_puts(m, "# TX reg low16=controller tail, high16=host producer.\n");
+	seq_puts(m, "# RX reg low16=host consumer, high16=controller tail.\n");
+	seq_puts(m, "# opt0 bits: enable=31 raw=30 no_snoop=29 e2e=28 e2e_peer_tx_hop=22:12.\n\n");
+
+	seq_puts(m, "tx_rings:\n");
+	active = 0;
+	for (i = 0; i < hop_count; i++) {
+		struct tb_ring *ring = READ_ONCE(nhi->tx_rings[i]);
+		u64 posted = 0;
+		u64 completed = 0;
+		u64 errors = 0;
+
+		if (!ring)
+			continue;
+
+		if (ring == peer->tx_ring) {
+			posted = atomic64_read(&peer->tx_frames);
+			completed = atomic64_read(&peer->tx_completions);
+			errors = atomic64_read(&peer->tx_errors);
+			seq_puts(m, "  owner=apple_rdma\n");
+		} else {
+			seq_puts(m, "  owner=other\n");
+		}
+		ardma_dump_ring_summary(m, "tx", ring, posted, completed,
+					errors);
+		active++;
+	}
+	seq_printf(m, "active_tx_rings=%d\n\n", active);
+
+	seq_puts(m, "rx_rings:\n");
+	active = 0;
+	for (i = 0; i < hop_count; i++) {
+		struct tb_ring *ring = READ_ONCE(nhi->rx_rings[i]);
+		u64 posted = 0;
+		u64 completed = 0;
+
+		if (!ring)
+			continue;
+
+		if (ring == peer->rx_ring) {
+			posted = ARDMA_RX_FRAMES;
+			completed = atomic64_read(&peer->rx_frame_count);
+			seq_puts(m, "  owner=apple_rdma\n");
+		} else {
+			seq_puts(m, "  owner=other\n");
+		}
+		ardma_dump_ring_summary(m, "rx", ring, posted, completed, 0);
+		active++;
+	}
+	seq_printf(m, "active_rx_rings=%d\n", active);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(ardma_nhi_all_rings);
+
 static int ardma_rx_marker_log_show(struct seq_file *m, void *unused)
 {
 	struct ardma_rx_marker_log_entry *entries;
@@ -3505,12 +3582,13 @@ static atomic_t ardma_login_command_id = ATOMIC_INIT(0);
 
 static int ardma_send_xdomain_probe(struct ardma_peer *peer,
 				    const uuid_t *dispatcher_uuid,
-				    u32 type, const u8 *body, size_t body_len)
+				    u32 type, const u8 *body, size_t body_len,
+				    size_t reply_size)
 {
 	struct ardma_xdomain_ctrl_hdr *hdr;
 	struct tb_xdomain *xd = peer ? peer->xd : NULL;
 	u8 *buf;
-	u8 reply[256];
+	u8 *reply;
 	size_t total;
 	u32 cmd_id;
 	int ret;
@@ -3519,11 +3597,18 @@ static int ardma_send_xdomain_probe(struct ardma_peer *peer,
 		return -ENODEV;
 	if (body_len > 1024)
 		return -EINVAL;
+	if (reply_size < sizeof(*hdr) || reply_size > 4096)
+		return -EINVAL;
 
 	total = sizeof(*hdr) + body_len;
 	buf = kzalloc(total, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
+	reply = kzalloc(reply_size, GFP_KERNEL);
+	if (!reply) {
+		kfree(buf);
+		return -ENOMEM;
+	}
 
 	hdr = (struct ardma_xdomain_ctrl_hdr *)buf;
 	hdr->route_hi = upper_32_bits(xd->route);
@@ -3542,31 +3627,32 @@ static int ardma_send_xdomain_probe(struct ardma_peer *peer,
 	if (body && body_len)
 		memcpy(buf + sizeof(*hdr), body, body_len);
 
-	pr_info("login_send -> uuid=%pUb type=0x%x cmd=0x%x route=0x%llx total=%zu timeout=%ums\n",
+	pr_info("login_send -> uuid=%pUb type=0x%x cmd=0x%x route=0x%llx req=%zu rsp=%zu timeout=%ums\n",
 		dispatcher_uuid, type, cmd_id,
-		(unsigned long long)xd->route, total, login_timeout_ms);
+		(unsigned long long)xd->route, total, reply_size,
+		login_timeout_ms);
 	print_hex_dump(KERN_INFO, "login_send req: ", DUMP_PREFIX_OFFSET,
 		       16, 1, buf, min_t(size_t, total, 96), false);
 
-	memset(reply, 0, sizeof(reply));
 	ret = tb_xdomain_request(xd, buf, total,
 				 TB_CFG_PKG_XDOMAIN_RESP,
-				 reply, sizeof(reply),
+				 reply, reply_size,
 				 TB_CFG_PKG_XDOMAIN_RESP,
 				 login_timeout_ms);
 	if (ret < 0) {
-		pr_info("login_send <- error %d (likely timeout/no reply)\n",
-			ret);
+		pr_info("login_send <- error %d (likely timeout/no reply for rsp_size=%zu)\n",
+			ret, reply_size);
 	} else {
 		const struct ardma_xdomain_ctrl_hdr *rh = (void *)reply;
 
-		pr_info("login_send <- reply uuid=%pUb type=0x%x cmd=0x%x\n",
-			&rh->uuid, rh->type, rh->command_id);
+		pr_info("login_send <- reply uuid=%pUb type=0x%x cmd=0x%x rsp_size=%zu (matched)\n",
+			&rh->uuid, rh->type, rh->command_id, reply_size);
 		print_hex_dump(KERN_INFO, "login_send rsp: ",
 			       DUMP_PREFIX_OFFSET, 16, 1,
-			       reply, sizeof(reply), false);
+			       reply, reply_size, false);
 	}
 
+	kfree(reply);
 	kfree(buf);
 	return ret;
 }
@@ -3576,11 +3662,13 @@ static ssize_t ardma_login_send_write(struct file *file,
 				      size_t count, loff_t *ppos)
 {
 	struct ardma_peer *peer = file->private_data;
-	char *kbuf, *cur, *uuid_s, *type_s, *body_s;
+	char *kbuf, *cur, *uuid_s, *type_s, *body_s, *rsp_s;
 	uuid_t dispatcher_uuid;
 	u32 type;
 	u8 *body = NULL;
 	size_t body_len = 0;
+	size_t reply_size = 256;
+	u32 rsp_arg;
 	int ret;
 
 	if (!peer)
@@ -3607,6 +3695,18 @@ static ssize_t ardma_login_send_write(struct file *file,
 		*body_s++ = '\0';
 		while (*body_s == ' ')
 			body_s++;
+	}
+	rsp_s = body_s ? strchr(body_s, ' ') : NULL;
+	if (rsp_s) {
+		*rsp_s++ = '\0';
+		while (*rsp_s == ' ')
+			rsp_s++;
+		if (kstrtou32(rsp_s, 0, &rsp_arg) < 0) {
+			pr_info("login_send: bad reply size '%s'\n", rsp_s);
+			ret = -EINVAL;
+			goto out;
+		}
+		reply_size = rsp_arg;
 	}
 
 	if (uuid_parse(uuid_s, &dispatcher_uuid) < 0) {
@@ -3642,7 +3742,7 @@ static ssize_t ardma_login_send_write(struct file *file,
 	}
 
 	ret = ardma_send_xdomain_probe(peer, &dispatcher_uuid, type,
-				       body, body_len);
+				       body, body_len, reply_size);
 
 out_body:
 	kfree(body);
@@ -3917,6 +4017,9 @@ static int ardma_probe(struct tb_service *svc, const struct tb_service_id *id)
 	if (!IS_ERR_OR_NULL(peer->debugfs_dir))
 		debugfs_create_file("nhi_rings", 0444, peer->debugfs_dir,
 				    peer, &ardma_nhi_rings_fops);
+	if (!IS_ERR_OR_NULL(peer->debugfs_dir))
+		debugfs_create_file("nhi_all_rings", 0444, peer->debugfs_dir,
+				    peer, &ardma_nhi_all_rings_fops);
 	if (!IS_ERR_OR_NULL(peer->debugfs_dir))
 		debugfs_create_file("rx_marker_log", 0444, peer->debugfs_dir,
 				    peer, &ardma_rx_marker_log_fops);

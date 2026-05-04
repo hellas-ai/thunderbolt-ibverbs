@@ -316,6 +316,10 @@ struct usb4_rdma_ib_dev {
 	struct u4_data_peer *rail;
 	atomic_t active_peers;
 	struct net_device *netdev;	/* RoCEv2 IP→GID stub; see netdev.c */
+	struct notifier_block netdev_nb;
+	struct mutex netdev_lock;
+	bool netdev_nb_registered;
+	bool shutting_down;
 };
 
 static struct usb4_rdma_ib_dev *u4r_dev;
@@ -3259,23 +3263,6 @@ static enum rdma_link_layer u4r_get_link_layer(struct ib_device *ibdev,
 
 /* ----- netdev / GID plumbing -------------------------------------- */
 
-/* Hand the netdev back to the RDMA core so RDMA-CM can resolve
- * source addrs against it. The core takes a reference; we just
- * pin our shared netdev pointer and bump it. */
-static struct net_device *u4r_get_netdev(struct ib_device *ibdev, u32 port_num)
-{
-	struct usb4_rdma_ib_dev *u4r =
-		container_of(ibdev, struct usb4_rdma_ib_dev, base);
-	struct net_device *ndev;
-
-	if (port_num != 1)
-		return NULL;
-	ndev = u4r->netdev;
-	if (ndev)
-		dev_hold(ndev);
-	return ndev;
-}
-
 /* The RoCE GID cache calls these whenever an IP is added/removed on
  * our netdev. The kernel itself maintains the GID table that
  * query_gid serves; our jobs are (a) accept the call so the caller
@@ -3313,7 +3300,6 @@ static const struct ib_device_ops u4r_dev_ops = {
 	.query_pkey        = u4r_query_pkey,
 	.add_gid           = u4r_add_gid,
 	.del_gid           = u4r_del_gid,
-	.get_netdev        = u4r_get_netdev,
 	.get_port_immutable= u4r_get_port_immutable,
 	.get_link_layer    = u4r_get_link_layer,
 
@@ -3347,6 +3333,79 @@ static const struct ib_device_ops u4r_dev_ops = {
 	INIT_RDMA_OBJ_SIZE(ib_qp,        usb4_rdma_qp,       base),
 };
 
+static void u4r_detach_netdev_locked(struct usb4_rdma_ib_dev *u4r)
+{
+	struct net_device *netdev = u4r->netdev;
+
+	if (!netdev)
+		return;
+
+	ib_device_set_netdev(&u4r->base, NULL, 1);
+	u4r->netdev = NULL;
+	dev_put(netdev);
+}
+
+static int u4r_attach_netdev_locked(struct usb4_rdma_ib_dev *u4r,
+				    struct net_device *netdev)
+{
+	int ret;
+
+	if (u4r->netdev == netdev)
+		return 0;
+	if (u4r->netdev)
+		u4r_detach_netdev_locked(u4r);
+
+	ret = ib_device_set_netdev(&u4r->base, netdev, 1);
+	if (ret)
+		return ret;
+
+	dev_hold(netdev);
+	u4r->netdev = netdev;
+	return 0;
+}
+
+static int u4r_netdev_event(struct notifier_block *nb,
+			    unsigned long event, void *ptr)
+{
+	struct usb4_rdma_ib_dev *u4r =
+		container_of(nb, struct usb4_rdma_ib_dev, netdev_nb);
+	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
+	int ret;
+
+	switch (event) {
+	case NETDEV_UNREGISTER:
+		mutex_lock(&u4r->netdev_lock);
+		if (u4r->netdev == netdev) {
+			pr_info("CM netdev %s unregistering; detaching GID netdev\n",
+				netdev_name(netdev));
+			u4r_detach_netdev_locked(u4r);
+			mutex_unlock(&u4r->netdev_lock);
+			return NOTIFY_OK;
+		}
+		mutex_unlock(&u4r->netdev_lock);
+		break;
+	case NETDEV_REGISTER:
+		if (strcmp(netdev_name(netdev), cm_netdev))
+			break;
+		mutex_lock(&u4r->netdev_lock);
+		if (!u4r->netdev && !u4r->shutting_down) {
+			ret = u4r_attach_netdev_locked(u4r, netdev);
+			if (ret)
+				pr_warn("reattach CM netdev %s failed: %d\n",
+					netdev_name(netdev), ret);
+			else
+				pr_info("reattached CM netdev %s\n",
+					netdev_name(netdev));
+		}
+		mutex_unlock(&u4r->netdev_lock);
+		break;
+	default:
+		break;
+	}
+
+	return NOTIFY_DONE;
+}
+
 static int u4r_register_ibdev(struct u4_data_peer *rail, bool active,
 			      bool list_device,
 			      struct usb4_rdma_ib_dev **out)
@@ -3367,6 +3426,8 @@ static int u4r_register_ibdev(struct u4_data_peer *rail, bool active,
 	INIT_LIST_HEAD(&u4r->dev_link);
 	u4r->rail = rail;
 	atomic_set(&u4r->active_peers, active ? 1 : 0);
+	mutex_init(&u4r->netdev_lock);
+	u4r->netdev_nb.notifier_call = u4r_netdev_event;
 	u4r->base.phys_port_cnt    = USB4_RDMA_NPORTS;
 	u4r->base.num_comp_vectors = num_possible_cpus();
 	u4r->base.local_dma_lkey   = 0;
@@ -3424,10 +3485,7 @@ static int u4r_register_ibdev(struct u4_data_peer *rail, bool active,
 	err = ib_device_set_netdev(&u4r->base, u4r->netdev, 1);
 	if (err) {
 		pr_err("ib_device_set_netdev failed: %d\n", err);
-		dev_put(u4r->netdev);
-		ib_dealloc_device(&u4r->base);
-		usb4_rdma_data_rail_put(rail);
-		return err;
+		goto err_netdev;
 	}
 
 	if (rail) {
@@ -3436,10 +3494,8 @@ static int u4r_register_ibdev(struct u4_data_peer *rail, bool active,
 		if (idx < 0) {
 			pr_err("failed to derive deterministic rail name: %d\n",
 			       idx);
-			dev_put(u4r->netdev);
-			ib_dealloc_device(&u4r->base);
-			usb4_rdma_data_rail_put(rail);
-			return idx;
+			err = idx;
+			goto err_clear_netdev;
 		}
 		snprintf(name, sizeof(name), "usb4_rdma%d", idx);
 	} else {
@@ -3449,11 +3505,15 @@ static int u4r_register_ibdev(struct u4_data_peer *rail, bool active,
 	err = ib_register_device(&u4r->base, name, NULL);
 	if (err) {
 		pr_err("ib_register_device failed: %d\n", err);
-		dev_put(u4r->netdev);
-		ib_dealloc_device(&u4r->base);
-		usb4_rdma_data_rail_put(rail);
-		return err;
+		goto err_clear_netdev;
 	}
+
+	err = register_netdevice_notifier(&u4r->netdev_nb);
+	if (err) {
+		pr_err("register_netdevice_notifier failed: %d\n", err);
+		goto err_unregister_ibdev;
+	}
+	u4r->netdev_nb_registered = true;
 
 	if (list_device) {
 		mutex_lock(&u4r_dev_list_lock);
@@ -3466,25 +3526,44 @@ static int u4r_register_ibdev(struct u4_data_peer *rail, bool active,
 	pr_info("registered ib_device %s (1 port%s)\n",
 		dev_name(&u4r->base.dev), rail ? ", lane rail" : "");
 	return 0;
+
+err_unregister_ibdev:
+	ib_unregister_device(&u4r->base);
+err_clear_netdev:
+	ib_device_set_netdev(&u4r->base, NULL, 1);
+err_netdev:
+	dev_put(u4r->netdev);
+	u4r->netdev = NULL;
+	ib_dealloc_device(&u4r->base);
+	usb4_rdma_data_rail_put(rail);
+	return err;
 }
 
 static void u4r_unregister_ibdev(struct usb4_rdma_ib_dev *u4r)
 {
-	struct net_device *ndev;
 	struct u4_data_peer *rail;
 
 	if (!u4r)
 		return;
 
-	ndev = u4r->netdev;
+	/* Detach before unregistering the notifier. The notifier core emits
+	 * synthetic NETDEV_UNREGISTER events during unregister; leaving netdev
+	 * armed would make module teardown look like a real cm_netdev hot-unplug.
+	 */
+	mutex_lock(&u4r->netdev_lock);
+	u4r->shutting_down = true;
+	u4r_detach_netdev_locked(u4r);
+	mutex_unlock(&u4r->netdev_lock);
+
+	if (u4r->netdev_nb_registered) {
+		unregister_netdevice_notifier(&u4r->netdev_nb);
+		u4r->netdev_nb_registered = false;
+	}
 	rail = u4r->rail;
-	u4r->netdev = NULL;
 	u4r->rail = NULL;
 	atomic_set(&u4r->active_peers, 0);
 	ib_unregister_device(&u4r->base);
 	ib_dealloc_device(&u4r->base);
-	if (ndev)
-		dev_put(ndev);
 	usb4_rdma_data_rail_put(rail);
 }
 
