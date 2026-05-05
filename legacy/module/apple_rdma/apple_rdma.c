@@ -161,6 +161,21 @@ MODULE_PARM_DESC(apple_vendor_only,
 
 static char *peer_device_name;
 module_param(peer_device_name, charp, 0444);
+
+/*
+ * Linux<->Linux setups can have two TB cables between the same two
+ * machines (one per NHI / TB controller). Each cable advertises a
+ * separate FA57 peer at a different XDomain route. Apple_rdma only
+ * supports one bound peer at a time -- if multiple peers race the
+ * probe, the binding ends up asymmetric across the two hosts.
+ *
+ * Set peer_route to the hex route value (e.g. "2") to force probing
+ * only the peer at that route. Default empty = first to win the mutex.
+ */
+static char *peer_route;
+module_param(peer_route, charp, 0444);
+MODULE_PARM_DESC(peer_route,
+		 "Bind only the AD/FA57 peer whose XDomain route matches this hex value (default: first to probe)");
 MODULE_PARM_DESC(peer_device_name,
 		 "Bind only a peer whose xdomain device_name exactly matches this value");
 
@@ -4391,6 +4406,36 @@ static int ardma_probe(struct tb_service *svc, const struct tb_service_id *id)
 			 xd->device_name ? xd->device_name : "(null)",
 			 peer_device_name);
 		return -ENODEV;
+	}
+	if (peer_route && *peer_route) {
+		/* Format: "<domain>-<route>" e.g. "0-2" or "1-2". Matches
+		 * the XDomain device dir name under /sys/bus/thunderbolt. */
+		int wanted_domain = -1;
+		u64 wanted_route_v = 0;
+		const char *dash = strchr(peer_route, '-');
+		bool ok = false;
+		if (dash) {
+			char dom_buf[8] = {0};
+			size_t dom_len = dash - peer_route;
+			if (dom_len > 0 && dom_len < sizeof(dom_buf)) {
+				memcpy(dom_buf, peer_route, dom_len);
+				if (kstrtoint(dom_buf, 10, &wanted_domain) == 0 &&
+				    kstrtou64(dash + 1, 16, &wanted_route_v) == 0)
+					ok = true;
+			}
+		}
+		if (!ok) {
+			dev_warn(&svc->dev, "peer_route '%s' must be <domain>-<route> e.g. 1-2\n",
+				 peer_route);
+			return -EINVAL;
+		}
+		if (xd->tb->index != wanted_domain || xd->route != wanted_route_v) {
+			dev_info(&svc->dev,
+				 "skipping AD/FA57 peer %d-%llx wanted %d-%llx\n",
+				 xd->tb->index, (unsigned long long)xd->route,
+				 wanted_domain, (unsigned long long)wanted_route_v);
+			return -ENODEV;
+		}
 	}
 
 	mutex_lock(&ardma_peer_lock);
