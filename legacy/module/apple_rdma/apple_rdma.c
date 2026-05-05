@@ -184,6 +184,11 @@ module_param(tx_e2e, bool, 0444);
 MODULE_PARM_DESC(tx_e2e,
 		 "Enable E2E flow control on TX rings (default: true)");
 
+static bool rx_e2e = true;
+module_param(rx_e2e, bool, 0444);
+MODULE_PARM_DESC(rx_e2e,
+		 "Enable E2E flow control on RX rings (default: true)");
+
 static bool tx_honor_path_mtu;
 module_param(tx_honor_path_mtu, bool, 0644);
 MODULE_PARM_DESC(tx_honor_path_mtu,
@@ -3051,7 +3056,7 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 {
 	struct tb_xdomain *xd = peer->xd;
 	unsigned int tx_ring_flags = READ_ONCE(tx_e2e) ? RING_FLAG_E2E : 0;
-	unsigned int rx_ring_flags = RING_FLAG_E2E;
+	unsigned int rx_ring_flags = READ_ONCE(rx_e2e) ? RING_FLAG_E2E : 0;
 	int e2e_tx_hop;
 	int ret, i;
 
@@ -3634,6 +3639,208 @@ static int ardma_nhi_all_rings_show(struct seq_file *m, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(ardma_nhi_all_rings);
+
+/*
+ * Dump every NHI MMIO register that the upstream Linux NHI driver
+ * names, plus a wide non-zero scan of the rest of BAR0. Used to diff
+ * NHI state between "one E2E ring" vs "two E2E rings" to find AMD-
+ * specific credit registers that change unexpectedly across that
+ * boundary. Read-only -- no writes performed.
+ *
+ * NHI register offsets per linux/drivers/thunderbolt/nhi_regs.h:
+ *   0x00000  TX descriptor ring base (16 B per hop)
+ *   0x08000  RX descriptor ring base (16 B per hop)
+ *   0x19800  TX options (32 B per hop)
+ *   0x29800  RX options (32 B per hop)
+ *   0x37800  RING_NOTIFY_BASE
+ *   0x37808  RING_INT_CLEAR
+ *   0x38200  RING_INTERRUPT_BASE
+ *   0x38208  RING_INTERRUPT_MASK_CLEAR_BASE
+ *   0x38c00  INT_THROTTLING_RATE
+ *   0x38c40  INT_VEC_ALLOC_BASE
+ *   0x39640  CAPS (low 11 bits = hop_count, bits 16-23 = version)
+ *   0x39864  DMA_MISC
+ *   0x39898  RESET
+ *   0x39900  INMAIL_DATA
+ *   0x39904  INMAIL_CMD
+ *   0x3990c  OUTMAIL_CMD
+ *   0x39944  FW_STS
+ */
+static int ardma_nhi_regs_show(struct seq_file *m, void *unused)
+{
+	struct ardma_peer *peer = m->private;
+	struct tb_nhi *nhi;
+	void __iomem *iobase;
+	u32 hop_count;
+	u32 i, j;
+
+	if (!peer || !peer->xd || !peer->xd->tb || !peer->xd->tb->nhi)
+		return -ENODEV;
+
+	nhi = peer->xd->tb->nhi;
+	iobase = nhi->iobase;
+	hop_count = READ_ONCE(nhi->hop_count);
+
+	if (!iobase) {
+		seq_puts(m, "ERROR: nhi->iobase is NULL\n");
+		return -EIO;
+	}
+
+	seq_printf(m,
+		   "# AMD Strix Halo NHI register dump. peer=%s hop_count=%u\n",
+		   dev_name(&peer->svc->dev), hop_count);
+	seq_printf(m, "# pci=%s vendor=0x%04x device=0x%04x\n\n",
+		   pci_name(nhi->pdev), nhi->pdev->vendor, nhi->pdev->device);
+
+	/* Global named registers */
+	seq_puts(m, "[global named registers]\n");
+	seq_printf(m, "0x39640 CAPS                 = 0x%08x  (hop_count=%u version=0x%02x)\n",
+		   ioread32(iobase + 0x39640),
+		   ioread32(iobase + 0x39640) & 0x7ff,
+		   (ioread32(iobase + 0x39640) >> 16) & 0xff);
+	seq_printf(m, "0x37808 RING_INT_CLEAR       = 0x%08x\n",
+		   ioread32(iobase + 0x37808));
+	seq_printf(m, "0x38c00 INT_THROTTLING_RATE  = 0x%08x\n",
+		   ioread32(iobase + 0x38c00));
+	seq_printf(m, "0x39864 DMA_MISC             = 0x%08x\n",
+		   ioread32(iobase + 0x39864));
+	seq_printf(m, "0x39898 RESET                = 0x%08x\n",
+		   ioread32(iobase + 0x39898));
+	seq_printf(m, "0x39900 INMAIL_DATA          = 0x%08x\n",
+		   ioread32(iobase + 0x39900));
+	seq_printf(m, "0x39904 INMAIL_CMD           = 0x%08x\n",
+		   ioread32(iobase + 0x39904));
+	seq_printf(m, "0x3990c OUTMAIL_CMD          = 0x%08x\n",
+		   ioread32(iobase + 0x3990c));
+	seq_printf(m, "0x39944 FW_STS               = 0x%08x\n",
+		   ioread32(iobase + 0x39944));
+	seq_puts(m, "\n");
+
+	/* Per-ring interrupt enable / notify / int-vec-alloc.
+	 * Each is a bitmap with one bit per hop, packed into u32 words. */
+	seq_puts(m, "[per-ring interrupt registers]\n");
+	for (i = 0; i < (31 + 3 * hop_count) / 32 && i < 8; i++)
+		seq_printf(m, "0x%05x RING_NOTIFY[%u]        = 0x%08x\n",
+			   0x37800 + i * 4, i,
+			   ioread32(iobase + 0x37800 + i * 4));
+	for (i = 0; i < (31 + 2 * hop_count) / 32 && i < 8; i++) {
+		seq_printf(m, "0x%05x RING_INTERRUPT[%u]     = 0x%08x\n",
+			   0x38200 + i * 4, i,
+			   ioread32(iobase + 0x38200 + i * 4));
+		seq_printf(m, "0x%05x RING_INT_MASK_CLR[%u]  = 0x%08x\n",
+			   0x38208 + i * 4, i,
+			   ioread32(iobase + 0x38208 + i * 4));
+	}
+	for (i = 0; i < (hop_count + 7) / 8 && i < 8; i++)
+		seq_printf(m, "0x%05x INT_VEC_ALLOC[%u]      = 0x%08x\n",
+			   0x38c40 + i * 4, i,
+			   ioread32(iobase + 0x38c40 + i * 4));
+	seq_puts(m, "\n");
+
+	/* Per-ring TX/RX descriptor pointer regs (16 bytes per hop). */
+	seq_puts(m, "[per-ring TX descriptor regs (REG_TX_RING_BASE + hop*16)]\n");
+	seq_puts(m, "# off    hop  phys_lo    phys_hi    tail/head   size_descs\n");
+	for (i = 0; i < hop_count && i < 32; i++) {
+		u32 off = 0x00000 + i * 16;
+		u32 lo = ioread32(iobase + off);
+		u32 hi = ioread32(iobase + off + 4);
+		u32 tailhead = ioread32(iobase + off + 8);
+		u32 size = ioread32(iobase + off + 12);
+		if (!lo && !hi && !tailhead && !size)
+			continue;
+		seq_printf(m,
+			   "0x%05x %2u   0x%08x 0x%08x 0x%08x  0x%08x\n",
+			   off, i, lo, hi, tailhead, size);
+	}
+	seq_puts(m, "\n");
+
+	seq_puts(m, "[per-ring RX descriptor regs (REG_RX_RING_BASE + hop*16)]\n");
+	for (i = 0; i < hop_count && i < 32; i++) {
+		u32 off = 0x08000 + i * 16;
+		u32 lo = ioread32(iobase + off);
+		u32 hi = ioread32(iobase + off + 4);
+		u32 tailhead = ioread32(iobase + off + 8);
+		u32 size = ioread32(iobase + off + 12);
+		if (!lo && !hi && !tailhead && !size)
+			continue;
+		seq_printf(m,
+			   "0x%05x %2u   0x%08x 0x%08x 0x%08x  0x%08x\n",
+			   off, i, lo, hi, tailhead, size);
+	}
+	seq_puts(m, "\n");
+
+	/* Per-ring TX options (32 bytes per hop, 8 dwords). */
+	seq_puts(m, "[per-ring TX options (REG_TX_OPTIONS_BASE + hop*32)]\n");
+	for (i = 0; i < hop_count && i < 32; i++) {
+		u32 off = 0x19800 + i * 32;
+		u32 dw[8];
+		bool any = false;
+
+		for (j = 0; j < 8; j++) {
+			dw[j] = ioread32(iobase + off + j * 4);
+			if (dw[j])
+				any = true;
+		}
+		if (!any)
+			continue;
+		seq_printf(m,
+			   "0x%05x hop%2u: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			   off, i, dw[0], dw[1], dw[2], dw[3],
+			   dw[4], dw[5], dw[6], dw[7]);
+	}
+	seq_puts(m, "\n");
+
+	seq_puts(m, "[per-ring RX options (REG_RX_OPTIONS_BASE + hop*32)]\n");
+	for (i = 0; i < hop_count && i < 32; i++) {
+		u32 off = 0x29800 + i * 32;
+		u32 dw[8];
+		bool any = false;
+
+		for (j = 0; j < 8; j++) {
+			dw[j] = ioread32(iobase + off + j * 4);
+			if (dw[j])
+				any = true;
+		}
+		if (!any)
+			continue;
+		seq_printf(m,
+			   "0x%05x hop%2u: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			   off, i, dw[0], dw[1], dw[2], dw[3],
+			   dw[4], dw[5], dw[6], dw[7]);
+	}
+	seq_puts(m, "\n");
+
+	/* Wide scan of full BAR0 (0x80000 = 512 KiB on Strix Halo) for
+	 * non-zero u32s, skipping the ring banks we've already named to
+	 * keep output tractable. Coverage = everything outside:
+	 *   0x00000-0x07FFF  TX descriptor regs
+	 *   0x08000-0x0FFFF  RX descriptor regs
+	 *   0x10000-0x197FF  unmapped / unused
+	 *   0x19800-0x1A7FF  TX options (32 hops * 32 B)
+	 *   0x29800-0x2A7FF  RX options (32 hops * 32 B)
+	 * The interesting candidates for AMD-private credit registers are
+	 * anywhere else with a non-zero default.
+	 */
+	seq_puts(m, "[wide non-zero scan: full BAR0 0x00000-0x80000, skipping known ring banks]\n");
+	for (i = 0; i < 0x80000; i += 4) {
+		u32 v;
+
+		/* Skip already-dumped per-ring banks. */
+		if (i < 0x10000)
+			continue;
+		if (i >= 0x19800 && i < 0x1a800)
+			continue;
+		if (i >= 0x29800 && i < 0x2a800)
+			continue;
+
+		v = ioread32(iobase + i);
+		if (v)
+			seq_printf(m, "0x%05x = 0x%08x\n", i, v);
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(ardma_nhi_regs);
 
 static int ardma_rx_marker_log_show(struct seq_file *m, void *unused)
 {
@@ -4254,6 +4461,9 @@ static int ardma_probe(struct tb_service *svc, const struct tb_service_id *id)
 	if (!IS_ERR_OR_NULL(peer->debugfs_dir))
 		debugfs_create_file("nhi_all_rings", 0444, peer->debugfs_dir,
 				    peer, &ardma_nhi_all_rings_fops);
+	if (!IS_ERR_OR_NULL(peer->debugfs_dir))
+		debugfs_create_file("nhi_regs", 0444, peer->debugfs_dir,
+				    peer, &ardma_nhi_regs_fops);
 	if (!IS_ERR_OR_NULL(peer->debugfs_dir))
 		debugfs_create_file("rx_marker_log", 0444, peer->debugfs_dir,
 				    peer, &ardma_rx_marker_log_fops);
