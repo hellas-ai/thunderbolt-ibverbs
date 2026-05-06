@@ -3857,6 +3857,133 @@ static int ardma_nhi_regs_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(ardma_nhi_regs);
 
+/*
+ * nhi_poke debugfs writer for AMD silicon experiments. Read returns help.
+ * Write commands (one command per write):
+ *   "throttle_all <hex32>"   write same value to all 16 INT_THROTTLING slots
+ *   "throttle_one <slot> <hex32>"  write one slot
+ *   "reset_hrr"              pulse REG_RESET bit 0 (HRR). DANGEROUS.
+ *   "ring_int_clear <hex32>" write to REG_RING_INT_CLEAR (clears NOTIFY bits)
+ *
+ * No safety net beyond peer/iobase null checks. For experiments only.
+ */
+static int ardma_nhi_poke_show(struct seq_file *m, void *unused)
+{
+	seq_puts(m,
+		 "Write commands (echo into this file):\n"
+		 "  throttle_all <hex32>          write same value to all 16 throttle slots\n"
+		 "  throttle_one <slot> <hex32>   write one slot (0..15)\n"
+		 "  reset_hrr                     pulse REG_RESET bit 0 (DANGEROUS)\n"
+		 "  ring_int_clear <hex32>        write REG_RING_INT_CLEAR\n");
+	return 0;
+}
+static int ardma_nhi_poke_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, ardma_nhi_poke_show, inode->i_private);
+}
+static ssize_t ardma_nhi_poke_write(struct file *file, const char __user *ubuf,
+				    size_t len, loff_t *off)
+{
+	struct seq_file *m = file->private_data;
+	struct ardma_peer *peer = m->private;
+	struct tb_nhi *nhi;
+	void __iomem *iobase;
+	char buf[64];
+	char cmd[32];
+	u32 v0, v1;
+	int n;
+
+	if (!peer || !peer->xd || !peer->xd->tb || !peer->xd->tb->nhi)
+		return -ENODEV;
+	nhi = peer->xd->tb->nhi;
+	iobase = nhi->iobase;
+	if (!iobase)
+		return -EIO;
+
+	if (len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = 0;
+
+	v0 = v1 = 0;
+	if (sscanf(buf, "%31s %x %x", cmd, &v0, &v1) >= 1) {
+		/* For throttle_one, slot was meant to be decimal — re-parse */
+		if (strcmp(cmd, "throttle_one") == 0)
+			sscanf(buf, "%31s %u %x", cmd, &v0, &v1);
+		if (strcmp(cmd, "throttle_all") == 0) {
+			u32 slot;
+			for (slot = 0; slot < 16; slot++)
+				iowrite32(v0, iobase + 0x38c00 + slot * 4);
+			pr_info("apple_rdma: wrote 0x%08x to all 16 throttle slots\n", v0);
+			return len;
+		}
+		if (strcmp(cmd, "throttle_one") == 0) {
+			if (v0 >= 16) return -EINVAL;
+			iowrite32(v1, iobase + 0x38c00 + v0 * 4);
+			pr_info("apple_rdma: wrote 0x%08x to throttle slot %u\n", v1, v0);
+			return len;
+		}
+		if (strcmp(cmd, "reset_hrr") == 0) {
+			iowrite32(1, iobase + 0x39898);
+			pr_info("apple_rdma: pulsed REG_RESET HRR bit\n");
+			return len;
+		}
+		if (strcmp(cmd, "ring_int_clear") == 0) {
+			iowrite32(v0, iobase + 0x37808);
+			pr_info("apple_rdma: wrote 0x%08x to RING_INT_CLEAR\n", v0);
+			return len;
+		}
+		if (strcmp(cmd, "wr") == 0) {
+			/* wr <hex_off> <hex_val> -- arbitrary u32 write */
+			if (v0 >= 0x80000) return -EINVAL;
+			if (v0 & 3) return -EINVAL;
+			iowrite32(v1, iobase + v0);
+			pr_info("apple_rdma: wrote 0x%08x to BAR0+0x%05x\n", v1, v0);
+			return len;
+		}
+		if (strcmp(cmd, "rd") == 0) {
+			/* rd <hex_off> -- arbitrary u32 read, result in dmesg */
+			u32 r;
+			if (v0 >= 0x80000) return -EINVAL;
+			if (v0 & 3) return -EINVAL;
+			r = ioread32(iobase + v0);
+			pr_info("apple_rdma: read BAR0+0x%05x = 0x%08x\n", v0, r);
+			return len;
+		}
+		if (strcmp(cmd, "or") == 0) {
+			/* or <hex_off> <hex_mask> -- read-modify-write set bits */
+			u32 r;
+			if (v0 >= 0x80000 || (v0 & 3)) return -EINVAL;
+			r = ioread32(iobase + v0);
+			iowrite32(r | v1, iobase + v0);
+			pr_info("apple_rdma: BAR0+0x%05x: 0x%08x |= 0x%08x -> 0x%08x\n",
+				v0, r, v1, r | v1);
+			return len;
+		}
+		if (strcmp(cmd, "and") == 0) {
+			/* and <hex_off> <hex_mask> -- read-modify-write clear bits */
+			u32 r;
+			if (v0 >= 0x80000 || (v0 & 3)) return -EINVAL;
+			r = ioread32(iobase + v0);
+			iowrite32(r & v1, iobase + v0);
+			pr_info("apple_rdma: BAR0+0x%05x: 0x%08x &= 0x%08x -> 0x%08x\n",
+				v0, r, v1, r & v1);
+			return len;
+		}
+	}
+	(void)n;
+	return -EINVAL;
+}
+static const struct file_operations ardma_nhi_poke_fops = {
+	.owner = THIS_MODULE,
+	.open = ardma_nhi_poke_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+	.write = ardma_nhi_poke_write,
+};
+
 static int ardma_rx_marker_log_show(struct seq_file *m, void *unused)
 {
 	struct ardma_rx_marker_log_entry *entries;
@@ -4509,6 +4636,9 @@ static int ardma_probe(struct tb_service *svc, const struct tb_service_id *id)
 	if (!IS_ERR_OR_NULL(peer->debugfs_dir))
 		debugfs_create_file("nhi_regs", 0444, peer->debugfs_dir,
 				    peer, &ardma_nhi_regs_fops);
+	if (!IS_ERR_OR_NULL(peer->debugfs_dir))
+		debugfs_create_file("nhi_poke", 0644, peer->debugfs_dir,
+				    peer, &ardma_nhi_poke_fops);
 	if (!IS_ERR_OR_NULL(peer->debugfs_dir))
 		debugfs_create_file("rx_marker_log", 0444, peer->debugfs_dir,
 				    peer, &ardma_rx_marker_log_fops);
