@@ -239,6 +239,11 @@ module_param(rx_poll_mode, bool, 0444);
 MODULE_PARM_DESC(rx_poll_mode,
 		 "Use polled RX ring instead of IRQ-driven (default: false). Spawns a polling kthread per peer.");
 
+static unsigned int rx_post_frames;
+module_param(rx_post_frames, uint, 0444);
+MODULE_PARM_DESC(rx_post_frames,
+		 "Number of RX descriptors to post initially and recycle (default: 0 = ARDMA_RX_FRAMES)");
+
 enum {
 	ARDMA_TX_MARKER_APPLE_EOF = 0,
 	ARDMA_TX_MARKER_GEMINI_SOF = 1,
@@ -531,6 +536,7 @@ struct ardma_peer {
 	struct tb_ring *tx_ring;
 	struct tb_ring *rx_ring;
 	struct ardma_rx_frame *rx_frames;
+	u32 rx_posted_frames;
 	struct mutex tx_lock;
 	bool tx_ring_running;
 
@@ -869,13 +875,17 @@ static int ardma_recv_scatter(struct ardma_pd *pd, struct ardma_recv_wr *r,
 /* FRAME-mode assembled-frame extractor.
  *
  * AMD silicon FRAME-mode RX assembles per-TLP arrivals into one callback
- * (gated on the configured eof_mask). The assembled wire payload is laid
- * out as 256-byte slots: 252 user bytes followed by 4 silicon CRC bytes
- * per slot. A trailing partial fragment (len % 256 != 0) is the tail
- * with no per-slot CRC overhead.
+ * (gated on the configured eof_mask). Most 256-byte slots are 252 user
+ * bytes followed by 4 silicon-owned trailer bytes.
  *
- * Pull just the user bytes out of @payload into @r at @dst_off, and
- * return how many user bytes were written via @out_user_len.
+ * The Apple-shaped FRAME TX path packs the end of a full chunk as a small
+ * split descriptor plus the 240-byte tail descriptor:
+ *
+ *   [split user][4-byte silicon trailer][240-byte tail user]
+ *
+ * A naive "copy first 252 bytes of every full slot" therefore copies the
+ * split trailer at user offset 3792 in a 4096-byte SEND. Decode the terminal
+ * slot shape explicitly and return only user bytes.
  */
 static int ardma_recv_scatter_frame(struct ardma_pd *pd,
 				    struct ardma_recv_wr *r, u32 dst_off,
@@ -885,22 +895,59 @@ static int ardma_recv_scatter_frame(struct ardma_pd *pd,
 	u32 num_slots = len / ARDMA_SLOT_WIRE_SIZE;
 	u32 tail = len - num_slots * ARDMA_SLOT_WIRE_SIZE;
 	u32 written = 0;
+	u32 normal_slots = num_slots;
+	const u8 *p = payload;
 	u32 i;
 	int ret;
 
-	for (i = 0; i < num_slots; i++) {
+	if (!tail && num_slots)
+		normal_slots--;
+
+	for (i = 0; i < normal_slots; i++) {
 		ret = ardma_recv_scatter(pd, r, dst_off + written,
-					 (const u8 *)payload +
-					 i * ARDMA_SLOT_WIRE_SIZE,
+					 p + i * ARDMA_SLOT_WIRE_SIZE,
 					 ARDMA_FRAME_SLOT_USER_SIZE);
 		if (ret)
 			return ret;
 		written += ARDMA_FRAME_SLOT_USER_SIZE;
 	}
-	if (tail) {
+
+	if (!tail && num_slots) {
+		const u8 *slot = p + normal_slots * ARDMA_SLOT_WIRE_SIZE;
+
+		ret = ardma_recv_scatter(pd, r, dst_off + written, slot,
+					 ARDMA_FRAME_SPLIT_USER_SIZE);
+		if (ret)
+			return ret;
+		written += ARDMA_FRAME_SPLIT_USER_SIZE;
+
 		ret = ardma_recv_scatter(pd, r, dst_off + written,
-					 (const u8 *)payload +
-					 num_slots * ARDMA_SLOT_WIRE_SIZE,
+					 slot + ARDMA_FRAME_SPLIT_USER_SIZE + 4,
+					 ARDMA_TAIL_USER_SIZE);
+		if (ret)
+			return ret;
+		written += ARDMA_TAIL_USER_SIZE;
+	} else if (tail > ARDMA_TAIL_USER_SIZE) {
+		const u8 *frag = p + normal_slots * ARDMA_SLOT_WIRE_SIZE;
+		u32 split = tail - ARDMA_TAIL_USER_SIZE - 4;
+
+		if (!split || split > ARDMA_FRAME_SPLIT_USER_SIZE)
+			return -EINVAL;
+
+		ret = ardma_recv_scatter(pd, r, dst_off + written, frag, split);
+		if (ret)
+			return ret;
+		written += split;
+
+		ret = ardma_recv_scatter(pd, r, dst_off + written,
+					 frag + split + 4,
+					 ARDMA_TAIL_USER_SIZE);
+		if (ret)
+			return ret;
+		written += ARDMA_TAIL_USER_SIZE;
+	} else if (tail) {
+		ret = ardma_recv_scatter(pd, r, dst_off + written,
+					 p + normal_slots * ARDMA_SLOT_WIRE_SIZE,
 					 tail);
 		if (ret)
 			return ret;
@@ -3035,6 +3082,15 @@ err:
 	return -ENOMEM;
 }
 
+static u32 ardma_rx_post_count(void)
+{
+	unsigned int requested = READ_ONCE(rx_post_frames);
+
+	if (!requested || requested > ARDMA_RX_FRAMES)
+		return ARDMA_RX_FRAMES;
+	return requested;
+}
+
 static void ardma_free_rx_frames(struct ardma_peer *peer)
 {
 	struct device *dma_dev;
@@ -3170,6 +3226,7 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 	ret = ardma_alloc_rx_frames(peer);
 	if (ret)
 		goto err_rx_ring;
+	peer->rx_posted_frames = ardma_rx_post_count();
 
 	if (READ_ONCE(rx_poll_mode)) {
 		peer->rx_poll_task = kthread_run(ardma_rx_poll_thread, peer,
@@ -3188,7 +3245,7 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 	peer->tx_ring_running = true;
 	tb_ring_start(peer->rx_ring);
 
-	for (i = 0; i < ARDMA_RX_FRAMES; i++) {
+	for (i = 0; i < peer->rx_posted_frames; i++) {
 		ret = tb_ring_rx(peer->rx_ring, &peer->rx_frames[i].frame);
 		if (ret) {
 			pr_warn("post RX frame %d failed: %d\n", i, ret);
@@ -3214,6 +3271,8 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 		peer->local_in_hop, peer->rx_ring->hop,
 		peer->local_out_hop, peer->tx_ring->hop,
 		peer->paths_enabled);
+	pr_info("posted %u/%u RX descriptors\n", peer->rx_posted_frames,
+		ARDMA_RX_FRAMES);
 	return 0;
 
 err_started:
@@ -3552,6 +3611,7 @@ static int ardma_nhi_stall_dump_show(struct seq_file *m, void *unused)
 	seq_printf(m, "local_in_hop: %d\n", peer->local_in_hop);
 	seq_printf(m, "local_out_hop: %d\n", peer->local_out_hop);
 	seq_printf(m, "tx_marker_mode: %u\n", READ_ONCE(tx_marker_mode));
+	seq_printf(m, "rx_posted_frames: %u\n", peer->rx_posted_frames);
 	seq_printf(m, "rx_frames: %lld\n",
 		   (long long)atomic64_read(&peer->rx_frame_count));
 	seq_printf(m, "rx_eof0: %lld\n",
@@ -3578,7 +3638,8 @@ static int ardma_nhi_stall_dump_show(struct seq_file *m, void *unused)
 	ardma_dump_ring_summary(m, "tx_ring", peer->tx_ring,
 				atomic64_read(&peer->tx_frames),
 				tx_completions, tx_errors);
-	ardma_dump_ring_summary(m, "rx_ring", peer->rx_ring, ARDMA_RX_FRAMES,
+	ardma_dump_ring_summary(m, "rx_ring", peer->rx_ring,
+				peer->rx_posted_frames,
 				atomic64_read(&peer->rx_frame_count), 0);
 	seq_puts(m, "\n");
 
@@ -3600,17 +3661,18 @@ static int ardma_nhi_rings_show(struct seq_file *m, void *unused)
 	tx_completions = atomic64_read(&peer->tx_completions);
 	tx_errors = atomic64_read(&peer->tx_errors);
 
-	seq_printf(m, "peer=%s receive_path=%d paths_enabled=%u tx_raw_mode=%u tx_e2e=%u rx_raw_mode=%u rx_poll_mode=%u tx_marker_mode=%u\n",
+	seq_printf(m, "peer=%s receive_path=%d paths_enabled=%u tx_raw_mode=%u tx_e2e=%u rx_raw_mode=%u rx_poll_mode=%u tx_marker_mode=%u rx_posted_frames=%u\n",
 		   dev_name(&peer->svc->dev), receive_path, peer->paths_enabled,
 		   READ_ONCE(tx_raw_mode), READ_ONCE(tx_e2e),
 		   READ_ONCE(rx_raw_mode), READ_ONCE(rx_poll_mode),
-		   READ_ONCE(tx_marker_mode));
+		   READ_ONCE(tx_marker_mode), peer->rx_posted_frames);
 	seq_puts(m, "# TX reg low16=controller tail, high16=host producer.\n");
 	seq_puts(m, "# RX reg low16=host consumer, high16=controller tail.\n");
 	ardma_dump_ring_summary(m, "tx_ring", peer->tx_ring,
 				atomic64_read(&peer->tx_frames),
 				tx_completions, tx_errors);
-	ardma_dump_ring_summary(m, "rx_ring", peer->rx_ring, ARDMA_RX_FRAMES,
+	ardma_dump_ring_summary(m, "rx_ring", peer->rx_ring,
+				peer->rx_posted_frames,
 				atomic64_read(&peer->rx_frame_count), 0);
 	return 0;
 }
@@ -3631,12 +3693,12 @@ static int ardma_nhi_all_rings_show(struct seq_file *m, void *unused)
 	hop_count = READ_ONCE(nhi->hop_count);
 
 	seq_printf(m,
-		   "peer=%s receive_path=%d paths_enabled=%u local_in_hop=%d local_out_hop=%d hop_count=%u tx_raw_mode=%u tx_e2e=%u rx_raw_mode=%u rx_poll_mode=%u tx_marker_mode=%u\n",
+		   "peer=%s receive_path=%d paths_enabled=%u local_in_hop=%d local_out_hop=%d hop_count=%u tx_raw_mode=%u tx_e2e=%u rx_raw_mode=%u rx_poll_mode=%u tx_marker_mode=%u rx_posted_frames=%u\n",
 		   dev_name(&peer->svc->dev), receive_path, peer->paths_enabled,
 		   peer->local_in_hop, peer->local_out_hop, hop_count,
 		   READ_ONCE(tx_raw_mode), READ_ONCE(tx_e2e),
 		   READ_ONCE(rx_raw_mode), READ_ONCE(rx_poll_mode),
-		   READ_ONCE(tx_marker_mode));
+		   READ_ONCE(tx_marker_mode), peer->rx_posted_frames);
 	seq_puts(m, "# All active NHI rings on this controller, including thunderbolt-net.\n");
 	seq_puts(m, "# TX reg low16=controller tail, high16=host producer.\n");
 	seq_puts(m, "# RX reg low16=host consumer, high16=controller tail.\n");
@@ -3678,7 +3740,7 @@ static int ardma_nhi_all_rings_show(struct seq_file *m, void *unused)
 			continue;
 
 		if (ring == peer->rx_ring) {
-			posted = ARDMA_RX_FRAMES;
+			posted = peer->rx_posted_frames;
 			completed = atomic64_read(&peer->rx_frame_count);
 			seq_puts(m, "  owner=apple_rdma\n");
 		} else {
