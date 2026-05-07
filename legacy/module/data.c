@@ -207,6 +207,7 @@ struct u4_data_peer {
 	wait_queue_head_t ref_wait;
 	struct irq_work rx_poll_irq;
 	struct task_struct *rx_poll_task;
+	atomic_t tx_poll_busy;
 	atomic_t rx_poll_armed;
 	atomic_t rx_poll_busy;
 
@@ -344,11 +345,13 @@ static void u4_data_rx_complete_one(struct tb_ring *ring,
 				    struct list_head *repost_list);
 static void u4_data_repost_rx_list(struct u4_data_peer *p,
 				   struct list_head *frames);
+static int u4_data_poll_tx_peer(struct u4_data_peer *p);
 
 static atomic64_t rx_poll_calls;
 static atomic64_t rx_poll_armed_scans;
 static atomic64_t rx_poll_opportunistic_scans;
 static atomic64_t rx_poll_skipped;
+static atomic64_t tx_poll_frames;
 static atomic64_t tx_stream_affinity_used;
 static atomic64_t tx_stream_affinity_fallback;
 
@@ -521,6 +524,12 @@ static u64 u4_tx_stream_affinity_max(struct u4_data_peer *p)
 
 static bool u4_data_tx_room(struct u4_data_peer *p, int needed)
 {
+	if (needed > p->frames_per_dir)
+		return false;
+	if (atomic_read(&p->tx_inflight) <= p->frames_per_dir - needed)
+		return true;
+
+	u4_data_poll_tx_peer(p);
 	return atomic_read(&p->tx_inflight) <= p->frames_per_dir - needed;
 }
 
@@ -570,6 +579,33 @@ static int u4_data_poll_rx_peer(struct u4_data_peer *p)
 	return done;
 }
 
+static int u4_data_poll_tx_peer(struct u4_data_peer *p)
+{
+	struct ring_frame *frame, *tmp;
+	LIST_HEAD(done_frames);
+	int done = 0;
+
+	if (!p->tx_ring)
+		return 0;
+	if (atomic_cmpxchg(&p->tx_poll_busy, 0, 1))
+		return 0;
+
+	while (usb4_rdma_nhi_raw_poll_batch(p->tx_ring, &done_frames,
+					    p->ring_depth)) {
+		list_for_each_entry_safe(frame, tmp, &done_frames, list) {
+			list_del_init(&frame->list);
+			if (frame->callback)
+				frame->callback(p->tx_ring, frame, false);
+			done++;
+		}
+	}
+
+	atomic_set(&p->tx_poll_busy, 0);
+	if (done)
+		atomic64_add(done, &tx_poll_frames);
+	return done;
+}
+
 static void u4_data_rx_poll_irq(struct irq_work *work)
 {
 	struct u4_data_peer *p =
@@ -596,7 +632,9 @@ static int u4_data_rx_poll_thread(void *data)
 	unsigned int empty_polls = 0;
 
 	while (!kthread_should_stop()) {
-		int done = u4_data_poll_rx_peer(p);
+		int done = u4_data_poll_tx_peer(p);
+
+		done += u4_data_poll_rx_peer(p);
 
 		if (done) {
 			atomic64_add(done, &p->rx_poll_busy_frames);
@@ -1556,6 +1594,7 @@ static int u4_data_prepare_lane(struct u4_data_peer *p, struct tb_service *svc,
 	init_waitqueue_head(&p->tx_wait);
 	init_waitqueue_head(&p->ref_wait);
 	init_irq_work(&p->rx_poll_irq, u4_data_rx_poll_irq);
+	atomic_set(&p->tx_poll_busy, 0);
 	atomic_set(&p->rx_poll_armed, 0);
 	atomic_set(&p->rx_poll_busy, 0);
 	INIT_LIST_HEAD(&p->list);
@@ -1778,6 +1817,8 @@ static int u4_data_stats_show(struct seq_file *m, void *unused)
 		   (long long)atomic64_read(&rx_poll_opportunistic_scans));
 	seq_printf(m, "rx_poll_skipped:      %lld\n",
 		   (long long)atomic64_read(&rx_poll_skipped));
+	seq_printf(m, "tx_poll_frames:       %lld\n",
+		   (long long)atomic64_read(&tx_poll_frames));
 	seq_printf(m, "active_lanes:         %d\n",
 		   usb4_rdma_data_active_lane_count());
 	usb4_rdma_nhi_raw_stats_show(m);
@@ -2771,6 +2812,7 @@ int usb4_rdma_data_poll_rx(void)
 		atomic64_inc(&rx_poll_armed_scans);
 		n = u4_data_peers_get(peers, U4_MAX_ACTIVE_LANES);
 		for (i = 0; i < n; i++) {
+			done += u4_data_poll_tx_peer(peers[i]);
 			if (atomic_read(&peers[i]->rx_poll_armed)) {
 				int lane_done = u4_data_poll_rx_peer(peers[i]);
 
@@ -2802,6 +2844,7 @@ int usb4_rdma_data_poll_rx(void)
 
 		if (!p)
 			break;
+		done += u4_data_poll_tx_peer(p);
 		lane_done = u4_data_poll_rx_peer(p);
 		if (lane_done)
 			atomic64_add(lane_done,
