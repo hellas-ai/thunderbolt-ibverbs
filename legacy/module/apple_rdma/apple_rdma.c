@@ -86,6 +86,7 @@
 #define ARDMA_APPLE_RAW_CHUNK_BYTES	SZ_4K
 #define ARDMA_APPLE_RAW_FRAMES_PER_CHUNK	17
 #define ARDMA_APPLE_RAW_MAX_RECV_BYTES	SZ_512K
+#define ARDMA_APPLE_RAW_RX_WINDOW_BYTES	SZ_2M
 #define ARDMA_RAW_RX_CREDIT_HEADROOM	64
 #define ARDMA_RX_MARKER_LOG_ENTRIES	8192
 #define ARDMA_RX_MARKER_PREFIX	128
@@ -354,6 +355,11 @@ module_param(raw_rx_max_recv_bytes, uint, 0644);
 MODULE_PARM_DESC(raw_rx_max_recv_bytes,
 		 "Maximum single posted receive size accepted for Apple RAW RX; 0 disables (default: 524288)");
 
+static unsigned int raw_rx_window_bytes = ARDMA_APPLE_RAW_RX_WINDOW_BYTES;
+module_param(raw_rx_window_bytes, uint, 0644);
+MODULE_PARM_DESC(raw_rx_window_bytes,
+		 "Maximum total bytes of posted Apple RAW receive WRs per peer; 0 disables (default: 2097152)");
+
 struct ardma_peer;
 struct ardma_qp;
 
@@ -408,6 +414,7 @@ struct ardma_recv_wr {
 	u64 wr_id;
 	struct ib_cqe *wr_cqe;
 	u32 raw_rx_credits;
+	u32 raw_rx_bytes;
 	int num_sge;
 	struct ib_sge sge[ARDMA_MAX_SGE];
 	struct ardma_mr *mr[ARDMA_MAX_SGE];
@@ -679,6 +686,7 @@ struct ardma_peer {
 	atomic64_t tx_pool_frames;
 	atomic64_t tx_dynamic_frames;
 	atomic_t raw_rx_credits_reserved;
+	atomic64_t raw_rx_bytes_reserved;
 	unsigned int extra_lane_count;
 	struct ardma_path_lane extra_lanes[ARDMA_MAX_PATH_LANES - 1];
 };
@@ -994,6 +1002,9 @@ static void ardma_recv_wr_release(struct ardma_qp *qp, struct ardma_recv_wr *r)
 	if (r && r->raw_rx_credits && qp && qp->peer)
 		atomic_sub(r->raw_rx_credits,
 			   &qp->peer->raw_rx_credits_reserved);
+	if (r && r->raw_rx_bytes && qp && qp->peer)
+		atomic64_sub(r->raw_rx_bytes,
+			     &qp->peer->raw_rx_bytes_reserved);
 	ardma_recv_wr_free(r);
 }
 
@@ -3804,6 +3815,8 @@ static int ardma_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 			u32 credits = ardma_apple_raw_rx_credits(total_len);
 			u32 budget = ardma_peer_raw_rx_credit_budget(qp->peer);
 			u32 max_recv = READ_ONCE(raw_rx_max_recv_bytes);
+			u32 byte_budget = READ_ONCE(raw_rx_window_bytes);
+			s64 bytes_reserved;
 			int reserved;
 
 			if (max_recv && total_len > max_recv) {
@@ -3826,11 +3839,36 @@ static int ardma_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
 				return -EMSGSIZE;
 			}
 
+			if (byte_budget) {
+				bytes_reserved =
+					atomic64_add_return(total_len,
+							     &qp->peer->raw_rx_bytes_reserved);
+				if (bytes_reserved > byte_budget) {
+					atomic64_sub(total_len,
+						     &qp->peer->raw_rx_bytes_reserved);
+					pr_warn_ratelimited("post_recv[qp=0x%x]: rejecting Apple RAW recv byte window len=%u reserved=%lld budget=%u\n",
+							    ibqp->qp_num,
+							    total_len,
+							    (long long)bytes_reserved,
+							    byte_budget);
+					ardma_recv_wr_free(r);
+					if (bad_wr)
+						*bad_wr = wr;
+					return -ENOMEM;
+				}
+				r->raw_rx_bytes = total_len;
+			}
+
 			reserved = atomic_add_return(credits,
 						     &qp->peer->raw_rx_credits_reserved);
 			if (reserved > budget) {
 				atomic_sub(credits,
 					   &qp->peer->raw_rx_credits_reserved);
+				if (r->raw_rx_bytes) {
+					atomic64_sub(r->raw_rx_bytes,
+						     &qp->peer->raw_rx_bytes_reserved);
+					r->raw_rx_bytes = 0;
+				}
 				pr_warn_ratelimited("post_recv[qp=0x%x]: rejecting Apple RAW recv window len=%u credits=%u reserved=%d budget=%u\n",
 						    ibqp->qp_num, total_len,
 						    credits, reserved, budget);
@@ -4818,6 +4856,10 @@ static int ardma_stats_show(struct seq_file *m, void *unused)
 		   atomic_read(&peer->raw_rx_credits_reserved));
 	seq_printf(m, "raw_rx_credit_budget: %u\n",
 		   ardma_peer_raw_rx_credit_budget(peer));
+	seq_printf(m, "raw_rx_bytes_reserved: %lld\n",
+		   (long long)atomic64_read(&peer->raw_rx_bytes_reserved));
+	seq_printf(m, "raw_rx_window_bytes: %u\n",
+		   READ_ONCE(raw_rx_window_bytes));
 	seq_printf(m, "local_in_hop: %d\n", peer->local_in_hop);
 	seq_printf(m, "rx_hop: %d\n", peer->rx_ring ? peer->rx_ring->hop : -1);
 	seq_printf(m, "local_out_hop: %d\n", peer->local_out_hop);
@@ -5091,6 +5133,10 @@ static int ardma_nhi_stall_dump_show(struct seq_file *m, void *unused)
 		   atomic_read(&peer->raw_rx_credits_reserved));
 	seq_printf(m, "raw_rx_credit_budget: %u\n",
 		   ardma_peer_raw_rx_credit_budget(peer));
+	seq_printf(m, "raw_rx_bytes_reserved: %lld\n",
+		   (long long)atomic64_read(&peer->raw_rx_bytes_reserved));
+	seq_printf(m, "raw_rx_window_bytes: %u\n",
+		   READ_ONCE(raw_rx_window_bytes));
 	seq_printf(m, "local_in_hop: %d\n", peer->local_in_hop);
 	seq_printf(m, "local_out_hop: %d\n", peer->local_out_hop);
 	seq_printf(m, "remote_is_apple: %u\n", peer->remote_is_apple);
