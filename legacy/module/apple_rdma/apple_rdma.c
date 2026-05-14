@@ -87,9 +87,9 @@
 #define ARDMA_APPLE_RAW_FRAMES_PER_CHUNK	17
 #define ARDMA_APPLE_RAW_MAX_RECV_BYTES	SZ_512K
 #define ARDMA_RAW_RX_CREDIT_HEADROOM	64
-#define ARDMA_RX_MARKER_LOG_ENTRIES	64
-#define ARDMA_RX_MARKER_PREFIX	16
-#define ARDMA_EVENT_LOG_ENTRIES	4096
+#define ARDMA_RX_MARKER_LOG_ENTRIES	8192
+#define ARDMA_RX_MARKER_PREFIX	128
+#define ARDMA_EVENT_LOG_ENTRIES	65536
 #define ARDMA_UVERBS_ABI	1
 #define ARDMA_QPN_MIN		0x900
 #define ARDMA_QPN_MAX		0x00ffffff
@@ -167,18 +167,25 @@ module_param(receive_path, int, 0444);
 MODULE_PARM_DESC(receive_path,
 		 "Incoming Apple transmit HopID to bind as our RX path (default: 9)");
 
-static int local_tx_hop = -1;
+static int transmit_path = 9;
+module_param(transmit_path, int, 0444);
+MODULE_PARM_DESC(transmit_path,
+		 "Outgoing Apple transmit HopID to request for our TX path (-1 = auto; default: 9)");
+
+static unsigned int reserve_low_out_hops;
+module_param(reserve_low_out_hops, uint, 0444);
+MODULE_PARM_DESC(reserve_low_out_hops,
+		 "Diagnostic: reserve this many low auto out HopIDs before allocating the real TX path");
+
+static int local_tx_hop = 2;
 module_param(local_tx_hop, int, 0444);
 MODULE_PARM_DESC(local_tx_hop,
-		 "Local NHI TX ring hop ID to allocate (default: -1 = auto). "
-		 "AMD Strix Halo silicon supports hops 1..6 with the kernel "
-		 "patch enabled; use 3+ to avoid colliding with tbnet's E2E "
-		 "credit pool on hops 1-2.");
+		 "Local NHI TX ring hop ID to allocate (default: 2 for the Mac-compatible profile; -1 = auto).");
 
-static int local_rx_hop = -1;
+static int local_rx_hop = 2;
 module_param(local_rx_hop, int, 0444);
 MODULE_PARM_DESC(local_rx_hop,
-		 "Local NHI RX ring hop ID to allocate (default: -1 = auto)");
+		 "Local NHI RX ring hop ID to allocate (default: 2 for the Mac-compatible profile; -1 = auto)");
 
 static bool apple_vendor_only;
 module_param(apple_vendor_only, bool, 0444);
@@ -583,6 +590,7 @@ enum ardma_rx_event_type {
 	ARDMA_RX_EVT_FLUSH_PENDING,
 	ARDMA_RX_EVT_MSG_DONE,
 	ARDMA_RX_EVT_RECV_CQE,
+	ARDMA_RX_EVT_RAW_COPY,
 };
 
 struct ardma_rx_event_entry {
@@ -621,6 +629,7 @@ struct ardma_peer {
 
 	int local_in_hop;
 	int local_out_hop;
+	int reserved_out_hop;
 	bool paths_enabled;
 	bool remote_is_apple;
 	bool rx_raw_wire;
@@ -799,6 +808,8 @@ static const char *ardma_rx_event_name(u8 type)
 		return "msg_done";
 	case ARDMA_RX_EVT_RECV_CQE:
 		return "recv_cqe";
+	case ARDMA_RX_EVT_RAW_COPY:
+		return "raw_copy";
 	default:
 		return "unknown";
 	}
@@ -1852,6 +1863,9 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	unsigned long flags;
 	u32 dst_off;
 	u32 copy_len = len;
+	u32 split_len = 0;
+	u32 split_off = 0;
+	u8 split_eof = 0;
 	u32 pending_byte_len = 0;
 	enum ib_wc_status complete_status = IB_WC_SUCCESS;
 	enum ib_wc_status pending_status = IB_WC_SUCCESS;
@@ -1997,6 +2011,18 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
 
 	if (ardma_peer_rx_raw(peer)) {
+		u32 expected_len = 0;
+
+		if (!ardma_recv_wr_total_len(r, &expected_len) &&
+		    dst_off < expected_len && dst_off + copy_len > expected_len &&
+		    eof != 2 && eof != 3) {
+			u32 current_len = expected_len - dst_off;
+
+			split_off = current_len;
+			split_len = copy_len - current_len;
+			split_eof = eof;
+			copy_len = current_len;
+		}
 		ret = ardma_recv_scatter(pd, r, dst_off, payload, copy_len);
 	} else {
 		u32 user_len = 0;
@@ -2014,18 +2040,43 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	qp->rx_byte_len = max(qp->rx_byte_len, dst_off + copy_len);
 	/* The posted receive length is capacity. A shorter SEND completes
 	 * successfully; only overflow is a local length error. */
-	if (!ardma_recv_wr_total_len(r, &dst_off)) {
-		if (qp->rx_byte_len > dst_off) {
+	{
+		u32 expected_len = 0;
+
+		if (!ardma_recv_wr_total_len(r, &expected_len)) {
+			if (ardma_peer_rx_raw(peer)) {
+				s32 prefix = -1;
+
+				if (len >= 4) {
+					const u8 *p = payload;
+
+					prefix = p[0] | (p[1] << 8) |
+						 (p[2] << 16) | (p[3] << 24);
+				}
+				ardma_log_rx_event(peer, ARDMA_RX_EVT_RAW_COPY,
+						   qpn, qp->attr.dest_qp_num,
+						   r->wr_id, len, qp->rx_byte_len,
+						   expected_len, 0, eof,
+						   ret ? IB_WC_LOC_PROT_ERR :
+							 IB_WC_SUCCESS,
+						   0, qp->state, qp->registered,
+						   qp->recv_q_depth,
+						   qp->rx_pending_ready_count,
+						   qp->rx_pending_active, dst_off,
+						   prefix);
+			}
+			if (qp->rx_byte_len > expected_len) {
+				qp->rx_truncated = true;
+				atomic64_inc(&peer->rx_bad_shape);
+			} else if (qp->rx_byte_len < expected_len && eof != 3) {
+				spin_unlock_irqrestore(&qp->recv_lock, flags);
+				ardma_qp_put(qp);
+				return;
+			}
+		} else {
 			qp->rx_truncated = true;
 			atomic64_inc(&peer->rx_bad_shape);
-		} else if (eof != 3) {
-			spin_unlock_irqrestore(&qp->recv_lock, flags);
-			ardma_qp_put(qp);
-			return;
 		}
-	} else {
-		qp->rx_truncated = true;
-		atomic64_inc(&peer->rx_bad_shape);
 	}
 	if (qp->rx_truncated)
 		complete_status = ret && ret != -ERANGE ?
@@ -2035,6 +2086,10 @@ static void ardma_rx_apple_frame(struct ardma_peer *peer, u32 qpn,
 	atomic64_inc(&peer->rx_messages);
 	ardma_complete_rx_wr(qp, complete_status);
 	ardma_qp_put(qp);
+	if (split_len)
+		ardma_rx_apple_frame(peer, qpn,
+				     (const u8 *)payload + split_off,
+				     split_len, split_eof);
 }
 
 static u32 ardma_rx_frame_meta(const struct ring_frame *frame, u32 len)
@@ -4506,6 +4561,7 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 	unsigned int rx_ring_flags = READ_ONCE(rx_e2e) ? RING_FLAG_E2E : 0;
 	unsigned int depth = READ_ONCE(ring_depth);
 	unsigned int lanes = READ_ONCE(path_lanes);
+	int requested_out_hop = READ_ONCE(transmit_path);
 	u16 rx_sof_mask = ARDMA_RX_RAW_SOF_MASK;
 	u16 rx_eof_mask = ARDMA_RX_RAW_EOF_MASK;
 	int e2e_tx_hop;
@@ -4536,6 +4592,7 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 
 	peer->local_in_hop = -1;
 	peer->local_out_hop = -1;
+	peer->reserved_out_hop = -1;
 
 	ret = tb_xdomain_alloc_in_hopid(xd, receive_path);
 	if (ret != receive_path) {
@@ -4557,16 +4614,28 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 	}
 	e2e_tx_hop = peer->tx_ring->hop;
 
-	ret = tb_xdomain_alloc_out_hopid(xd, lanes > 1 ? receive_path : -1);
+	if (lanes > 1 && requested_out_hop < 0)
+		requested_out_hop = receive_path;
+
+	if (requested_out_hop < 0 && READ_ONCE(reserve_low_out_hops)) {
+		ret = tb_xdomain_alloc_out_hopid(xd, -1);
+		if (ret < 0)
+			goto err_tx_ring;
+		peer->reserved_out_hop = ret;
+		pr_info("reserved diagnostic low out_hop=%d before real TX path allocation\n",
+			peer->reserved_out_hop);
+	}
+
+	ret = tb_xdomain_alloc_out_hopid(xd, requested_out_hop);
 	if (ret < 0)
 		goto err_tx_ring;
-	if (lanes > 1 && ret != receive_path) {
+	if (requested_out_hop >= 0 && ret != requested_out_hop) {
 		if (ret >= 0) {
 			tb_xdomain_release_out_hopid(xd, ret);
 			ret = -EINVAL;
 		}
-		pr_warn("alloc_out_hopid(%d) for lane 0 failed: %d\n",
-			receive_path, ret);
+		pr_warn("alloc_out_hopid(%d) failed: %d\n",
+			requested_out_hop, ret);
 		goto err_tx_ring;
 	}
 	peer->local_out_hop = ret;
@@ -4680,6 +4749,10 @@ err_out_hop:
 		tb_xdomain_release_out_hopid(xd, peer->local_out_hop);
 	peer->local_out_hop = -1;
 err_tx_ring:
+	if (peer->reserved_out_hop >= 0) {
+		tb_xdomain_release_out_hopid(xd, peer->reserved_out_hop);
+		peer->reserved_out_hop = -1;
+	}
 	tb_ring_free(peer->tx_ring);
 	peer->tx_ring = NULL;
 err_in_hop:
@@ -4728,6 +4801,10 @@ static void ardma_teardown_rings(struct ardma_peer *peer)
 		tb_xdomain_release_out_hopid(peer->xd, peer->local_out_hop);
 		peer->local_out_hop = -1;
 	}
+	if (peer->reserved_out_hop >= 0) {
+		tb_xdomain_release_out_hopid(peer->xd, peer->reserved_out_hop);
+		peer->reserved_out_hop = -1;
+	}
 }
 
 static int ardma_stats_show(struct seq_file *m, void *unused)
@@ -4744,6 +4821,7 @@ static int ardma_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "local_in_hop: %d\n", peer->local_in_hop);
 	seq_printf(m, "rx_hop: %d\n", peer->rx_ring ? peer->rx_ring->hop : -1);
 	seq_printf(m, "local_out_hop: %d\n", peer->local_out_hop);
+	seq_printf(m, "reserved_out_hop: %d\n", peer->reserved_out_hop);
 	seq_printf(m, "tx_hop: %d\n", peer->tx_ring ? peer->tx_ring->hop : -1);
 	seq_printf(m, "tx_marker_mode: %u\n", READ_ONCE(tx_marker_mode));
 	seq_printf(m, "rx_frames: %lld\n",
