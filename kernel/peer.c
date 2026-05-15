@@ -85,6 +85,11 @@ int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key)
 	rail->native_last_error = 0;
 	tbv_native_control_init_rail(rail, peer);
 	tbv_path_default_config(peer->backend, &path_cfg);
+	if (peer->backend == TBV_BACKEND_NATIVE &&
+	    peer->state->cfg.profile == TBV_PROFILE_LINUX_PERF) {
+		path_cfg.rx_flags |= RING_FLAG_E2E;
+		path_cfg.e2e = true;
+	}
 	tbv_path_init(&rail->path, &path_cfg, rail);
 
 	list_for_each_entry(pos, &peer->rails, node) {
