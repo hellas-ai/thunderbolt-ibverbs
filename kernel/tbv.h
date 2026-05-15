@@ -10,6 +10,7 @@
 #include <linux/types.h>
 #include <linux/uuid.h>
 #include <linux/workqueue.h>
+#include <linux/xarray.h>
 
 #define TBV_DRV_NAME "thunderbolt_ibverbs"
 #define TBV_ETH_ALEN 6
@@ -202,6 +203,7 @@ struct tbv_state {
 	atomic_t verbs_cqs;
 	atomic_t verbs_qps;
 	atomic_t verbs_mrs;
+	struct xarray verbs_mrs_xa;
 	struct tbv_ibdev *ibdev;
 };
 

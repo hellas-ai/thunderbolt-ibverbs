@@ -31,6 +31,7 @@ int tbv_core_init(struct tbv_state *state,
 	state->cfg = *cfg;
 	mutex_init(&state->lock);
 	INIT_LIST_HEAD(&state->peers);
+	xa_init(&state->verbs_mrs_xa);
 	state->next_peer_id = 1;
 
 	if (!cfg->native_enabled && !cfg->apple_enabled)
@@ -67,6 +68,9 @@ void tbv_core_exit(struct tbv_state *state)
 		pr_warn("unloading with live peers after service teardown\n");
 
 	tbv_debugfs_exit(state);
+	if (!xa_empty(&state->verbs_mrs_xa))
+		pr_warn("unloading with live MR registry entries\n");
+	xa_destroy(&state->verbs_mrs_xa);
 	tbv_tbnet_identity_stop(&state->tbnet_identity);
 	mutex_destroy(&state->lock);
 }

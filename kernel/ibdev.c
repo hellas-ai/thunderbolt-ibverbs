@@ -365,6 +365,7 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 {
 	struct tbv_mr *mr;
 	u32 key;
+	int ret;
 
 	if (!length)
 		return ERR_PTR(-EINVAL);
@@ -389,6 +390,12 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	mr->length = length;
 	mr->virt_addr = virt_addr;
 	mr->access = access;
+	ret = xa_insert(&mr->owner->verbs_mrs_xa, key, mr, GFP_KERNEL);
+	if (ret) {
+		ib_umem_release(mr->umem);
+		kfree(mr);
+		return ERR_PTR(ret);
+	}
 	atomic_inc(&mr->owner->verbs_mrs);
 	return &mr->base;
 }
@@ -397,6 +404,8 @@ static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 {
 	struct tbv_mr *mr = container_of(ibmr, struct tbv_mr, base);
 
+	if (mr->owner)
+		xa_erase(&mr->owner->verbs_mrs_xa, ibmr->lkey);
 	if (mr->owner)
 		atomic_dec(&mr->owner->verbs_mrs);
 	ib_umem_release(mr->umem);
