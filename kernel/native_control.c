@@ -96,9 +96,10 @@ out:
 	return ret;
 }
 
-static int tbv_native_control_apply_ack(struct tbv_state *state,
-					const struct tbv_native_wire_info *info,
-					const struct tbv_native_wire_hello *remote)
+static int tbv_native_control_apply_remote(struct tbv_state *state,
+					   const struct tbv_native_wire_info *info,
+					   const struct tbv_native_wire_hello *remote,
+					   bool require_matching_rail)
 {
 	struct tbv_peer *peer;
 	int ret = -ENOENT;
@@ -111,7 +112,9 @@ static int tbv_native_control_apply_ack(struct tbv_state *state,
 			continue;
 
 		list_for_each_entry(rail, &peer->rails, node) {
-			if (rail->key.route != info->route ||
+			if (rail->key.route != info->route)
+				continue;
+			if (require_matching_rail &&
 			    rail->rail_id != remote->rail_id)
 				continue;
 
@@ -128,6 +131,13 @@ static int tbv_native_control_apply_ack(struct tbv_state *state,
 out:
 	mutex_unlock(&state->lock);
 	return ret;
+}
+
+static int tbv_native_control_apply_ack(struct tbv_state *state,
+					const struct tbv_native_wire_info *info,
+					const struct tbv_native_wire_hello *remote)
+{
+	return tbv_native_control_apply_remote(state, info, remote, true);
 }
 
 static int tbv_native_control_handle(const void *buf, size_t size, void *data)
@@ -170,6 +180,12 @@ static int tbv_native_control_handle(const void *buf, size_t size, void *data)
 			info.route);
 		return 1;
 	}
+
+	ret = tbv_native_control_apply_remote(state, &info, &remote, false);
+	if (!ret)
+		pr_info("native HELLO received route=0x%llx rail=0x%x remote_out=%u remote_tx=%u remote_rx=%u\n",
+			info.route, remote.rail_id, remote.transmit_path,
+			remote.tx_hop, remote.rx_hop);
 
 	ret = tbv_native_wire_build_hello(reply, sizeof(reply), &local,
 					  TBV_NATIVE_WIRE_OP_HELLO_ACK,
