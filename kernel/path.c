@@ -170,6 +170,8 @@ static void tbv_path_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 		else
 			atomic64_inc(&state->data_tx_completed);
 	}
+	if (packet && !packet->control && !canceled)
+		atomic64_inc(&path->data_tx_completed);
 	if (packet)
 		tbv_path_tx_packet_release(packet,
 					   canceled ? -ECANCELED : 0);
@@ -205,6 +207,7 @@ static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 		return;
 	if (state)
 		atomic64_inc(&state->data_rx_completed);
+	atomic64_inc(&path->data_rx_completed);
 
 	dma_sync_single_for_cpu(tb_ring_dma_device(ring), f->dma,
 				TBV_DATA_FRAME_SIZE, DMA_FROM_DEVICE);
@@ -592,6 +595,7 @@ static int tbv_path_enqueue_data(struct tbv_path *path,
 	packet->queued = true;
 	list_add_tail(&packet->node, &path->tx_data_queue);
 	path->tx_data_queued++;
+	atomic64_inc(&path->data_tx_enqueued);
 	spin_unlock_irqrestore(&path->tx_lock, flags);
 
 	tbv_path_schedule_tx(path);
@@ -703,6 +707,8 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		if (!ret) {
 			if (state)
 				atomic64_inc(&state->data_tx_posted);
+			if (!packet->control)
+				atomic64_inc(&path->data_tx_posted);
 			continue;
 		}
 

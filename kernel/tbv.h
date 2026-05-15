@@ -137,6 +137,10 @@ struct tbv_path {
 	struct list_head tx_control_queue;
 	struct list_head tx_data_queue;
 	atomic_t tx_inflight;
+	atomic64_t data_tx_enqueued;
+	atomic64_t data_tx_posted;
+	atomic64_t data_tx_completed;
+	atomic64_t data_rx_completed;
 	bool tx_scheduling;
 	int local_transmit_path;
 	int remote_transmit_path;

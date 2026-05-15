@@ -110,6 +110,12 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 				   rail->remote_transmit_path,
 				   rail->remote_tx_hop,
 				   rail->remote_rx_hop);
+			seq_printf(s,
+				   "    data_tx_enqueued=%lld data_tx_posted=%lld data_tx_completed=%lld data_rx_completed=%lld\n",
+				   atomic64_read(&rail->path.data_tx_enqueued),
+				   atomic64_read(&rail->path.data_tx_posted),
+				   atomic64_read(&rail->path.data_tx_completed),
+				   atomic64_read(&rail->path.data_rx_completed));
 		}
 	}
 	mutex_unlock(&state->lock);
