@@ -163,6 +163,11 @@ int tbv_tbip_parse_login(const void *buf, size_t size,
 int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
 				    const void *request, size_t request_size,
 				    const struct tbv_tbnet_arp_proxy *proxy);
+void tbv_rail_key_init(struct tbv_rail_key *key, u64 route,
+		       u32 local_adapter, u32 remote_adapter, u32 path_id);
+int tbv_rail_key_cmp(const struct tbv_rail_key *a,
+		     const struct tbv_rail_key *b);
+u32 tbv_rail_key_hash(const struct tbv_rail_key *key);
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);
 
