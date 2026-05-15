@@ -102,16 +102,20 @@ struct tbv_ibdev {
 struct tbv_send_ctx {
 	struct list_head node;
 	struct tbv_qp *tqp;
+	refcount_t refs;
+	spinlock_t lock;
 	u64 wr_id;
 	u32 psn;
 	bool signaled;
+	bool completed;
 };
 
 static DEFINE_IDA(tbv_qpn_ida);
 static atomic_t tbv_mr_key = ATOMIC_INIT(1);
 
 static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc);
-static void tbv_send_done(void *ctx, int status);
+static void tbv_send_ctx_put(struct tbv_send_ctx *send);
+static bool tbv_send_complete(struct tbv_send_ctx *send, int status);
 
 static struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev)
 {
@@ -518,7 +522,8 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 			list_first_entry(&flush, struct tbv_send_ctx, node);
 
 		list_del_init(&send->node);
-		tbv_send_done(send, -ECANCELED);
+		tbv_send_complete(send, -ECANCELED);
+		tbv_send_ctx_put(send);
 	}
 
 	tbv_qp_put(tqp);
@@ -599,10 +604,33 @@ static int tbv_query_qp(struct ib_qp *qp, struct ib_qp_attr *attr,
 	return 0;
 }
 
-static void tbv_send_done(void *ctx, int status)
+static void tbv_send_ctx_get(struct tbv_send_ctx *send)
 {
-	struct tbv_send_ctx *send = ctx;
+	refcount_inc(&send->refs);
+}
+
+static void tbv_send_ctx_put(struct tbv_send_ctx *send)
+{
+	if (refcount_dec_and_test(&send->refs)) {
+		tbv_qp_put(send->tqp);
+		kfree(send);
+	}
+}
+
+static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
+{
 	struct tbv_qp *tqp = send->tqp;
+	unsigned long flags;
+	bool complete = false;
+
+	spin_lock_irqsave(&send->lock, flags);
+	if (!send->completed) {
+		send->completed = true;
+		complete = true;
+	}
+	spin_unlock_irqrestore(&send->lock, flags);
+	if (!complete)
+		return false;
 
 	if (send->signaled) {
 		struct tbv_cq *send_cq =
@@ -617,8 +645,7 @@ static void tbv_send_done(void *ctx, int status)
 		tbv_cq_push(send_cq, &wc);
 	}
 
-	tbv_qp_put(tqp);
-	kfree(send);
+	return true;
 }
 
 static void tbv_send_tx_done(void *ctx, int status)
@@ -626,11 +653,16 @@ static void tbv_send_tx_done(void *ctx, int status)
 	struct tbv_send_ctx *send = ctx;
 	struct tbv_qp *tqp = send->tqp;
 
-	if (!status)
+	if (!status) {
+		tbv_send_ctx_put(send);
 		return;
+	}
 
-	if (tbv_qp_unqueue_send(tqp, send))
-		tbv_send_done(send, status);
+	if (tbv_qp_unqueue_send(tqp, send)) {
+		tbv_send_complete(send, status);
+		tbv_send_ctx_put(send);
+	}
+	tbv_send_ctx_put(send);
 }
 
 static int tbv_copy_send_sges(struct tbv_qp *tqp, const struct ib_send_wr *wr,
@@ -728,6 +760,8 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		goto err_free_frame;
 	}
 	ctx->tqp = tqp;
+	refcount_set(&ctx->refs, 1);
+	spin_lock_init(&ctx->lock);
 	ctx->wr_id = wr->wr_id;
 	ctx->signaled = !!(wr->send_flags & IB_SEND_SIGNALED);
 	INIT_LIST_HEAD(&ctx->node);
@@ -748,16 +782,19 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	ret = tbv_native_data_build_header(frame, TBV_NATIVE_DATA_FRAME_SIZE,
 					   &hdr);
 	if (ret < 0)
-		goto err_free_ctx;
+		goto err_put_ctx;
 
 	tbv_qp_queue_send(tqp, ctx);
 	mutex_lock(&tqp->owner->lock);
 	path = tbv_first_active_native_path_locked(tqp->owner);
 	if (path) {
 		atomic64_inc(&tqp->owner->data_wr_path_send);
+		tbv_send_ctx_get(ctx);
 		ret = tbv_path_send(path, frame,
 				    TBV_NATIVE_DATA_HDR_SIZE + payload_len,
 				    tbv_send_tx_done, ctx);
+		if (ret)
+			tbv_send_ctx_put(ctx);
 	} else {
 		atomic64_inc(&tqp->owner->data_wr_no_path);
 		ret = -ENOTCONN;
@@ -766,15 +803,17 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	if (ret) {
 		atomic64_inc(&tqp->owner->data_wr_path_send_error);
 		tbv_qp_unqueue_send(tqp, ctx);
-		goto err_free_ctx;
+		goto err_put_ctx;
 	}
 
 	atomic64_inc(&tqp->owner->data_tx_accepted);
 	kfree(frame);
 	return 0;
 
-err_free_ctx:
-	kfree(ctx);
+err_put_ctx:
+	tbv_send_ctx_put(ctx);
+	kfree(frame);
+	return ret;
 err_free_frame:
 	kfree(frame);
 err_put_qp:
@@ -1082,8 +1121,10 @@ void tbv_ibdev_rx_frame(struct tbv_state *state, const void *data, u32 len)
 		}
 
 		send = tbv_qp_take_send(tqp, hdr.psn);
-		if (send)
-			tbv_send_done(send, hdr.imm_data ? -EIO : 0);
+		if (send) {
+			tbv_send_complete(send, hdr.imm_data ? -EIO : 0);
+			tbv_send_ctx_put(send);
+		}
 		tbv_qp_put(tqp);
 		return;
 	}
