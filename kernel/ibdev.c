@@ -428,6 +428,14 @@ static void tbv_release_path_refs(struct tbv_path **paths, u32 path_count)
 	}
 }
 
+static void tbv_kick_paths(struct tbv_path **paths, u32 path_count)
+{
+	u32 i;
+
+	for (i = 0; i < path_count; i++)
+		tbv_path_kick_tx(paths[i]);
+}
+
 static void tbv_release_path_reservations(struct tbv_path **paths,
 					  const u32 *reservations,
 					  u32 path_count)
@@ -1143,7 +1151,8 @@ out_unlock_paths:
 
 		atomic64_inc(&tqp->owner->data_wr_path_send);
 		tbv_send_ctx_get(ctx);
-		ret = tbv_path_send_owned(paths[path_idx], frame, packet_len, 0,
+		ret = tbv_path_send_owned(paths[path_idx], frame, packet_len,
+					  TBV_PATH_SEND_DEFER,
 					  tbv_send_tx_done, ctx);
 		if (ret)
 			tbv_send_ctx_put(ctx);
@@ -1158,6 +1167,7 @@ out_unlock_paths:
 		frag_idx++;
 	} while (offset < total_len);
 
+	tbv_kick_paths(paths, path_count);
 	tbv_release_path_refs(paths, path_count);
 	atomic64_inc(&tqp->owner->data_tx_accepted);
 	tbv_release_send_segments(segs, nsegs);
@@ -1165,6 +1175,8 @@ out_unlock_paths:
 
 err_release_paths_unqueue_ctx:
 	tbv_release_path_reservations(paths, reservations, path_count);
+	if (sent_any)
+		tbv_kick_paths(paths, path_count);
 	tbv_release_path_refs(paths, path_count);
 err_unqueue_ctx:
 	tbv_qp_unqueue_send(tqp, ctx);

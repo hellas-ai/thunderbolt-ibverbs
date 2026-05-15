@@ -293,6 +293,7 @@ struct tb_ring;
 struct tb_xdomain;
 typedef void (*tbv_path_tx_done_fn)(void *ctx, int status);
 #define TBV_PATH_SEND_CONTROL	BIT(0)
+#define TBV_PATH_SEND_DEFER	BIT(1)
 extern const uuid_t tbv_native_service_uuid;
 
 int tbv_config_parse(struct tbv_config *cfg, const char *compat,
@@ -370,6 +371,7 @@ int tbv_path_send(struct tbv_path *path, const void *data, u32 len,
 int tbv_path_send_owned(struct tbv_path *path, void *data, u32 len,
 			unsigned int flags,
 			tbv_path_tx_done_fn done, void *done_ctx);
+void tbv_path_kick_tx(struct tbv_path *path);
 u32 tbv_path_cancel_data_done_ctx(struct tbv_path *path,
 				  tbv_path_tx_done_fn done, void *done_ctx);
 void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd);

@@ -589,7 +589,8 @@ static int tbv_path_enqueue_control(struct tbv_path *path, const void *data,
 }
 
 static int tbv_path_enqueue_data(struct tbv_path *path,
-				 struct tbv_tx_packet *packet)
+				 struct tbv_tx_packet *packet,
+				 bool defer_schedule)
 {
 	unsigned long flags;
 
@@ -611,7 +612,8 @@ static int tbv_path_enqueue_data(struct tbv_path *path,
 	atomic64_inc(&path->data_tx_enqueued);
 	spin_unlock_irqrestore(&path->tx_lock, flags);
 
-	tbv_path_schedule_tx(path);
+	if (!defer_schedule)
+		tbv_path_schedule_tx(path);
 	return 0;
 }
 
@@ -759,6 +761,12 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 	}
 }
 
+void tbv_path_kick_tx(struct tbv_path *path)
+{
+	if (path)
+		tbv_path_schedule_tx(path);
+}
+
 int tbv_path_send(struct tbv_path *path, const void *data, u32 len,
 		  unsigned int send_flags,
 		  tbv_path_tx_done_fn done, void *done_ctx)
@@ -768,16 +776,20 @@ int tbv_path_send(struct tbv_path *path, const void *data, u32 len,
 
 	if (!len || len > TBV_DATA_FRAME_SIZE)
 		return -EINVAL;
-	if (send_flags & ~TBV_PATH_SEND_CONTROL)
+	if (send_flags & ~(TBV_PATH_SEND_CONTROL | TBV_PATH_SEND_DEFER))
 		return -EINVAL;
-	if (send_flags & TBV_PATH_SEND_CONTROL)
+	if (send_flags & TBV_PATH_SEND_CONTROL) {
+		if (send_flags & TBV_PATH_SEND_DEFER)
+			return -EINVAL;
 		return tbv_path_enqueue_control(path, data, len);
+	}
 
 	packet = tbv_path_alloc_data_packet(path, data, len, done, done_ctx);
 	if (!packet)
 		return -ENOMEM;
 
-	ret = tbv_path_enqueue_data(path, packet);
+	ret = tbv_path_enqueue_data(path, packet,
+				    send_flags & TBV_PATH_SEND_DEFER);
 	if (ret) {
 		kfree(packet->buf);
 		kfree(packet);
@@ -796,7 +808,7 @@ int tbv_path_send_owned(struct tbv_path *path, void *data, u32 len,
 	if (!data)
 		return -EINVAL;
 	if (!len || len > TBV_DATA_FRAME_SIZE ||
-	    (send_flags & ~TBV_PATH_SEND_CONTROL) ||
+	    (send_flags & ~(TBV_PATH_SEND_CONTROL | TBV_PATH_SEND_DEFER)) ||
 	    (send_flags & TBV_PATH_SEND_CONTROL)) {
 		kfree(data);
 		return -EINVAL;
@@ -809,7 +821,8 @@ int tbv_path_send_owned(struct tbv_path *path, void *data, u32 len,
 		return -ENOMEM;
 	}
 
-	ret = tbv_path_enqueue_data(path, packet);
+	ret = tbv_path_enqueue_data(path, packet,
+				    send_flags & TBV_PATH_SEND_DEFER);
 	if (ret) {
 		kfree(packet->buf);
 		kfree(packet);
