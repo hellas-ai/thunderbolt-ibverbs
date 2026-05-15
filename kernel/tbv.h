@@ -235,6 +235,8 @@ struct tbv_state {
 	bool start_rings;
 	bool negotiate_native;
 	bool enable_tunnels;
+	bool native_data;
+	bool apple_data;
 	bool native_wr_striping;
 	bool native_fragment_striping;
 	bool register_verbs;
@@ -247,6 +249,11 @@ struct tbv_state {
 	atomic_t verbs_mrs;
 	atomic_t verbs_recv_wqes;
 	atomic64_t data_wr_send;
+	atomic64_t data_wr_op_send;
+	atomic64_t data_wr_op_send_imm;
+	atomic64_t data_wr_op_write;
+	atomic64_t data_wr_op_write_imm;
+	atomic64_t data_wr_op_unsupported;
 	atomic64_t data_wr_live;
 	atomic64_t data_wr_no_path;
 	atomic64_t data_wr_copied;
@@ -262,6 +269,10 @@ struct tbv_state {
 	atomic64_t data_rx_bad_frame;
 	atomic64_t data_rx_bad_header;
 	atomic64_t data_rx_send;
+	atomic64_t data_rx_op_send;
+	atomic64_t data_rx_op_send_imm;
+	atomic64_t data_rx_op_write;
+	atomic64_t data_rx_op_write_imm;
 	atomic64_t data_rx_ack;
 	atomic64_t data_rx_no_qp;
 	atomic64_t data_rx_no_recv;

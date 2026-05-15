@@ -77,10 +77,12 @@ struct tbv_rx_message {
 	u32 src_qp;
 	u32 psn;
 	u32 total_len;
+	u32 imm_data;
 	u32 received;
 	u32 delivered;
 	int status;
 	bool active;
+	bool with_imm;
 	bool solicited;
 };
 
@@ -89,11 +91,13 @@ struct tbv_rx_reorder_msg {
 	u32 src_qp;
 	u32 psn;
 	u32 total_len;
+	u32 imm_data;
 	u32 received;
 	u16 frag_count;
 	u16 frags_received;
 	DECLARE_BITMAP(frag_seen, TBV_RX_REORDER_MAX_FRAGS);
 	bool complete;
+	bool with_imm;
 	bool solicited;
 	void *buf;
 };
@@ -153,6 +157,7 @@ struct tbv_send_ctx {
 	spinlock_t lock;
 	u64 wr_id;
 	u32 psn;
+	enum ib_wc_opcode wc_opcode;
 	bool signaled;
 	bool completed;
 };
@@ -851,7 +856,7 @@ static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 
 		wc.wr_id = send->wr_id;
 		wc.status = status ? IB_WC_WR_FLUSH_ERR : IB_WC_SUCCESS;
-		wc.opcode = IB_WC_SEND;
+		wc.opcode = send->wc_opcode;
 		wc.qp = &tqp->base;
 		wc.port_num = 1;
 		tbv_cq_push(send_cq, &wc);
@@ -1005,11 +1010,29 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	bool wr_striping;
 	bool credit_consumed = false;
 	bool sent_any = false;
+	bool is_send = wr->opcode == IB_WR_SEND ||
+		       wr->opcode == IB_WR_SEND_WITH_IMM;
+	bool send_with_imm = wr->opcode == IB_WR_SEND_WITH_IMM;
+	bool is_write = wr->opcode == IB_WR_RDMA_WRITE ||
+			wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM;
+	bool write_with_imm = wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM;
 	int ret;
 
-	if (wr->opcode != IB_WR_SEND)
+	if (!is_send && !is_write) {
+		atomic64_inc(&tqp->owner->data_wr_op_unsupported);
 		return -EOPNOTSUPP;
+	}
+	if (is_write && !tqp->attr.dest_qp_num)
+		return -EINVAL;
 	atomic64_inc(&tqp->owner->data_wr_send);
+	if (send_with_imm)
+		atomic64_inc(&tqp->owner->data_wr_op_send_imm);
+	else if (is_send)
+		atomic64_inc(&tqp->owner->data_wr_op_send);
+	else if (write_with_imm)
+		atomic64_inc(&tqp->owner->data_wr_op_write_imm);
+	else
+		atomic64_inc(&tqp->owner->data_wr_op_write);
 	if (!tbv_qp_get_live(tqp))
 		return -EINVAL;
 	atomic64_inc(&tqp->owner->data_wr_live);
@@ -1021,6 +1044,16 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	}
 	nfrags = total_len ? DIV_ROUND_UP(total_len,
 					  TBV_NATIVE_DATA_MAX_PAYLOAD) : 1;
+	if (is_write) {
+		const struct ib_rdma_wr *rwr = rdma_wr(wr);
+		u64 remote_end;
+
+		if (check_add_overflow(rwr->remote_addr, (u64)total_len,
+				       &remote_end)) {
+			ret = -EINVAL;
+			goto err_release_segs;
+		}
+	}
 
 	mutex_lock(&tqp->owner->lock);
 	path = tbv_first_active_native_path_locked(tqp->owner);
@@ -1032,10 +1065,12 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	}
 	path = NULL;
 
-	ret = tbv_qp_consume_remote_recv_credit(tqp);
-	if (ret)
-		goto err_release_segs;
-	credit_consumed = true;
+	if (is_send) {
+		ret = tbv_qp_consume_remote_recv_credit(tqp);
+		if (ret)
+			goto err_release_segs;
+		credit_consumed = true;
+	}
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx) {
@@ -1048,6 +1083,7 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	spin_lock_init(&ctx->lock);
 	ctx->wr_id = wr->wr_id;
 	ctx->signaled = !!(wr->send_flags & IB_SEND_SIGNALED);
+	ctx->wc_opcode = is_write ? IB_WC_RDMA_WRITE : IB_WC_SEND;
 	INIT_LIST_HEAD(&ctx->node);
 
 	spin_lock_irqsave(&tqp->lock, flags);
@@ -1132,7 +1168,14 @@ out_unlock_paths:
 		}
 
 		memset(&hdr, 0, sizeof(hdr));
-		hdr.opcode = TBV_NATIVE_DATA_OP_SEND;
+		if (send_with_imm)
+			hdr.opcode = TBV_NATIVE_DATA_OP_SEND_IMM;
+		else if (is_send)
+			hdr.opcode = TBV_NATIVE_DATA_OP_SEND;
+		else if (write_with_imm)
+			hdr.opcode = TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM;
+		else
+			hdr.opcode = TBV_NATIVE_DATA_OP_RDMA_WRITE;
 		hdr.flags = last ? TBV_NATIVE_DATA_F_LAST : 0;
 		if (last && (wr->send_flags & IB_SEND_SOLICITED))
 			hdr.flags |= TBV_NATIVE_DATA_F_SOLICITED;
@@ -1140,8 +1183,18 @@ out_unlock_paths:
 		hdr.src_qp = tqp->base.qp_num;
 		hdr.psn = psn;
 		hdr.length = payload_len;
-		hdr.imm_data = total_len;
-		hdr.remote_addr = offset;
+		hdr.imm_data = write_with_imm ? be32_to_cpu(wr->ex.imm_data) :
+						total_len;
+		if (is_send) {
+			hdr.remote_addr = offset;
+			hdr.rkey = send_with_imm ?
+				   be32_to_cpu(wr->ex.imm_data) : 0;
+		} else {
+			const struct ib_rdma_wr *rwr = rdma_wr(wr);
+
+			hdr.remote_addr = rwr->remote_addr + offset;
+			hdr.rkey = rwr->rkey;
+		}
 		ret = tbv_native_data_build_header(frame, packet_len,
 						   &hdr);
 		if (ret < 0) {
@@ -1180,7 +1233,7 @@ err_release_paths_unqueue_ctx:
 	tbv_release_path_refs(paths, path_count);
 err_unqueue_ctx:
 	tbv_qp_unqueue_send(tqp, ctx);
-	if (!sent_any)
+	if (credit_consumed && !sent_any)
 		tbv_qp_return_remote_recv_credit(tqp);
 	tbv_send_ctx_put(ctx);
 	tbv_release_send_segments(segs, nsegs);
@@ -1555,6 +1608,27 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 	return -EFAULT;
 }
 
+static int tbv_umem_copy_to_iova(struct tbv_mr *mr, u64 iova,
+				 const void *src, size_t len)
+{
+	u64 iova_end;
+	u64 mr_iova_end;
+	u64 addr;
+
+	if (!len)
+		return 0;
+	if (check_add_overflow(iova, (u64)len, &iova_end))
+		return -EINVAL;
+	if (check_add_overflow(mr->virt_addr, mr->length, &mr_iova_end))
+		return -EINVAL;
+	if (iova < mr->virt_addr || iova_end > mr_iova_end)
+		return -EFAULT;
+	if (check_add_overflow(mr->start, iova - mr->virt_addr, &addr))
+		return -EINVAL;
+
+	return tbv_umem_copy_to(mr, addr, src, len);
+}
+
 static int tbv_rx_copy_to_wqe(struct tbv_state *state,
 			      const struct tbv_recv_wqe *wqe, u32 offset,
 			      const void *payload, u32 len, u32 *delivered)
@@ -1672,6 +1746,10 @@ static void tbv_rx_finish_send(struct tbv_state *state, struct tbv_qp *tqp)
 	wc.src_qp = msg->src_qp;
 	wc.pkey_index = 0;
 	wc.port_num = 1;
+	if (msg->with_imm) {
+		wc.wc_flags = IB_WC_WITH_IMM;
+		wc.ex.imm_data = cpu_to_be32(msg->imm_data);
+	}
 	if (tbv_cq_push(recv_cq, &wc))
 		ack_status = 1;
 
@@ -1724,6 +1802,10 @@ static bool tbv_rx_deliver_reorder_msg_locked(struct tbv_state *state,
 	wc.src_qp = msg->src_qp;
 	wc.pkey_index = 0;
 	wc.port_num = 1;
+	if (msg->with_imm) {
+		wc.wc_flags = IB_WC_WITH_IMM;
+		wc.ex.imm_data = cpu_to_be32(msg->imm_data);
+	}
 	if (tbv_cq_push(recv_cq, &wc))
 		ack_status = 1;
 	if (status != IB_WC_SUCCESS)
@@ -1770,6 +1852,8 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 {
 	struct tbv_rx_reorder_msg *msg;
 	s32 delta = tbv_psn_delta(psn, tqp->rx_expected_psn);
+	bool with_imm = hdr->opcode == TBV_NATIVE_DATA_OP_SEND_IMM;
+	u32 imm_data = with_imm ? hdr->rkey : 0;
 	u32 frag_idx;
 	u32 frag_count;
 
@@ -1819,6 +1903,8 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 		msg->src_qp = hdr->src_qp;
 		msg->psn = psn;
 		msg->total_len = total_len;
+		msg->with_imm = with_imm;
+		msg->imm_data = imm_data;
 		msg->frag_count = frag_count;
 		msg->solicited = hdr->flags & TBV_NATIVE_DATA_F_SOLICITED;
 		list_add_tail(&msg->node, &tqp->rx_reorder);
@@ -1827,6 +1913,8 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 		atomic64_inc(&state->data_rx_reorder_buffered);
 	} else if (msg->src_qp != hdr->src_qp ||
 		   msg->total_len != total_len ||
+		   msg->with_imm != with_imm ||
+		   msg->imm_data != imm_data ||
 		   msg->frag_count != frag_count ||
 		   test_bit(frag_idx, msg->frag_seen)) {
 		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
@@ -1856,6 +1944,8 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 	u64 frag_end64;
 	u32 offset;
 	bool last = hdr->flags & TBV_NATIVE_DATA_F_LAST;
+	bool with_imm = hdr->opcode == TBV_NATIVE_DATA_OP_SEND_IMM;
+	u32 imm_data = with_imm ? hdr->rkey : 0;
 
 	if (hdr->remote_addr > U32_MAX ||
 	    check_add_overflow(hdr->remote_addr, (u64)hdr->length,
@@ -1865,6 +1955,7 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 	    (!last && !hdr->length) ||
 	    (hdr->flags & ~(TBV_NATIVE_DATA_F_LAST |
 			    TBV_NATIVE_DATA_F_SOLICITED)) ||
+	    (!with_imm && hdr->rkey) ||
 	    last != (frag_end64 == total_len)) {
 		tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, psn, 1);
 		return;
@@ -1881,7 +1972,10 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 
 	if (msg->active) {
 		if (msg->src_qp != hdr->src_qp || msg->psn != psn ||
-		    msg->total_len != total_len || msg->received != offset) {
+		    msg->total_len != total_len ||
+		    msg->with_imm != with_imm ||
+		    msg->imm_data != imm_data ||
+		    msg->received != offset) {
 			if (tbv_psn_delta(psn, tqp->rx_expected_psn) > 0) {
 				tbv_rx_buffer_fragment_locked(state, tqp, hdr,
 							      psn, total_len,
@@ -1922,6 +2016,8 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 		msg->src_qp = hdr->src_qp;
 		msg->psn = psn;
 		msg->total_len = total_len;
+		msg->with_imm = with_imm;
+		msg->imm_data = imm_data;
 		msg->status = total_len > msg->wqe.length ?
 				      IB_WC_LOC_LEN_ERR :
 				      IB_WC_SUCCESS;
@@ -1938,6 +2034,82 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 		tbv_rx_drain_reorder_locked(state, tqp);
 	}
 	mutex_unlock(&tqp->rx_lock);
+}
+
+static int tbv_rx_complete_write_imm(struct tbv_state *state,
+				     struct tbv_qp *tqp,
+				     const struct tbv_native_data_header *hdr)
+{
+	struct tbv_cq *recv_cq = container_of(tqp->base.recv_cq,
+					      struct tbv_cq, base);
+	struct tbv_recv_wqe wqe;
+	struct ib_wc wc = {};
+
+	if (!tbv_qp_pop_recv(tqp, &wqe)) {
+		atomic64_inc(&state->data_rx_no_recv);
+		return -ENODATA;
+	}
+
+	wc.wr_id = wqe.wr_id;
+	wc.status = IB_WC_SUCCESS;
+	wc.opcode = IB_WC_RECV_RDMA_WITH_IMM;
+	wc.qp = &tqp->base;
+	wc.src_qp = hdr->src_qp;
+	wc.pkey_index = 0;
+	wc.port_num = 1;
+	wc.wc_flags = IB_WC_WITH_IMM;
+	wc.ex.imm_data = cpu_to_be32(hdr->imm_data);
+	return tbv_cq_push(recv_cq, &wc);
+}
+
+static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
+					      struct tbv_qp *tqp,
+					      const struct tbv_native_data_header *hdr,
+					      const void *payload)
+{
+	struct tbv_mr *mr;
+	bool last = hdr->flags & TBV_NATIVE_DATA_F_LAST;
+	bool with_imm = hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM;
+	int ret;
+
+	if ((hdr->flags & ~(TBV_NATIVE_DATA_F_LAST |
+			    TBV_NATIVE_DATA_F_SOLICITED)) ||
+	    (!last && !hdr->length) ||
+	    !(tqp->attr.qp_access_flags & IB_ACCESS_REMOTE_WRITE)) {
+		atomic64_inc(&state->data_rx_bad_header);
+		tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, hdr->psn, 1);
+		return;
+	}
+
+	mr = tbv_mr_get(state, hdr->rkey);
+	if (!mr) {
+		atomic64_inc(&state->data_rx_copy_error);
+		tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, hdr->psn, 1);
+		return;
+	}
+
+	if (!(mr->access & IB_ACCESS_REMOTE_WRITE)) {
+		atomic64_inc(&state->data_rx_copy_error);
+		tbv_mr_put(mr);
+		tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, hdr->psn, 1);
+		return;
+	}
+
+	ret = tbv_umem_copy_to_iova(mr, hdr->remote_addr, payload,
+				    hdr->length);
+	tbv_mr_put(mr);
+	if (ret) {
+		atomic64_inc(&state->data_rx_copy_error);
+		tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, hdr->psn, 1);
+		return;
+	}
+
+	if (last) {
+		if (with_imm)
+			ret = tbv_rx_complete_write_imm(state, tqp, hdr);
+		tbv_send_ack(state, hdr->src_qp, hdr->dest_qp, hdr->psn,
+			     ret ? 1 : 0);
+	}
 }
 
 static int tbv_poll_cq(struct ib_cq *cq, int num_entries, struct ib_wc *wc)
@@ -2030,11 +2202,22 @@ void tbv_ibdev_rx_frame(struct tbv_state *state, const void *data, u32 len)
 		return;
 	}
 
-	if (hdr.opcode != TBV_NATIVE_DATA_OP_SEND) {
+	if (hdr.opcode != TBV_NATIVE_DATA_OP_SEND &&
+	    hdr.opcode != TBV_NATIVE_DATA_OP_SEND_IMM &&
+	    hdr.opcode != TBV_NATIVE_DATA_OP_RDMA_WRITE &&
+	    hdr.opcode != TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM) {
 		atomic64_inc(&state->data_rx_bad_header);
 		return;
 	}
 	atomic64_inc(&state->data_rx_send);
+	if (hdr.opcode == TBV_NATIVE_DATA_OP_SEND)
+		atomic64_inc(&state->data_rx_op_send);
+	else if (hdr.opcode == TBV_NATIVE_DATA_OP_SEND_IMM)
+		atomic64_inc(&state->data_rx_op_send_imm);
+	else if (hdr.opcode == TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM)
+		atomic64_inc(&state->data_rx_op_write_imm);
+	else
+		atomic64_inc(&state->data_rx_op_write);
 
 	tqp = tbv_qp_get_by_num(state, hdr.dest_qp);
 	if (!tqp) {
@@ -2044,7 +2227,11 @@ void tbv_ibdev_rx_frame(struct tbv_state *state, const void *data, u32 len)
 	}
 
 	payload = (const u8 *)data + TBV_NATIVE_DATA_HDR_SIZE;
-	tbv_rx_handle_send_fragment(state, tqp, &hdr, payload);
+	if (hdr.opcode == TBV_NATIVE_DATA_OP_SEND ||
+	    hdr.opcode == TBV_NATIVE_DATA_OP_SEND_IMM)
+		tbv_rx_handle_send_fragment(state, tqp, &hdr, payload);
+	else
+		tbv_rx_handle_rdma_write_fragment(state, tqp, &hdr, payload);
 	tbv_qp_put(tqp);
 }
 

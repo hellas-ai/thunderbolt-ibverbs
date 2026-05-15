@@ -16,12 +16,20 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "uc_supported: %u\n", state->cfg.uc_supported);
 	seq_printf(s, "tbnet_identity: %s\n",
 		   tbv_tbnet_identity_name(state->cfg.tbnet_identity));
+	seq_printf(s, "tbnet_policy: %s\n",
+		   tbv_tbnet_policy_name(state->cfg.requested.tbnet));
+	seq_printf(s, "native_service_count: %u\n",
+		   state->native_dir_count);
+	seq_printf(s, "apple_service_registered: %u\n",
+		   !!state->apple_dir);
 	seq_printf(s, "services_registered: %u\n",
 		   state->services_registered);
 	seq_printf(s, "allocate_rings: %u\n", state->allocate_rings);
 	seq_printf(s, "start_rings: %u\n", state->start_rings);
 	seq_printf(s, "negotiate_native: %u\n", state->negotiate_native);
 	seq_printf(s, "enable_tunnels: %u\n", state->enable_tunnels);
+	seq_printf(s, "native_data: %u\n", state->native_data);
+	seq_printf(s, "apple_data: %u\n", state->apple_data);
 	seq_printf(s, "native_wr_striping: %u\n", state->native_wr_striping);
 	seq_printf(s, "native_fragment_striping: %u\n",
 		   state->native_fragment_striping);
@@ -37,6 +45,16 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic_read(&state->verbs_recv_wqes));
 	seq_printf(s, "data_wr_send: %lld\n",
 		   atomic64_read(&state->data_wr_send));
+	seq_printf(s, "data_wr_op_send: %lld\n",
+		   atomic64_read(&state->data_wr_op_send));
+	seq_printf(s, "data_wr_op_send_imm: %lld\n",
+		   atomic64_read(&state->data_wr_op_send_imm));
+	seq_printf(s, "data_wr_op_write: %lld\n",
+		   atomic64_read(&state->data_wr_op_write));
+	seq_printf(s, "data_wr_op_write_imm: %lld\n",
+		   atomic64_read(&state->data_wr_op_write_imm));
+	seq_printf(s, "data_wr_op_unsupported: %lld\n",
+		   atomic64_read(&state->data_wr_op_unsupported));
 	seq_printf(s, "data_wr_live: %lld\n",
 		   atomic64_read(&state->data_wr_live));
 	seq_printf(s, "data_wr_no_path: %lld\n",
@@ -67,6 +85,14 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_bad_header));
 	seq_printf(s, "data_rx_send: %lld\n",
 		   atomic64_read(&state->data_rx_send));
+	seq_printf(s, "data_rx_op_send: %lld\n",
+		   atomic64_read(&state->data_rx_op_send));
+	seq_printf(s, "data_rx_op_send_imm: %lld\n",
+		   atomic64_read(&state->data_rx_op_send_imm));
+	seq_printf(s, "data_rx_op_write: %lld\n",
+		   atomic64_read(&state->data_rx_op_write));
+	seq_printf(s, "data_rx_op_write_imm: %lld\n",
+		   atomic64_read(&state->data_rx_op_write_imm));
 	seq_printf(s, "data_rx_ack: %lld\n",
 		   atomic64_read(&state->data_rx_ack));
 	seq_printf(s, "data_rx_no_qp: %lld\n",

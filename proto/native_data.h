@@ -19,6 +19,8 @@ enum tbv_native_data_op {
 	TBV_NATIVE_DATA_OP_RDMA_WRITE = 3,
 	TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM = 4,
 	TBV_NATIVE_DATA_OP_RECV_CREDIT = 5,
+	TBV_NATIVE_DATA_OP_SEND_IMM = 6,
+	TBV_NATIVE_DATA_OP_MAX = TBV_NATIVE_DATA_OP_SEND_IMM,
 };
 
 enum tbv_native_data_flag {
@@ -32,8 +34,9 @@ struct tbv_native_data_header {
 	tbv_wire_u32 dest_qp;
 	tbv_wire_u32 src_qp;
 	tbv_wire_u32 psn;
-	/* For SEND, length is this fragment, imm_data is total message bytes,
-	 * and remote_addr is the fragment offset. For ACK, imm_data is status.
+	/* For SEND/SEND_IMM, length is this fragment, imm_data is total
+	 * message bytes, remote_addr is the fragment offset, and rkey carries
+	 * immediate data for SEND_IMM. For ACK, imm_data is status.
 	 */
 	tbv_wire_u32 length;
 	tbv_wire_u32 imm_data;
@@ -51,8 +54,7 @@ tbv_native_data_build_header(void *buf, size_t size,
 		return -EINVAL;
 	if (size < TBV_NATIVE_DATA_HDR_SIZE)
 		return -ENOSPC;
-	if (!hdr->opcode ||
-	    hdr->opcode > TBV_NATIVE_DATA_OP_RECV_CREDIT)
+	if (!hdr->opcode || hdr->opcode > TBV_NATIVE_DATA_OP_MAX)
 		return -EINVAL;
 	if (hdr->length > TBV_NATIVE_DATA_MAX_PAYLOAD)
 		return -EMSGSIZE;
@@ -106,8 +108,7 @@ tbv_native_data_parse_header(const void *buf, size_t size,
 	hdr->remote_addr = tbv_wire_get_le64(p + 32);
 	hdr->rkey = tbv_wire_get_le32(p + 40);
 
-	if (!hdr->opcode ||
-	    hdr->opcode > TBV_NATIVE_DATA_OP_RECV_CREDIT)
+	if (!hdr->opcode || hdr->opcode > TBV_NATIVE_DATA_OP_MAX)
 		return -EINVAL;
 	if (hdr->length > TBV_NATIVE_DATA_MAX_PAYLOAD)
 		return -EMSGSIZE;

@@ -72,6 +72,16 @@ module_param(enable_tunnels, bool, 0444);
 MODULE_PARM_DESC(enable_tunnels,
 		 "Enable negotiated Thunderbolt paths after native HELLO");
 
+static bool native_data = true;
+module_param(native_data, bool, 0444);
+MODULE_PARM_DESC(native_data,
+		 "Allow native Linux peers to allocate rings and enable data paths");
+
+static bool apple_data;
+module_param(apple_data, bool, 0444);
+MODULE_PARM_DESC(apple_data,
+		 "Allow Apple-compatible peers to allocate rings and enable data paths");
+
 static bool native_wr_striping;
 module_param(native_wr_striping, bool, 0444);
 MODULE_PARM_DESC(native_wr_striping,
@@ -130,6 +140,8 @@ static int __init tbv_init(void)
 		return ret;
 	tbv_driver_state.native_wr_striping = native_wr_striping;
 	tbv_driver_state.native_fragment_striping = native_fragment_striping;
+	tbv_driver_state.native_data = native_data;
+	tbv_driver_state.apple_data = apple_data;
 
 	service_cfg.native_prtcstns = native_prtcstns;
 	service_cfg.apple_prtcstns = apple_prtcstns;
@@ -161,13 +173,15 @@ static int __init tbv_init(void)
 		snprintf(lanes_desc, sizeof(lanes_desc), "%u-%u",
 			 cfg.lanes_min, cfg.lanes_max);
 
-	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s lanes=%s native_wr_striping=%u native_fragment_striping=%u\n",
+	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s lanes=%s native_data=%u apple_data=%u native_wr_striping=%u native_fragment_striping=%u\n",
 		tbv_compat_name(cfg.compat),
 		tbv_profile_name(cfg.profile),
 		tbv_profile_name(resolved.profile),
 		tbv_tbnet_policy_name(cfg.tbnet),
 		tbv_tbnet_identity_name(resolved.tbnet_identity),
 		lanes_desc,
+		native_data,
+		apple_data,
 		native_wr_striping,
 		native_fragment_striping);
 

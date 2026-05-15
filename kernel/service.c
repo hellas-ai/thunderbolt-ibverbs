@@ -121,6 +121,14 @@ static bool tbv_service_backend_enabled(const struct tbv_state *state,
 	return state->cfg.native_enabled;
 }
 
+static bool tbv_service_backend_data_enabled(const struct tbv_state *state,
+					     enum tbv_backend_type backend)
+{
+	if (backend == TBV_BACKEND_APPLE)
+		return state->apple_data;
+	return state->native_data;
+}
+
 static u32 tbv_service_native_lane(const struct tb_service_id *id)
 {
 	return (u32)id->driver_data;
@@ -182,7 +190,8 @@ static int tbv_service_probe(struct tb_service *svc,
 	rail->link_speed = xd->link_speed;
 	rail->link_width = xd->link_width;
 
-	if (tbv_service_state->allocate_rings) {
+	if (tbv_service_state->allocate_rings &&
+	    tbv_service_backend_data_enabled(tbv_service_state, backend)) {
 		ret = tbv_path_alloc_rings(&rail->path, xd, -1);
 		if (ret) {
 			goto err_remove_rail;
@@ -204,7 +213,8 @@ static int tbv_service_probe(struct tb_service *svc,
 				rail->path.tx_ring->hop,
 				rail->path.rx_ring->hop);
 
-			if (tbv_service_state->negotiate_native)
+			if (backend == TBV_BACKEND_NATIVE &&
+			    tbv_service_state->negotiate_native)
 				tbv_native_control_queue_rail(tbv_service_state,
 							      rail);
 		}
