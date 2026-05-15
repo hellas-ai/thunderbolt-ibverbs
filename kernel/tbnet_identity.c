@@ -11,6 +11,7 @@
 
 #include <linux/errno.h>
 #include <linux/kernel.h>
+#include <linux/string.h>
 
 #include "tbv.h"
 
@@ -39,4 +40,45 @@ int tbv_tbnet_identity_check_config(const struct tbv_resolved_config *cfg)
 	}
 
 	return 0;
+}
+
+int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,
+			       const struct tbv_resolved_config *cfg)
+{
+	memset(identity, 0, sizeof(*identity));
+	identity->mode = cfg->tbnet_identity;
+
+	if (!cfg->apple_enabled || cfg->tbnet_identity == TBV_TBNET_ID_OFF)
+		return 0;
+
+	switch (cfg->tbnet_identity) {
+	case TBV_TBNET_ID_STOCK:
+		identity->state = TBV_TBNET_ID_STATE_CARRIER |
+				  TBV_TBNET_ID_STATE_NEIGHBOR_READY |
+				  TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE |
+				  TBV_TBNET_ID_STATE_FULL_IP_ACTIVE;
+		pr_info("TBnet identity uses stock ThunderboltIP\n");
+		return 0;
+
+	case TBV_TBNET_ID_STOCK_PROXY:
+		identity->state = TBV_TBNET_ID_STATE_CARRIER |
+				  TBV_TBNET_ID_STATE_NEIGHBOR_READY |
+				  TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE;
+		pr_info("TBnet identity uses stock ThunderboltIP with RDMA GID proxying\n");
+		return 0;
+
+	case TBV_TBNET_ID_MINIMAL_PACKET:
+		pr_err("tbnet_identity=minimal_packet is designed but not implemented\n");
+		return -EOPNOTSUPP;
+
+	case TBV_TBNET_ID_AUTO:
+	case TBV_TBNET_ID_OFF:
+	default:
+		return 0;
+	}
+}
+
+void tbv_tbnet_identity_stop(struct tbv_tbnet_identity *identity)
+{
+	identity->state = 0;
 }

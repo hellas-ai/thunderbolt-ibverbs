@@ -2,12 +2,18 @@
 #ifndef TBV_H
 #define TBV_H
 
+#include <linux/bitops.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/refcount.h>
 #include <linux/types.h>
 
 #define TBV_DRV_NAME "thunderbolt_ibverbs"
+
+#define TBV_TBNET_ID_STATE_CARRIER		BIT(0)
+#define TBV_TBNET_ID_STATE_NEIGHBOR_READY	BIT(1)
+#define TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE	BIT(2)
+#define TBV_TBNET_ID_STATE_FULL_IP_ACTIVE	BIT(3)
 
 enum tbv_compat_mode {
 	TBV_COMPAT_AUTO,
@@ -93,11 +99,17 @@ struct tbv_peer {
 	u32 nr_rails;
 };
 
+struct tbv_tbnet_identity {
+	enum tbv_tbnet_identity_mode mode;
+	unsigned long state;
+};
+
 struct tbv_state {
 	struct tbv_resolved_config cfg;
 	struct mutex lock;
 	struct list_head peers;
 	u32 next_peer_id;
+	struct tbv_tbnet_identity tbnet_identity;
 };
 
 int tbv_config_parse(struct tbv_config *cfg, const char *compat,
@@ -113,6 +125,9 @@ const char *tbv_tbnet_identity_name(enum tbv_tbnet_identity_mode mode);
 const char *tbv_backend_name(enum tbv_backend_type type);
 
 int tbv_tbnet_identity_check_config(const struct tbv_resolved_config *cfg);
+int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,
+			       const struct tbv_resolved_config *cfg);
+void tbv_tbnet_identity_stop(struct tbv_tbnet_identity *identity);
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);
 

@@ -25,6 +25,8 @@ static void tbv_core_log_backend(enum tbv_backend_type type)
 int tbv_core_init(struct tbv_state *state,
 		  const struct tbv_resolved_config *cfg)
 {
+	int ret;
+
 	memset(state, 0, sizeof(*state));
 	state->cfg = *cfg;
 	mutex_init(&state->lock);
@@ -33,6 +35,12 @@ int tbv_core_init(struct tbv_state *state,
 
 	if (!cfg->native_enabled && !cfg->apple_enabled)
 		return -EINVAL;
+
+	ret = tbv_tbnet_identity_prepare(&state->tbnet_identity, cfg);
+	if (ret) {
+		mutex_destroy(&state->lock);
+		return ret;
+	}
 
 	if (cfg->native_enabled)
 		tbv_core_log_backend(TBV_BACKEND_NATIVE);
@@ -51,5 +59,6 @@ void tbv_core_exit(struct tbv_state *state)
 	if (!list_empty(&state->peers))
 		pr_warn("unloading with live peers; hardware binding is not implemented yet\n");
 
+	tbv_tbnet_identity_stop(&state->tbnet_identity);
 	mutex_destroy(&state->lock);
 }
