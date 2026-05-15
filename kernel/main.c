@@ -37,6 +37,11 @@ static char *lanes = "auto";
 module_param(lanes, charp, 0444);
 MODULE_PARM_DESC(lanes, "Lane request: auto, N, or MIN-MAX");
 
+static bool bind_services;
+module_param(bind_services, bool, 0444);
+MODULE_PARM_DESC(bind_services,
+		 "Register Thunderbolt service drivers and advertise services");
+
 static struct tbv_state tbv_driver_state;
 
 static int __init tbv_init(void)
@@ -63,6 +68,12 @@ static int __init tbv_init(void)
 	if (ret)
 		return ret;
 
+	ret = tbv_services_start(&tbv_driver_state, bind_services);
+	if (ret) {
+		tbv_core_exit(&tbv_driver_state);
+		return ret;
+	}
+
 	if (cfg.lanes_auto)
 		strscpy(lanes_desc, "auto", sizeof(lanes_desc));
 	else if (cfg.lanes_min == cfg.lanes_max)
@@ -85,6 +96,7 @@ static int __init tbv_init(void)
 
 static void __exit tbv_exit(void)
 {
+	tbv_services_stop(&tbv_driver_state);
 	tbv_core_exit(&tbv_driver_state);
 	pr_info("unloaded\n");
 }

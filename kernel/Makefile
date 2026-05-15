@@ -35,3 +35,4 @@ help:
 	@echo "  profile=auto|mac_compat|linux_perf|mixed"
 	@echo "  tbnet=auto|allow|prefer_rdma|block"
 	@echo "  tbnet_identity=auto|stock|stock_proxy|minimal_packet|off"
+	@echo "  bind_services=0|1"

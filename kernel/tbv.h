@@ -143,6 +143,9 @@ struct tbv_state {
 	struct list_head peers;
 	u32 next_peer_id;
 	struct tbv_tbnet_identity tbnet_identity;
+	struct tb_property_dir *native_dir;
+	struct tb_property_dir *apple_dir;
+	bool services_registered;
 };
 
 struct tb_property_dir;
@@ -174,6 +177,8 @@ int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
 				    const struct tbv_tbnet_arp_proxy *proxy);
 struct tb_property_dir *tbv_service_create_native_dir(void);
 struct tb_property_dir *tbv_service_create_apple_dir(u32 prtcstns);
+int tbv_services_start(struct tbv_state *state, bool bind_services);
+void tbv_services_stop(struct tbv_state *state);
 void tbv_rail_key_init(struct tbv_rail_key *key, u64 route,
 		       u32 local_adapter, u32 remote_adapter, u32 path_id);
 int tbv_rail_key_cmp(const struct tbv_rail_key *a,
