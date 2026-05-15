@@ -158,12 +158,25 @@ static void tbv_path_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	struct tbv_data_frame *f = container_of(frame, struct tbv_data_frame,
 						frame);
 	struct tbv_path *path = f->path;
-	struct tbv_tx_packet *packet = f->packet;
+	struct tbv_tx_packet *packet;
 	struct tbv_state *state = tbv_path_state(path);
 	unsigned long flags;
 
 	dma_sync_single_for_cpu(tb_ring_dma_device(ring), f->dma,
 				TBV_DATA_FRAME_SIZE, DMA_TO_DEVICE);
+	spin_lock_irqsave(&path->tx_lock, flags);
+	packet = f->packet;
+	f->packet = NULL;
+	f->done = NULL;
+	f->done_ctx = NULL;
+	f->frame.callback = NULL;
+	f->frame.size = 0;
+	f->frame.flags = 0;
+	f->frame.sof = 0;
+	f->frame.eof = 0;
+	list_add_tail(&f->free_node, &path->tx_free);
+	spin_unlock_irqrestore(&path->tx_lock, flags);
+
 	if (state) {
 		if (canceled)
 			atomic64_inc(&state->data_tx_canceled);
@@ -176,18 +189,6 @@ static void tbv_path_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 		tbv_path_tx_packet_release(packet,
 					   canceled ? -ECANCELED : 0);
 
-	f->packet = NULL;
-	f->done = NULL;
-	f->done_ctx = NULL;
-	f->frame.callback = NULL;
-	f->frame.size = 0;
-	f->frame.flags = 0;
-	f->frame.sof = 0;
-	f->frame.eof = 0;
-
-	spin_lock_irqsave(&path->tx_lock, flags);
-	list_add_tail(&f->free_node, &path->tx_free);
-	spin_unlock_irqrestore(&path->tx_lock, flags);
 	atomic_dec(&path->tx_inflight);
 	tbv_path_schedule_tx(path);
 }
@@ -500,20 +501,14 @@ int tbv_path_enable_tunnel(struct tbv_path *path, struct tb_xdomain *xd,
 }
 
 static struct tbv_tx_packet *
-tbv_path_alloc_data_packet(struct tbv_path *path, const void *data, u32 len,
-			   tbv_path_tx_done_fn done, void *done_ctx)
+tbv_path_alloc_data_packet_owned(struct tbv_path *path, u8 *buf, u32 len,
+				 tbv_path_tx_done_fn done, void *done_ctx)
 {
 	struct tbv_tx_packet *packet;
-	u8 *buf;
 
 	packet = kzalloc(sizeof(*packet), GFP_KERNEL);
 	if (!packet)
 		return NULL;
-	buf = kmemdup(data, len, GFP_KERNEL);
-	if (!buf) {
-		kfree(packet);
-		return NULL;
-	}
 
 	INIT_LIST_HEAD(&packet->node);
 	packet->path = path;
@@ -521,6 +516,24 @@ tbv_path_alloc_data_packet(struct tbv_path *path, const void *data, u32 len,
 	packet->len = len;
 	packet->done = done;
 	packet->done_ctx = done_ctx;
+	return packet;
+}
+
+static struct tbv_tx_packet *
+tbv_path_alloc_data_packet(struct tbv_path *path, const void *data, u32 len,
+			   tbv_path_tx_done_fn done, void *done_ctx)
+{
+	struct tbv_tx_packet *packet;
+	u8 *buf;
+
+	buf = kmemdup(data, len, GFP_KERNEL);
+	if (!buf)
+		return NULL;
+
+	packet = tbv_path_alloc_data_packet_owned(path, buf, len, done,
+						  done_ctx);
+	if (!packet)
+		kfree(buf);
 	return packet;
 }
 
@@ -771,6 +784,89 @@ int tbv_path_send(struct tbv_path *path, const void *data, u32 len,
 		return ret;
 	}
 	return 0;
+}
+
+int tbv_path_send_owned(struct tbv_path *path, void *data, u32 len,
+			unsigned int send_flags,
+			tbv_path_tx_done_fn done, void *done_ctx)
+{
+	struct tbv_tx_packet *packet;
+	int ret;
+
+	if (!data)
+		return -EINVAL;
+	if (!len || len > TBV_DATA_FRAME_SIZE ||
+	    (send_flags & ~TBV_PATH_SEND_CONTROL) ||
+	    (send_flags & TBV_PATH_SEND_CONTROL)) {
+		kfree(data);
+		return -EINVAL;
+	}
+
+	packet = tbv_path_alloc_data_packet_owned(path, data, len, done,
+						  done_ctx);
+	if (!packet) {
+		kfree(data);
+		return -ENOMEM;
+	}
+
+	ret = tbv_path_enqueue_data(path, packet);
+	if (ret) {
+		kfree(packet->buf);
+		kfree(packet);
+		return ret;
+	}
+	return 0;
+}
+
+u32 tbv_path_cancel_data_done_ctx(struct tbv_path *path,
+				  tbv_path_tx_done_fn done, void *done_ctx)
+{
+	struct tbv_tx_packet *packet;
+	struct tbv_tx_packet *tmp;
+	LIST_HEAD(cancel);
+	unsigned long flags;
+	u32 canceled = 0;
+	u32 i;
+
+	if (!done || !done_ctx)
+		return 0;
+
+	spin_lock_irqsave(&path->tx_lock, flags);
+	list_for_each_entry_safe(packet, tmp, &path->tx_data_queue, node) {
+		if (packet->done != done || packet->done_ctx != done_ctx)
+			continue;
+		list_del_init(&packet->node);
+		packet->queued = false;
+		if (path->tx_data_queued)
+			path->tx_data_queued--;
+		packet->done = NULL;
+		packet->done_ctx = NULL;
+		list_add_tail(&packet->node, &cancel);
+		canceled++;
+	}
+
+	for (i = 0; i < path->tx_frame_count; i++) {
+		struct tbv_data_frame *f = &path->tx_frames[i];
+
+		packet = f->packet;
+		if (!packet || packet->control ||
+		    packet->done != done || packet->done_ctx != done_ctx)
+			continue;
+		packet->done = NULL;
+		packet->done_ctx = NULL;
+		f->done = NULL;
+		f->done_ctx = NULL;
+		canceled++;
+	}
+	spin_unlock_irqrestore(&path->tx_lock, flags);
+
+	while (!list_empty(&cancel)) {
+		packet = list_first_entry(&cancel, struct tbv_tx_packet, node);
+		list_del_init(&packet->node);
+		tbv_path_tx_packet_release(packet, -ECANCELED);
+	}
+
+	return canceled;
 }
 
 static void tbv_path_flush_tx_queue(struct tbv_path *path, int status)
