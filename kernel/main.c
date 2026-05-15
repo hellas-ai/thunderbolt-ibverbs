@@ -67,6 +67,11 @@ module_param(negotiate_native, bool, 0444);
 MODULE_PARM_DESC(negotiate_native,
 		 "Send a native HELLO after ring start without enabling paths");
 
+static bool enable_tunnels;
+module_param(enable_tunnels, bool, 0444);
+MODULE_PARM_DESC(enable_tunnels,
+		 "Enable negotiated Thunderbolt paths after native HELLO");
+
 static struct tbv_state tbv_driver_state;
 
 static int __init tbv_init(void)
@@ -100,6 +105,11 @@ static int __init tbv_init(void)
 		return -EINVAL;
 	}
 
+	if (enable_tunnels && !negotiate_native) {
+		pr_err("enable_tunnels=1 requires negotiate_native=1\n");
+		return -EINVAL;
+	}
+
 	ret = tbv_core_init(&tbv_driver_state, &resolved);
 	if (ret)
 		return ret;
@@ -109,6 +119,7 @@ static int __init tbv_init(void)
 	service_cfg.allocate_rings = allocate_rings;
 	service_cfg.start_rings = start_rings;
 	service_cfg.negotiate_native = negotiate_native;
+	service_cfg.enable_tunnels = enable_tunnels;
 
 	ret = tbv_services_start(&tbv_driver_state, bind_services,
 				 &service_cfg);

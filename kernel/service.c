@@ -159,6 +159,30 @@ static int tbv_service_probe(struct tb_service *svc,
 					return ret;
 				}
 			}
+
+			if (tbv_service_state->enable_tunnels) {
+				if (!rail->native_negotiated ||
+				    rail->remote_transmit_path < 0) {
+					tbv_peer_destroy(tbv_service_state,
+							 peer);
+					return -ENOTCONN;
+				}
+
+				ret = tbv_path_enable_tunnel(
+					&rail->path, xd,
+					rail->remote_transmit_path);
+				if (ret) {
+					tbv_peer_destroy(tbv_service_state,
+							 peer);
+					return ret;
+				}
+				pr_info("enabled tunnel service id=%d out_hop=%d remote_out_hop=%d tx_hop=%d rx_hop=%d\n",
+					svc->id,
+					rail->path.local_transmit_path,
+					rail->remote_transmit_path,
+					rail->path.tx_ring->hop,
+					rail->path.rx_ring->hop);
+			}
 		}
 	}
 
@@ -261,6 +285,7 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 	state->allocate_rings = service_cfg->allocate_rings;
 	state->start_rings = service_cfg->start_rings;
 	state->negotiate_native = service_cfg->negotiate_native;
+	state->enable_tunnels = service_cfg->enable_tunnels;
 
 	if (!bind_services) {
 		pr_info("Thunderbolt service binding disabled\n");

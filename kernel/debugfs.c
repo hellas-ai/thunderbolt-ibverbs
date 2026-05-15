@@ -21,6 +21,7 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "allocate_rings: %u\n", state->allocate_rings);
 	seq_printf(s, "start_rings: %u\n", state->start_rings);
 	seq_printf(s, "negotiate_native: %u\n", state->negotiate_native);
+	seq_printf(s, "enable_tunnels: %u\n", state->enable_tunnels);
 	return 0;
 }
 

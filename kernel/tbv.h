@@ -183,6 +183,7 @@ struct tbv_state {
 	bool allocate_rings;
 	bool start_rings;
 	bool negotiate_native;
+	bool enable_tunnels;
 	bool services_registered;
 };
 
@@ -193,6 +194,7 @@ struct tbv_service_config {
 	bool allocate_rings;
 	bool start_rings;
 	bool negotiate_native;
+	bool enable_tunnels;
 };
 
 struct tb_property_dir;

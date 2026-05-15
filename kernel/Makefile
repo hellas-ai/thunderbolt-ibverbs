@@ -39,5 +39,6 @@ help:
 	@echo "  allocate_rings=0|1"
 	@echo "  start_rings=0|1"
 	@echo "  negotiate_native=0|1"
+	@echo "  enable_tunnels=0|1"
 	@echo "  native_prtcstns=<u32>"
 	@echo "  apple_prtcstns=<u32>"

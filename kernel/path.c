@@ -144,9 +144,9 @@ int tbv_path_enable_tunnel(struct tbv_path *path, struct tb_xdomain *xd,
 		return ret < 0 ? ret : -EBUSY;
 
 	ret = tb_xdomain_enable_paths(xd, path->local_transmit_path,
-				      path->rx_ring->hop,
+				      path->tx_ring->hop,
 				      remote_transmit_path,
-				      path->tx_ring->hop);
+				      path->rx_ring->hop);
 	if (ret) {
 		tb_xdomain_release_in_hopid(xd, remote_transmit_path);
 		return ret;
@@ -161,9 +161,9 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 {
 	if (path->state == TBV_PATH_TUNNEL_ENABLED) {
 		tb_xdomain_disable_paths(xd, path->local_transmit_path,
-					 path->rx_ring ? path->rx_ring->hop : -1,
+					 path->tx_ring ? path->tx_ring->hop : -1,
 					 path->remote_transmit_path,
-					 path->tx_ring ? path->tx_ring->hop : -1);
+					 path->rx_ring ? path->rx_ring->hop : -1);
 		tb_xdomain_release_in_hopid(xd, path->remote_transmit_path);
 		path->remote_transmit_path = -1;
 		path->state = TBV_PATH_RING_STARTED;
