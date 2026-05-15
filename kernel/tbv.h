@@ -57,6 +57,14 @@ enum tbv_backend_type {
 	TBV_BACKEND_APPLE,
 };
 
+enum tbv_path_state {
+	TBV_PATH_NEW,
+	TBV_PATH_RING_ALLOCATED,
+	TBV_PATH_RING_STARTED,
+	TBV_PATH_TUNNEL_ENABLED,
+	TBV_PATH_STOPPED,
+};
+
 struct tbv_config {
 	enum tbv_compat_mode compat;
 	enum tbv_profile profile;
@@ -92,9 +100,29 @@ struct tbv_rail_key {
 	u32 path_id;
 };
 
+struct tbv_path_config {
+	u32 tx_ring_size;
+	u32 rx_ring_size;
+	u32 tx_flags;
+	u32 rx_flags;
+	u16 sof_mask;
+	u16 eof_mask;
+	bool e2e;
+};
+
+struct tbv_path {
+	enum tbv_path_state state;
+	struct tbv_path_config cfg;
+	struct tb_ring *tx_ring;
+	struct tb_ring *rx_ring;
+	int local_transmit_path;
+	int remote_transmit_path;
+};
+
 struct tbv_rail {
 	struct list_head node;
 	struct tbv_rail_key key;
+	struct tbv_path path;
 	u32 rail_id;
 	bool active;
 };
@@ -154,6 +182,7 @@ struct tbv_service_config {
 };
 
 struct tb_property_dir;
+struct tb_ring;
 
 int tbv_config_parse(struct tbv_config *cfg, const char *compat,
 		     const char *profile, const char *tbnet,
@@ -194,6 +223,12 @@ struct tbv_peer *tbv_peer_create(struct tbv_state *state,
 				 enum tbv_backend_type backend);
 void tbv_peer_destroy(struct tbv_state *state, struct tbv_peer *peer);
 int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key);
+void tbv_path_default_config(enum tbv_backend_type backend,
+			     struct tbv_path_config *cfg);
+void tbv_path_init(struct tbv_path *path,
+		   const struct tbv_path_config *cfg);
+void tbv_path_reset(struct tbv_path *path);
+const char *tbv_path_state_name(enum tbv_path_state state);
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);
 

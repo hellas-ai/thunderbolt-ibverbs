@@ -61,6 +61,7 @@ void tbv_peer_destroy(struct tbv_state *state, struct tbv_peer *peer)
 
 int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key)
 {
+	struct tbv_path_config path_cfg;
 	struct tbv_rail *rail;
 	struct tbv_rail *pos;
 
@@ -71,6 +72,8 @@ int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key)
 	rail->key = *key;
 	rail->rail_id = tbv_rail_key_hash(key);
 	rail->active = true;
+	tbv_path_default_config(peer->backend, &path_cfg);
+	tbv_path_init(&rail->path, &path_cfg);
 
 	list_for_each_entry(pos, &peer->rails, node) {
 		int cmp = tbv_rail_key_cmp(key, &pos->key);
