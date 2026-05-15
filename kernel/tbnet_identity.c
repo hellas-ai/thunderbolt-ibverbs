@@ -10,6 +10,8 @@
 #define pr_fmt(fmt) "thunderbolt_ibverbs: " fmt
 
 #include <linux/errno.h>
+#include <linux/if_arp.h>
+#include <linux/if_ether.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 
@@ -52,6 +54,13 @@ struct tbv_tbip_login_response {
 	u32 receiver_mac_len;
 	u32 reserved[4];
 };
+
+struct tbv_arp_ipv4_payload {
+	u8 sender_mac[TBV_ETH_ALEN];
+	__be32 sender_ip;
+	u8 target_mac[TBV_ETH_ALEN];
+	__be32 target_ip;
+} __packed;
 
 /* ThunderboltIP protocol UUID: 798f589e-3616-8a47-97c6-5664a920c8dd */
 static const uuid_t tbv_tbip_uuid =
@@ -142,6 +151,72 @@ int tbv_tbip_parse_login(const void *buf, size_t size,
 	params->ctrl.command_id = msg->hdr.command_id;
 	params->transmit_path = msg->transmit_path;
 	return 0;
+}
+
+static bool tbv_arp_is_ipv4_ethernet(const struct arphdr *arp)
+{
+	return arp->ar_hrd == htons(ARPHRD_ETHER) &&
+	       arp->ar_pro == htons(ETH_P_IP) &&
+	       arp->ar_hln == TBV_ETH_ALEN &&
+	       arp->ar_pln == sizeof(__be32);
+}
+
+int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
+				    const void *request, size_t request_size,
+				    const struct tbv_tbnet_arp_proxy *proxy)
+{
+	const struct tbv_arp_ipv4_payload *req_payload;
+	struct tbv_arp_ipv4_payload *reply_payload;
+	const struct ethhdr *req_eth = request;
+	struct ethhdr *reply_eth = reply;
+	const struct arphdr *req_arp;
+	struct arphdr *reply_arp;
+	size_t frame_len;
+
+	if (!reply || !request || !proxy)
+		return -EINVAL;
+
+	frame_len = sizeof(struct ethhdr) + sizeof(struct arphdr) +
+		    sizeof(struct tbv_arp_ipv4_payload);
+	if (reply_size < frame_len)
+		return -ENOSPC;
+	if (request_size < frame_len)
+		return -EINVAL;
+
+	if (req_eth->h_proto != htons(ETH_P_ARP))
+		return -ENOENT;
+
+	req_arp = (const struct arphdr *)(req_eth + 1);
+	if (!tbv_arp_is_ipv4_ethernet(req_arp))
+		return -ENOENT;
+	if (req_arp->ar_op != htons(ARPOP_REQUEST))
+		return -ENOENT;
+
+	req_payload = (const struct tbv_arp_ipv4_payload *)(req_arp + 1);
+	if (req_payload->target_ip != proxy->ipv4)
+		return -ENOENT;
+
+	memset(reply, 0, frame_len);
+
+	memcpy(reply_eth->h_dest, req_payload->sender_mac, TBV_ETH_ALEN);
+	memcpy(reply_eth->h_source, proxy->mac, TBV_ETH_ALEN);
+	reply_eth->h_proto = htons(ETH_P_ARP);
+
+	reply_arp = (struct arphdr *)(reply_eth + 1);
+	reply_arp->ar_hrd = htons(ARPHRD_ETHER);
+	reply_arp->ar_pro = htons(ETH_P_IP);
+	reply_arp->ar_hln = TBV_ETH_ALEN;
+	reply_arp->ar_pln = sizeof(__be32);
+	reply_arp->ar_op = htons(ARPOP_REPLY);
+
+	reply_payload = (struct tbv_arp_ipv4_payload *)(reply_arp + 1);
+	memcpy(reply_payload->sender_mac, proxy->mac, TBV_ETH_ALEN);
+	reply_payload->sender_ip = proxy->ipv4;
+	memcpy(reply_payload->target_mac, req_payload->sender_mac,
+	       TBV_ETH_ALEN);
+	reply_payload->target_ip = req_payload->sender_ip;
+
+	return frame_len;
 }
 
 int tbv_tbnet_identity_check_config(const struct tbv_resolved_config *cfg)

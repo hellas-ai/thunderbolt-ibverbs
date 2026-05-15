@@ -125,6 +125,11 @@ struct tbv_tbip_login_response_params {
 	u8 receiver_mac[TBV_ETH_ALEN];
 };
 
+struct tbv_tbnet_arp_proxy {
+	__be32 ipv4;
+	u8 mac[TBV_ETH_ALEN];
+};
+
 struct tbv_state {
 	struct tbv_resolved_config cfg;
 	struct mutex lock;
@@ -155,6 +160,9 @@ int tbv_tbip_build_login_response(void *buf, size_t size,
 				  const struct tbv_tbip_login_response_params *params);
 int tbv_tbip_parse_login(const void *buf, size_t size,
 			 struct tbv_tbip_login_params *params);
+int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
+				    const void *request, size_t request_size,
+				    const struct tbv_tbnet_arp_proxy *proxy);
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);
 
