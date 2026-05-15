@@ -316,7 +316,7 @@ struct usb4_rdma_ib_dev {
 	struct list_head dev_link;
 	struct u4_data_peer *rail;
 	atomic_t active_peers;
-	struct net_device *netdev;	/* RoCEv2 IP→GID stub; see netdev.c */
+	struct net_device *netdev;	/* Weak CM netdev pointer; RDMA core owns ref */
 	struct notifier_block netdev_nb;
 	struct mutex netdev_lock;
 	bool netdev_nb_registered;
@@ -3347,14 +3347,11 @@ static const struct ib_device_ops u4r_dev_ops = {
 
 static void u4r_detach_netdev_locked(struct usb4_rdma_ib_dev *u4r)
 {
-	struct net_device *netdev = u4r->netdev;
-
-	if (!netdev)
+	if (!u4r->netdev)
 		return;
 
 	ib_device_set_netdev(&u4r->base, NULL, 1);
 	u4r->netdev = NULL;
-	dev_put(netdev);
 }
 
 static int u4r_attach_netdev_locked(struct usb4_rdma_ib_dev *u4r,
@@ -3371,7 +3368,6 @@ static int u4r_attach_netdev_locked(struct usb4_rdma_ib_dev *u4r,
 	if (ret)
 		return ret;
 
-	dev_hold(netdev);
 	u4r->netdev = netdev;
 	return 0;
 }
@@ -3423,6 +3419,7 @@ static int u4r_register_ibdev(struct u4_data_peer *rail, bool active,
 			      struct usb4_rdma_ib_dev **out)
 {
 	struct usb4_rdma_ib_dev *u4r;
+	struct net_device *netdev;
 	char name[IB_DEVICE_NAME_MAX];
 	u8 mac[ETH_ALEN];
 	int err;
@@ -3482,23 +3479,24 @@ static int u4r_register_ibdev(struct u4_data_peer *rail, bool active,
 	eth_random_addr(mac);
 	addrconf_addr_eui48((u8 *)&u4r->base.node_guid, mac);
 
-	u4r->netdev = dev_get_by_name(&init_net, cm_netdev);
-	if (!u4r->netdev) {
+	netdev = dev_get_by_name(&init_net, cm_netdev);
+	if (!netdev) {
 		pr_err("CM netdev '%s' not found — bring it up first, or set "
 		       "cm_netdev=<iface> at module load\n", cm_netdev);
 		ib_dealloc_device(&u4r->base);
 		usb4_rdma_data_rail_put(rail);
 		return -ENODEV;
 	}
-	pr_info("CM control plane via netdev %s\n", cm_netdev);
 
 	ib_set_device_ops(&u4r->base, &u4r_dev_ops);
 
-	err = ib_device_set_netdev(&u4r->base, u4r->netdev, 1);
+	err = u4r_attach_netdev_locked(u4r, netdev);
+	dev_put(netdev);
 	if (err) {
 		pr_err("ib_device_set_netdev failed: %d\n", err);
-		goto err_netdev;
+		goto err_dealloc;
 	}
+	pr_info("CM control plane via netdev %s\n", cm_netdev);
 
 	if (rail) {
 		int idx = usb4_rdma_data_rail_index(rail);
@@ -3543,9 +3541,8 @@ err_unregister_ibdev:
 	ib_unregister_device(&u4r->base);
 err_clear_netdev:
 	ib_device_set_netdev(&u4r->base, NULL, 1);
-err_netdev:
-	dev_put(u4r->netdev);
 	u4r->netdev = NULL;
+err_dealloc:
 	ib_dealloc_device(&u4r->base);
 	usb4_rdma_data_rail_put(rail);
 	return err;

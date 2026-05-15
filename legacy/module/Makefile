@@ -1,7 +1,11 @@
-# Out-of-tree build for the usb4_rdma kernel module skeleton.
+# Out-of-tree build for the release-track usb4_rdma kernel module.
 #
 # By default, builds against the running kernel's headers. Override by
 # setting KDIR=/path/to/linux at make time.
+#
+# Set RESEARCH=1 to compile the BAR0 explorer and loadtest services used
+# during hardware characterization. The default build keeps those out of the
+# public module while retaining the production native Linux data path.
 
 KVER ?= $(shell uname -r)
 KDIR ?= $(shell \
@@ -19,9 +23,13 @@ KDIR ?= $(shell \
 PWD  := $(shell pwd)
 
 obj-m := usb4_rdma.o
-usb4_rdma-y := main.o bar.o loadtest.o ibdev.o data.o nhi_raw.o
-
+usb4_rdma-y := main.o config.o ibdev.o data.o nhi_raw.o
 ccflags-y := -Wall -Wextra -Wno-unused-parameter
+
+ifeq ($(RESEARCH),1)
+usb4_rdma-y += bar.o loadtest.o
+ccflags-y += -DUSB4_RDMA_RESEARCH=1
+endif
 
 .PHONY: all clean modules modules_install help
 

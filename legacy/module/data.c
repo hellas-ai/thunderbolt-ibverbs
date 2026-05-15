@@ -50,14 +50,15 @@
 #include <linux/random.h>
 
 #include "usb4_rdma.h"
+#include "config.h"
 #include "wire.h"
 #include "nhi_raw.h"
 
-#define U4_DATA_RING_DEPTH_DEFAULT 256
+#define U4_DATA_RING_DEPTH_DEFAULT U4_DATA_RING_DEPTH_MAX
 #define U4_DATA_RING_DEPTH_MIN     16
 #define U4_DATA_RING_DEPTH_MAX     4095
 #define U4_DATA_FRAME_SLACK        32
-#define U4_TX_ZCOPY_POOL_DEFAULT   256
+#define U4_TX_ZCOPY_POOL_DEFAULT   U4_TX_ZCOPY_POOL_MAX
 #define U4_TX_ZCOPY_POOL_MAX       4096
 #define U4_FRAME_SIZE              4096
 #define U4_DATA_PDF_FRAME_START    1
@@ -100,7 +101,7 @@ MODULE_PARM_DESC(rx_drain_test_frames,
 static uint data_ring_depth = U4_DATA_RING_DEPTH_DEFAULT;
 module_param(data_ring_depth, uint, 0444);
 MODULE_PARM_DESC(data_ring_depth,
-		 "NHI descriptor ring depth for RDMA data rings (default 256, max 4095)");
+		 "NHI descriptor ring depth for RDMA data rings (default 4095, max 4095)");
 
 static uint data_frames_per_dir;
 module_param(data_frames_per_dir, uint, 0444);
@@ -125,7 +126,7 @@ MODULE_PARM_DESC(rx_poll_opportunistic_lanes,
 static uint tx_zcopy_pool_frames = U4_TX_ZCOPY_POOL_DEFAULT;
 module_param(tx_zcopy_pool_frames, uint, 0444);
 MODULE_PARM_DESC(tx_zcopy_pool_frames,
-		 "preallocated TX zero-copy frame descriptors per lane (default: 256, max: 4096)");
+		 "preallocated TX zero-copy frame descriptors per lane (default: 4096, max: 4096)");
 
 static bool tx_stream_affinity = true;
 module_param(tx_stream_affinity, bool, 0644);
@@ -2171,6 +2172,8 @@ int usb4_rdma_data_attach_peer(struct tb_service *svc)
 	struct u4_login_ctx *login;
 	struct u4_data_peer *p;
 	struct tb_xdomain *xd = tb_service_parent(svc);
+	unsigned int lane_limit =
+		usb4_rdma_config_max_lanes(U4_MAX_LANES_PER_SERVICE);
 	int ret = 0, lane, prepared = 0;
 
 	if (!xd)
@@ -2186,7 +2189,7 @@ int usb4_rdma_data_attach_peer(struct tb_service *svc)
 	login->svc = svc;
 	login->xd = xd;
 
-	for (lane = 0; lane < U4_MAX_LANES_PER_SERVICE; lane++) {
+	for (lane = 0; lane < lane_limit; lane++) {
 		p = kzalloc(sizeof(*p), GFP_KERNEL);
 		if (!p) {
 			ret = -ENOMEM;
@@ -2199,8 +2202,9 @@ int usb4_rdma_data_attach_peer(struct tb_service *svc)
 			if (!prepared)
 				goto err_free_login;
 			dev_info(&svc->dev,
-				 "data: lane %d unavailable (%d); continuing with %d lane(s)\n",
-				 lane, ret, prepared);
+				 "data: lane %d unavailable (%d); continuing with %d lane(s), requested up to %u by profile=%s\n",
+				 lane, ret, prepared, lane_limit,
+				 usb4_rdma_config_profile_name());
 			break;
 		}
 		login->lanes[prepared++] = p;

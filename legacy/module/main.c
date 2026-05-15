@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * usb4_rdma — soft-RDMA over USB4 host-to-host xdomain (skeleton).
+ * usb4_rdma — soft-RDMA over USB4 host-to-host xdomain.
  *
  * Goal: provide an `ib_device` whose data path runs over `tb_xdomain`
  * rings, so any libibverbs userspace (RCCL, MPI, EXO/Jaccl, perftest)
@@ -13,13 +13,6 @@
  *      discover us during xdomain property exchange.
  *   3. On probe(), log peer info and (TODO) allocate TX+RX rings.
  *   4. (TODO) Register the verbs surface as `ib_device`.
- *
- * The skeleton intentionally does *not* yet:
- *   - allocate or use `tb_ring`s
- *   - implement any wire protocol
- *   - register an `ib_device`
- *
- * Each of those is its own pull request.
  *
  * Tested against kernel 7.0.x (NixOS) on AMD Strix Halo USB4 host
  * routers (PCI 1022:158d / 1022:158e).
@@ -38,13 +31,15 @@
 #include <linux/spinlock.h>
 
 #include "usb4_rdma.h"
+#include "config.h"
 
 #define DRV_NAME    "usb4_rdma"
+#define DRV_PROTOCOL_NAME "native-linux"
 
 /* Protocol key as advertised on the xdomain bus. Constrained to ≤ 8
  * chars by tb_register_property_dir(); both peers must match. */
 #define USB4_RDMA_PROTO_KEY "usb4rdma"
-#define DRV_VERSION "0.0.1"
+#define DRV_VERSION "0.1.0"
 
 /*
  * Service UUID: peers running this driver must agree on it. Generated
@@ -88,7 +83,7 @@ static struct dentry *usb4_rdma_debugfs_root;
 static bool enable_data_path = true;
 module_param(enable_data_path, bool, 0444);
 MODULE_PARM_DESC(enable_data_path,
-	"Attach the normal RDMA data path on peer probe (default true; set false for isolated loadtest probes)");
+	"Attach the RDMA data path on peer probe (default true)");
 
 /* ----- debugfs ---------------------------------------------------- */
 
@@ -110,7 +105,9 @@ static int usb4_rdma_state_show(struct seq_file *m, void *v)
 		   (long long)atomic64_read(&dev->probe_jiffies));
 	seq_printf(m, "service_key:     %s\n",
 		   dev->service ? dev->service->key : "(none)");
+	seq_printf(m, "protocol_name:   %s\n", DRV_PROTOCOL_NAME);
 	seq_printf(m, "protocol_rev:    %u\n", USB4_RDMA_PROTOCOL_REV);
+	usb4_rdma_config_show(m);
 	return 0;
 }
 
@@ -236,6 +233,7 @@ static int usb4_rdma_build_property_dir(void)
 	err = err ?: tb_property_add_immediate(dir, "prtcrevs", 1);
 	err = err ?: tb_property_add_immediate(dir, "prtcstns", 0);
 	err = err ?: tb_property_add_text(dir, "deviceid", DRV_NAME);
+	err = err ?: tb_property_add_text(dir, "protocol", DRV_PROTOCOL_NAME);
 	if (err) {
 		tb_property_free_dir(dir);
 		return err;
@@ -262,6 +260,10 @@ static int __init usb4_rdma_init(void)
 	int err;
 
 	pr_info("%s %s loading\n", DRV_NAME, DRV_VERSION);
+
+	err = usb4_rdma_config_init();
+	if (err)
+		return err;
 
 	usb4_rdma_debugfs_root = debugfs_create_dir(DRV_NAME, NULL);
 	if (IS_ERR(usb4_rdma_debugfs_root)) {
@@ -293,6 +295,7 @@ static int __init usb4_rdma_init(void)
 		goto err_ibdev;
 	}
 
+#ifdef USB4_RDMA_RESEARCH
 	/* PCI BAR explorer — best-effort, doesn't fail module load. */
 	if (usb4_rdma_pci_init(usb4_rdma_debugfs_root))
 		pr_warn("PCI BAR explorer init failed; continuing without it\n");
@@ -300,9 +303,12 @@ static int __init usb4_rdma_init(void)
 	/* Multi-ring xdomain loadtest — best-effort. */
 	if (usb4_rdma_loadtest_init(usb4_rdma_debugfs_root))
 		pr_warn("loadtest init failed; continuing without it\n");
+#else
+	pr_info("research helpers disabled (build with RESEARCH=1 to include BAR/loadtest services)\n");
+#endif
 
-	pr_info("%s ready, advertising service uuid %pUb\n",
-		DRV_NAME, &usb4_rdma_uuid);
+	pr_info("%s ready, advertising %s service uuid %pUb\n",
+		DRV_NAME, DRV_PROTOCOL_NAME, &usb4_rdma_uuid);
 	return 0;
 
 err_ibdev:
@@ -319,8 +325,10 @@ static void __exit usb4_rdma_exit(void)
 {
 	pr_info("%s unloading\n", DRV_NAME);
 	tb_unregister_service_driver(&usb4_rdma_driver);
+#ifdef USB4_RDMA_RESEARCH
 	usb4_rdma_loadtest_exit();
 	usb4_rdma_pci_exit();
+#endif
 	usb4_rdma_ibdev_exit();
 	usb4_rdma_data_exit();
 	usb4_rdma_destroy_property_dir();
@@ -331,7 +339,7 @@ module_init(usb4_rdma_init);
 module_exit(usb4_rdma_exit);
 
 MODULE_AUTHOR("usb4-rdma project");
-MODULE_DESCRIPTION("Soft-RDMA over USB4 host-to-host xdomain (skeleton)");
+MODULE_DESCRIPTION("Soft-RDMA over USB4 host-to-host xdomain");
 MODULE_VERSION(DRV_VERSION);
 MODULE_LICENSE("GPL v2");
 MODULE_ALIAS("tbsvc:kusb4rdmap00000001");

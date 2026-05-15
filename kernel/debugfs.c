@@ -42,11 +42,14 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 
 		list_for_each_entry(rail, &peer->rails, node) {
 			seq_printf(s,
-				   "  rail=0x%x route=0x%llx local=%u remote=%u path=%u active=%u state=%s negotiated=%u attempts=%u last_error=%d remote_rail=0x%x remote_out=%d remote_tx=%d remote_rx=%d\n",
+				   "  rail=0x%x route=0x%llx local=%u remote=%u path=%u link_speed=%uGb/s link_width=0x%x active=%u state=%s negotiated=%u attempts=%u last_error=%d remote_rail=0x%x remote_out=%d remote_tx=%d remote_rx=%d\n",
 				   rail->rail_id, rail->key.route,
 				   rail->key.local_adapter,
 				   rail->key.remote_adapter,
-				   rail->key.path_id, rail->active,
+				   rail->key.path_id,
+				   rail->link_speed,
+				   rail->link_width,
+				   rail->active,
 				   tbv_path_state_name(rail->path.state),
 				   rail->native_negotiated,
 				   rail->native_attempts,

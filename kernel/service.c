@@ -106,6 +106,7 @@ static int tbv_service_probe(struct tb_service *svc,
 	struct tb_xdomain *xd = tb_service_parent(svc);
 	struct tbv_rail_key key;
 	struct tbv_peer *peer;
+	struct tbv_rail *rail;
 	int ret;
 
 	if (!tbv_service_state)
@@ -125,11 +126,11 @@ static int tbv_service_probe(struct tb_service *svc,
 		return ret;
 	}
 
-	if (tbv_service_state->allocate_rings) {
-		struct tbv_rail *rail = list_first_entry(&peer->rails,
-							 struct tbv_rail,
-							 node);
+	rail = list_first_entry(&peer->rails, struct tbv_rail, node);
+	rail->link_speed = xd->link_speed;
+	rail->link_width = xd->link_width;
 
+	if (tbv_service_state->allocate_rings) {
 		ret = tbv_path_alloc_rings(&rail->path, xd, -1);
 		if (ret) {
 			tbv_peer_destroy(tbv_service_state, peer);

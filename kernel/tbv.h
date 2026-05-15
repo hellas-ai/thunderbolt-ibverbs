@@ -128,6 +128,8 @@ struct tbv_rail {
 	struct tbv_path path;
 	struct delayed_work native_work;
 	u32 rail_id;
+	u32 link_speed;
+	u32 link_width;
 	u32 remote_rail_id;
 	int remote_transmit_path;
 	int remote_tx_hop;

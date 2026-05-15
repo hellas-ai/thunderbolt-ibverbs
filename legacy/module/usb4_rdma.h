@@ -8,11 +8,9 @@
 
 struct u4_data_peer;
 
-/* bar.c — read-only BAR0 explorer for USB4 host routers. */
+/* bar.c/loadtest.c — research-only helpers, compiled with RESEARCH=1. */
 int  usb4_rdma_pci_init(struct dentry *parent_dir);
 void usb4_rdma_pci_exit(void);
-
-/* loadtest.c — multi-ring xdomain throughput probe. */
 int  usb4_rdma_loadtest_init(struct dentry *parent_dir);
 void usb4_rdma_loadtest_exit(void);
 
