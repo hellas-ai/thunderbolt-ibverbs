@@ -7,6 +7,7 @@
 #include <linux/idr.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <rdma/ib_mad.h>
 #include <rdma/ib_umem.h>
 #include <rdma/ib_user_verbs.h>
@@ -38,7 +39,12 @@ struct tbv_pd {
 struct tbv_cq {
 	struct ib_cq base;
 	struct tbv_state *owner;
+	spinlock_t lock;
+	struct ib_wc *entries;
 	u32 cqe;
+	u32 head;
+	u32 tail;
+	u32 count;
 };
 
 struct tbv_qp {
@@ -244,6 +250,12 @@ static int tbv_create_cq(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
 
 	if (!attr || attr->cqe <= 0 || attr->cqe > TBV_IBDEV_MAX_CQE)
 		return -EINVAL;
+
+	tcq->entries = kcalloc(attr->cqe, sizeof(*tcq->entries), GFP_KERNEL);
+	if (!tcq->entries)
+		return -ENOMEM;
+
+	spin_lock_init(&tcq->lock);
 	tcq->owner = tbv_ibdev_state(cq->device);
 	tcq->cqe = attr->cqe;
 	atomic_inc(&tcq->owner->verbs_cqs);
@@ -256,6 +268,7 @@ static int tbv_destroy_cq(struct ib_cq *cq, struct ib_udata *udata)
 
 	if (tcq->owner)
 		atomic_dec(&tcq->owner->verbs_cqs);
+	kfree(tcq->entries);
 	return 0;
 }
 
@@ -350,7 +363,22 @@ static int tbv_post_recv(struct ib_qp *qp, const struct ib_recv_wr *wr,
 
 static int tbv_poll_cq(struct ib_cq *cq, int num_entries, struct ib_wc *wc)
 {
-	return 0;
+	struct tbv_cq *tcq = container_of(cq, struct tbv_cq, base);
+	unsigned long flags;
+	int polled = 0;
+
+	if (num_entries <= 0 || !wc)
+		return 0;
+
+	spin_lock_irqsave(&tcq->lock, flags);
+	while (polled < num_entries && tcq->count) {
+		wc[polled++] = tcq->entries[tcq->head];
+		tcq->head = (tcq->head + 1) % tcq->cqe;
+		tcq->count--;
+	}
+	spin_unlock_irqrestore(&tcq->lock, flags);
+
+	return polled;
 }
 
 static int tbv_req_notify_cq(struct ib_cq *cq, enum ib_cq_notify_flags flags)
