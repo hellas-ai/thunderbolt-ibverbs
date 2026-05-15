@@ -62,6 +62,11 @@ module_param(start_rings, bool, 0444);
 MODULE_PARM_DESC(start_rings,
 		 "Start allocated Thunderbolt rings without enabling paths");
 
+static bool negotiate_native;
+module_param(negotiate_native, bool, 0444);
+MODULE_PARM_DESC(negotiate_native,
+		 "Send a native HELLO after ring start without enabling paths");
+
 static struct tbv_state tbv_driver_state;
 
 static int __init tbv_init(void)
@@ -90,6 +95,11 @@ static int __init tbv_init(void)
 		return -EINVAL;
 	}
 
+	if (negotiate_native && !start_rings) {
+		pr_err("negotiate_native=1 requires start_rings=1\n");
+		return -EINVAL;
+	}
+
 	ret = tbv_core_init(&tbv_driver_state, &resolved);
 	if (ret)
 		return ret;
@@ -98,6 +108,7 @@ static int __init tbv_init(void)
 	service_cfg.apple_prtcstns = apple_prtcstns;
 	service_cfg.allocate_rings = allocate_rings;
 	service_cfg.start_rings = start_rings;
+	service_cfg.negotiate_native = negotiate_native;
 
 	ret = tbv_services_start(&tbv_driver_state, bind_services,
 				 &service_cfg);

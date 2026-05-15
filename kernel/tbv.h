@@ -124,7 +124,12 @@ struct tbv_rail {
 	struct tbv_rail_key key;
 	struct tbv_path path;
 	u32 rail_id;
+	u32 remote_rail_id;
+	int remote_transmit_path;
+	int remote_tx_hop;
+	int remote_rx_hop;
 	bool active;
+	bool native_negotiated;
 };
 
 struct tbv_peer {
@@ -177,6 +182,7 @@ struct tbv_state {
 	struct dentry *debugfs_dir;
 	bool allocate_rings;
 	bool start_rings;
+	bool negotiate_native;
 	bool services_registered;
 };
 
@@ -186,6 +192,7 @@ struct tbv_service_config {
 	u32 apple_prtcstns;
 	bool allocate_rings;
 	bool start_rings;
+	bool negotiate_native;
 };
 
 struct tb_property_dir;
@@ -225,6 +232,8 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 void tbv_services_stop(struct tbv_state *state);
 int tbv_native_control_start(struct tbv_state *state);
 void tbv_native_control_stop(void);
+int tbv_native_control_exchange(struct tbv_state *state, struct tbv_peer *peer,
+				struct tbv_rail *rail);
 void tbv_rail_key_init(struct tbv_rail_key *key, u64 route,
 		       u32 local_adapter, u32 remote_adapter, u32 path_id);
 int tbv_rail_key_cmp(const struct tbv_rail_key *a,

@@ -20,6 +20,7 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   state->services_registered);
 	seq_printf(s, "allocate_rings: %u\n", state->allocate_rings);
 	seq_printf(s, "start_rings: %u\n", state->start_rings);
+	seq_printf(s, "negotiate_native: %u\n", state->negotiate_native);
 	return 0;
 }
 
@@ -40,12 +41,17 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 
 		list_for_each_entry(rail, &peer->rails, node) {
 			seq_printf(s,
-				   "  rail=0x%x route=0x%llx local=%u remote=%u path=%u active=%u state=%s\n",
+				   "  rail=0x%x route=0x%llx local=%u remote=%u path=%u active=%u state=%s negotiated=%u remote_rail=0x%x remote_out=%d remote_tx=%d remote_rx=%d\n",
 				   rail->rail_id, rail->key.route,
 				   rail->key.local_adapter,
 				   rail->key.remote_adapter,
 				   rail->key.path_id, rail->active,
-				   tbv_path_state_name(rail->path.state));
+				   tbv_path_state_name(rail->path.state),
+				   rail->native_negotiated,
+				   rail->remote_rail_id,
+				   rail->remote_transmit_path,
+				   rail->remote_tx_hop,
+				   rail->remote_rx_hop);
 		}
 	}
 	mutex_unlock(&state->lock);

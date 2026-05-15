@@ -149,6 +149,16 @@ static int tbv_service_probe(struct tb_service *svc,
 			pr_info("started rings service id=%d tx_hop=%d rx_hop=%d\n",
 				svc->id, rail->path.tx_ring->hop,
 				rail->path.rx_ring->hop);
+
+			if (tbv_service_state->negotiate_native) {
+				ret = tbv_native_control_exchange(
+					tbv_service_state, peer, rail);
+				if (ret) {
+					tbv_peer_destroy(tbv_service_state,
+							 peer);
+					return ret;
+				}
+			}
 		}
 	}
 
@@ -250,6 +260,7 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 
 	state->allocate_rings = service_cfg->allocate_rings;
 	state->start_rings = service_cfg->start_rings;
+	state->negotiate_native = service_cfg->negotiate_native;
 
 	if (!bind_services) {
 		pr_info("Thunderbolt service binding disabled\n");

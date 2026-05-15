@@ -38,5 +38,6 @@ help:
 	@echo "  bind_services=0|1"
 	@echo "  allocate_rings=0|1"
 	@echo "  start_rings=0|1"
+	@echo "  negotiate_native=0|1"
 	@echo "  native_prtcstns=<u32>"
 	@echo "  apple_prtcstns=<u32>"

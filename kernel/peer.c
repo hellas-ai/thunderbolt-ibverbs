@@ -77,6 +77,9 @@ int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key)
 	rail->key = *key;
 	rail->rail_id = tbv_rail_key_hash(key);
 	rail->active = true;
+	rail->remote_transmit_path = -1;
+	rail->remote_tx_hop = -1;
+	rail->remote_rx_hop = -1;
 	tbv_path_default_config(peer->backend, &path_cfg);
 	tbv_path_init(&rail->path, &path_cfg);
 

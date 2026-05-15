@@ -31,7 +31,7 @@ typedef uint64_t tbv_wire_u64;
 	 TBV_NATIVE_WIRE_HELLO_SIZE)
 
 static const tbv_wire_u8 tbv_native_wire_uuid[16] = {
-	0x1e, 0x8f, 0x2c, 0x7c, 0x4d, 0x5b, 0x01, 0x4a,
+	0x7c, 0x2c, 0x8f, 0x1e, 0x5b, 0x4d, 0x4a, 0x01,
 	0x9f, 0x3a, 0x2b, 0x8e, 0x6d, 0x4c, 0x1a, 0x07,
 };
 
@@ -213,6 +213,7 @@ tbv_native_wire_parse_hello(const void *buf, size_t size,
 		info->xdomain_sequence = (length_sn >> 27) & 0x3u;
 		info->route = ((tbv_wire_u64)tbv_wire_get_le32(p) << 32) |
 			      tbv_wire_get_le32(p + 4);
+		info->route &= ~(1ull << 63);
 	}
 
 	p += TBV_NATIVE_WIRE_XDOMAIN_HDR_SIZE;
