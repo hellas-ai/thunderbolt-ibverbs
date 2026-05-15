@@ -8,25 +8,19 @@
 
 #include "tbv.h"
 
-static void tbv_peer_free_rails(struct tbv_peer *peer)
+static bool tbv_peer_matches(const struct tbv_peer *peer,
+			     enum tbv_backend_type backend,
+			     const struct tb_xdomain *xd)
 {
-	struct tbv_rail *rail;
-	struct tbv_rail *tmp;
-
-	list_for_each_entry_safe(rail, tmp, &peer->rails, node) {
-		tbv_native_control_cancel_rail(rail);
-		tbv_path_destroy(&rail->path, peer->xd);
-		list_del(&rail->node);
-		kfree(rail);
-	}
-	peer->nr_rails = 0;
+	return peer->backend == backend && peer->xd == xd;
 }
 
-struct tbv_peer *tbv_peer_create(struct tbv_state *state,
-				 enum tbv_backend_type backend,
-				 struct tb_xdomain *xd)
+struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
+					enum tbv_backend_type backend,
+					struct tb_xdomain *xd)
 {
 	struct tbv_peer *peer;
+	struct tbv_peer *pos;
 
 	if (!tbv_backend_get(backend))
 		return ERR_PTR(-EINVAL);
@@ -42,6 +36,19 @@ struct tbv_peer *tbv_peer_create(struct tbv_state *state,
 	INIT_LIST_HEAD(&peer->rails);
 
 	mutex_lock(&state->lock);
+	list_for_each_entry(pos, &state->peers, node) {
+		if (!tbv_peer_matches(pos, backend, xd))
+			continue;
+
+		refcount_inc(&pos->refcnt);
+		mutex_unlock(&state->lock);
+		tb_xdomain_put(peer->xd);
+		kfree(peer);
+		pr_info("peer %u reused backend=%s refs=%u\n", pos->peer_id,
+			tbv_backend_name(backend), refcount_read(&pos->refcnt));
+		return pos;
+	}
+
 	peer->peer_id = state->next_peer_id++;
 	list_add_tail(&peer->node, &state->peers);
 	mutex_unlock(&state->lock);
@@ -51,22 +58,34 @@ struct tbv_peer *tbv_peer_create(struct tbv_state *state,
 	return peer;
 }
 
-void tbv_peer_destroy(struct tbv_state *state, struct tbv_peer *peer)
+void tbv_peer_put(struct tbv_state *state, struct tbv_peer *peer)
 {
+	bool free_peer;
+
 	if (!peer)
 		return;
 
 	mutex_lock(&state->lock);
-	list_del_init(&peer->node);
+	free_peer = refcount_dec_and_test(&peer->refcnt);
+	if (free_peer)
+		list_del_init(&peer->node);
 	mutex_unlock(&state->lock);
 
-	tbv_peer_free_rails(peer);
-	pr_info("peer %u destroyed\n", peer->peer_id);
+	if (!free_peer)
+		return;
+
+	if (peer->nr_rails)
+		pr_warn("peer %u destroyed with %u live rails\n",
+			peer->peer_id, peer->nr_rails);
+
+	pr_info("peer %u destroyed backend=%s\n", peer->peer_id,
+		tbv_backend_name(peer->backend));
 	tb_xdomain_put(peer->xd);
 	kfree(peer);
 }
 
-int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key)
+struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
+				   const struct tbv_rail_key *key)
 {
 	struct tbv_path_config path_cfg;
 	struct tbv_rail *rail;
@@ -74,7 +93,7 @@ int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key)
 
 	rail = kzalloc(sizeof(*rail), GFP_KERNEL);
 	if (!rail)
-		return -ENOMEM;
+		return ERR_PTR(-ENOMEM);
 
 	rail->key = *key;
 	rail->rail_id = tbv_rail_key_hash(key);
@@ -92,21 +111,46 @@ int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key)
 	}
 	tbv_path_init(&rail->path, &path_cfg, rail);
 
+	mutex_lock(&peer->state->lock);
 	list_for_each_entry(pos, &peer->rails, node) {
 		int cmp = tbv_rail_key_cmp(key, &pos->key);
 
 		if (!cmp) {
+			mutex_unlock(&peer->state->lock);
 			kfree(rail);
-			return -EEXIST;
+			return ERR_PTR(-EEXIST);
 		}
 		if (cmp < 0) {
 			list_add_tail(&rail->node, &pos->node);
 			peer->nr_rails++;
-			return 0;
+			mutex_unlock(&peer->state->lock);
+			return rail;
 		}
 	}
 
 	list_add_tail(&rail->node, &peer->rails);
 	peer->nr_rails++;
-	return 0;
+	mutex_unlock(&peer->state->lock);
+	return rail;
+}
+
+void tbv_peer_remove_rail(struct tbv_rail *rail)
+{
+	struct tbv_peer *peer;
+
+	if (!rail)
+		return;
+
+	peer = rail->peer;
+	mutex_lock(&peer->state->lock);
+	if (!list_empty(&rail->node)) {
+		list_del_init(&rail->node);
+		if (peer->nr_rails)
+			peer->nr_rails--;
+	}
+	mutex_unlock(&peer->state->lock);
+
+	tbv_native_control_cancel_rail(rail);
+	tbv_path_destroy(&rail->path, peer->xd);
+	kfree(rail);
 }

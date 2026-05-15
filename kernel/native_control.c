@@ -104,6 +104,8 @@ void tbv_native_control_cancel_rail(struct tbv_rail *rail)
 
 static int tbv_native_control_snapshot(struct tbv_state *state,
 				       const struct tbv_native_wire_info *info,
+				       u32 rail_id,
+				       bool require_matching_rail,
 				       struct tbv_native_wire_hello *hello,
 				       struct tb_xdomain **xd)
 {
@@ -119,6 +121,8 @@ static int tbv_native_control_snapshot(struct tbv_state *state,
 
 		list_for_each_entry(rail, &peer->rails, node) {
 			if (rail->key.route != info->route)
+				continue;
+			if (require_matching_rail && rail->rail_id != rail_id)
 				continue;
 
 			tbv_native_control_fill_hello(state, peer, rail,
@@ -212,14 +216,15 @@ static int tbv_native_control_handle(const void *buf, size_t size, void *data)
 		return 0;
 
 	memset(&local, 0, sizeof(local));
-	ret = tbv_native_control_snapshot(state, &info, &local, &xd);
+	ret = tbv_native_control_snapshot(state, &info, remote.rail_id, true,
+					  &local, &xd);
 	if (ret) {
-		pr_warn("native HELLO route=0x%llx has no matching peer\n",
-			info.route);
+		pr_warn("native HELLO route=0x%llx rail=0x%x has no matching peer rail\n",
+			info.route, remote.rail_id);
 		return 1;
 	}
 
-	ret = tbv_native_control_apply_remote(state, &info, &remote, false);
+	ret = tbv_native_control_apply_remote(state, &info, &remote, true);
 	if (!ret)
 		pr_info("native HELLO received route=0x%llx rail=0x%x remote_out=%u remote_tx=%u remote_rx=%u\n",
 			info.route, remote.rail_id, remote.transmit_path,

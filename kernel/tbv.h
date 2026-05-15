@@ -16,6 +16,7 @@
 #define TBV_DRV_NAME "thunderbolt_ibverbs"
 #define TBV_ETH_ALEN 6
 #define TBV_NATIVE_PROTOCOL_KEY "tbverbs"
+#define TBV_NATIVE_MAX_LANES 4
 #define TBV_NATIVE_PRTCID 1
 #define TBV_NATIVE_PRTCVERS 1
 #define TBV_NATIVE_PRTCREVS 0
@@ -208,7 +209,8 @@ struct tbv_state {
 	struct list_head peers;
 	u32 next_peer_id;
 	struct tbv_tbnet_identity tbnet_identity;
-	struct tb_property_dir *native_dir;
+	struct tb_property_dir *native_dirs[TBV_NATIVE_MAX_LANES];
+	u32 native_dir_count;
 	struct tb_property_dir *apple_dir;
 	struct dentry *debugfs_dir;
 	bool allocate_rings;
@@ -317,11 +319,13 @@ void tbv_rail_key_init(struct tbv_rail_key *key, u64 route,
 int tbv_rail_key_cmp(const struct tbv_rail_key *a,
 		     const struct tbv_rail_key *b);
 u32 tbv_rail_key_hash(const struct tbv_rail_key *key);
-struct tbv_peer *tbv_peer_create(struct tbv_state *state,
-				 enum tbv_backend_type backend,
-				 struct tb_xdomain *xd);
-void tbv_peer_destroy(struct tbv_state *state, struct tbv_peer *peer);
-int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key);
+struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
+					enum tbv_backend_type backend,
+					struct tb_xdomain *xd);
+void tbv_peer_put(struct tbv_state *state, struct tbv_peer *peer);
+struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
+				   const struct tbv_rail_key *key);
+void tbv_peer_remove_rail(struct tbv_rail *rail);
 void tbv_path_default_config(enum tbv_backend_type backend,
 			     struct tbv_path_config *cfg);
 void tbv_path_init(struct tbv_path *path,
