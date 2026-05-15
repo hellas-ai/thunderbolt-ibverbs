@@ -185,6 +185,7 @@ struct tbv_service_config {
 
 struct tb_property_dir;
 struct tb_ring;
+struct tb_xdomain;
 
 int tbv_config_parse(struct tbv_config *cfg, const char *compat,
 		     const char *profile, const char *tbnet,
@@ -231,6 +232,12 @@ void tbv_path_init(struct tbv_path *path,
 		   const struct tbv_path_config *cfg);
 void tbv_path_reset(struct tbv_path *path);
 const char *tbv_path_state_name(enum tbv_path_state state);
+int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
+			 int requested_transmit_path);
+int tbv_path_start_rings(struct tbv_path *path);
+int tbv_path_enable_tunnel(struct tbv_path *path, struct tb_xdomain *xd,
+			   int remote_transmit_path);
+void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd);
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);
 int tbv_debugfs_init(struct tbv_state *state);
