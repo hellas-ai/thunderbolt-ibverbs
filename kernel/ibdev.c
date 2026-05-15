@@ -278,6 +278,10 @@ static struct tbv_path *tbv_first_active_native_path_locked(struct tbv_state *st
 	return NULL;
 }
 
+/*
+ * Keep one QP on one rail. The current receiver reassembles an ordered SEND
+ * stream per QP, so per-WR rail striping would require a reorder layer.
+ */
 static struct tbv_path *tbv_select_native_data_path_locked(struct tbv_state *state,
 							  u32 selector)
 {
