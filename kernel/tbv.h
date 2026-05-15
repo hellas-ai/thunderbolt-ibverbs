@@ -122,11 +122,21 @@ struct tbv_path {
 	struct tb_ring *rx_ring;
 	struct tbv_data_frame *tx_frames;
 	struct tbv_data_frame *rx_frames;
+	struct tbv_tx_packet *tx_control_packets;
 	u32 tx_frame_count;
 	u32 rx_frame_count;
+	u32 tx_control_packet_count;
+	u32 tx_control_queued;
+	u32 tx_data_queued;
+	u32 tx_data_reserved;
+	u32 tx_data_queue_limit;
 	spinlock_t tx_lock;
 	struct list_head tx_free;
+	struct list_head tx_control_free;
+	struct list_head tx_control_queue;
+	struct list_head tx_data_queue;
 	atomic_t tx_inflight;
+	bool tx_scheduling;
 	int local_transmit_path;
 	int remote_transmit_path;
 };
@@ -252,9 +262,11 @@ struct tbv_service_config {
 
 struct tb_property_dir;
 struct tbv_data_frame;
+struct tbv_tx_packet;
 struct tb_ring;
 struct tb_xdomain;
 typedef void (*tbv_path_tx_done_fn)(void *ctx, int status);
+#define TBV_PATH_SEND_CONTROL	BIT(0)
 extern const uuid_t tbv_native_service_uuid;
 
 int tbv_config_parse(struct tbv_config *cfg, const char *compat,
@@ -321,7 +333,10 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 int tbv_path_start_rings(struct tbv_path *path);
 int tbv_path_enable_tunnel(struct tbv_path *path, struct tb_xdomain *xd,
 			   int remote_transmit_path);
+int tbv_path_reserve_data(struct tbv_path *path, u32 frames);
+void tbv_path_release_data_reservation(struct tbv_path *path, u32 frames);
 int tbv_path_send(struct tbv_path *path, const void *data, u32 len,
+		  unsigned int flags,
 		  tbv_path_tx_done_fn done, void *done_ctx);
 void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd);
 
