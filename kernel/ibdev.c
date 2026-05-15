@@ -278,6 +278,46 @@ static struct tbv_path *tbv_first_active_native_path_locked(struct tbv_state *st
 	return NULL;
 }
 
+static struct tbv_path *tbv_select_native_data_path_locked(struct tbv_state *state)
+{
+	struct tbv_peer *peer;
+	u32 active = 0;
+	u32 target;
+	u32 idx = 0;
+
+	list_for_each_entry(peer, &state->peers, node) {
+		struct tbv_rail *rail;
+
+		if (peer->backend != TBV_BACKEND_NATIVE)
+			continue;
+		list_for_each_entry(rail, &peer->rails, node) {
+			if (rail->path.state == TBV_PATH_TUNNEL_ENABLED)
+				active++;
+		}
+	}
+
+	if (!active)
+		return NULL;
+
+	target = (u32)atomic_inc_return(&state->data_path_rr) - 1;
+	target %= active;
+
+	list_for_each_entry(peer, &state->peers, node) {
+		struct tbv_rail *rail;
+
+		if (peer->backend != TBV_BACKEND_NATIVE)
+			continue;
+		list_for_each_entry(rail, &peer->rails, node) {
+			if (rail->path.state != TBV_PATH_TUNNEL_ENABLED)
+				continue;
+			if (idx++ == target)
+				return &rail->path;
+		}
+	}
+
+	return NULL;
+}
+
 static bool tbv_ibdev_port_active(struct tbv_state *state)
 {
 	struct tbv_peer *peer;
@@ -812,7 +852,7 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	u8 *frame;
 	struct tbv_native_data_header hdr = {};
 	struct tbv_send_ctx *ctx;
-	struct tbv_path *path;
+	struct tbv_path *path = NULL;
 	unsigned long flags;
 	u32 total_len = 0;
 	u32 offset = 0;
@@ -841,17 +881,17 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 
 	mutex_lock(&tqp->owner->lock);
 	path = tbv_first_active_native_path_locked(tqp->owner);
-	ret = path ? tbv_path_reserve_data(path, nfrags) : -ENOTCONN;
 	mutex_unlock(&tqp->owner->lock);
-	if (ret) {
+	if (!path) {
 		atomic64_inc(&tqp->owner->data_wr_no_path);
+		ret = -ENOTCONN;
 		goto err_release_segs;
 	}
-	reserved_frames = nfrags;
+	path = NULL;
 
 	ret = tbv_qp_consume_remote_recv_credit(tqp);
 	if (ret)
-		goto err_release_reservation;
+		goto err_release_segs;
 	credit_consumed = true;
 
 	frame = kzalloc(TBV_NATIVE_DATA_FRAME_SIZE, GFP_KERNEL);
@@ -879,6 +919,16 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	ctx->psn = psn;
 
 	tbv_qp_queue_send(tqp, ctx);
+	mutex_lock(&tqp->owner->lock);
+	path = tbv_select_native_data_path_locked(tqp->owner);
+	ret = path ? tbv_path_reserve_data(path, nfrags) : -ENOTCONN;
+	if (ret) {
+		mutex_unlock(&tqp->owner->lock);
+		atomic64_inc(&tqp->owner->data_wr_no_path);
+		goto err_unqueue_ctx;
+	}
+	reserved_frames = nfrags;
+
 	do {
 		u32 payload_len = min_t(u32, total_len - offset,
 					TBV_NATIVE_DATA_MAX_PAYLOAD);
@@ -889,7 +939,7 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 					  payload_len);
 		if (ret) {
 			atomic64_inc(&tqp->owner->data_wr_copy_error);
-			goto err_unqueue_ctx;
+			goto err_unlock_unqueue_ctx;
 		}
 
 		memset(&hdr, 0, sizeof(hdr));
@@ -907,40 +957,36 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 						   TBV_NATIVE_DATA_FRAME_SIZE,
 						   &hdr);
 		if (ret < 0)
-			goto err_unqueue_ctx;
+			goto err_unlock_unqueue_ctx;
 
-		mutex_lock(&tqp->owner->lock);
-		path = tbv_first_active_native_path_locked(tqp->owner);
-		if (path) {
-			atomic64_inc(&tqp->owner->data_wr_path_send);
-			tbv_send_ctx_get(ctx);
-			ret = tbv_path_send(path, frame,
-					    TBV_NATIVE_DATA_HDR_SIZE +
-						    payload_len,
-					    0,
-					    tbv_send_tx_done, ctx);
-			if (ret)
-				tbv_send_ctx_put(ctx);
-		} else {
-			atomic64_inc(&tqp->owner->data_wr_no_path);
-			ret = -ENOTCONN;
-		}
-		mutex_unlock(&tqp->owner->lock);
+		atomic64_inc(&tqp->owner->data_wr_path_send);
+		tbv_send_ctx_get(ctx);
+		ret = tbv_path_send(path, frame,
+				    TBV_NATIVE_DATA_HDR_SIZE + payload_len,
+				    0, tbv_send_tx_done, ctx);
+		if (ret)
+			tbv_send_ctx_put(ctx);
 		if (ret) {
 			atomic64_inc(&tqp->owner->data_wr_path_send_error);
-			goto err_unqueue_ctx;
+			goto err_unlock_unqueue_ctx;
 		}
 
 		reserved_frames--;
 		sent_any = true;
 		offset += payload_len;
 	} while (offset < total_len);
+	mutex_unlock(&tqp->owner->lock);
 
 	atomic64_inc(&tqp->owner->data_tx_accepted);
 	tbv_release_send_segments(segs, nsegs);
 	kfree(frame);
 	return 0;
 
+err_unlock_unqueue_ctx:
+	if (path)
+		tbv_path_release_data_reservation(path, reserved_frames);
+	mutex_unlock(&tqp->owner->lock);
+	path = NULL;
 err_unqueue_ctx:
 	tbv_qp_unqueue_send(tqp, ctx);
 	if (!sent_any)
@@ -956,9 +1002,6 @@ err_free_frame:
 err_return_credit:
 	if (credit_consumed)
 		tbv_qp_return_remote_recv_credit(tqp);
-err_release_reservation:
-	if (path)
-		tbv_path_release_data_reservation(path, reserved_frames);
 err_release_segs:
 	tbv_release_send_segments(segs, nsegs);
 err_put_qp:
