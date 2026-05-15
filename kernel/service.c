@@ -150,39 +150,9 @@ static int tbv_service_probe(struct tb_service *svc,
 				svc->id, rail->path.tx_ring->hop,
 				rail->path.rx_ring->hop);
 
-			if (tbv_service_state->negotiate_native) {
-				ret = tbv_native_control_exchange(
-					tbv_service_state, peer, rail);
-				if (ret) {
-					tbv_peer_destroy(tbv_service_state,
-							 peer);
-					return ret;
-				}
-			}
-
-			if (tbv_service_state->enable_tunnels) {
-				if (!rail->native_negotiated ||
-				    rail->remote_transmit_path < 0) {
-					tbv_peer_destroy(tbv_service_state,
-							 peer);
-					return -ENOTCONN;
-				}
-
-				ret = tbv_path_enable_tunnel(
-					&rail->path, xd,
-					rail->remote_transmit_path);
-				if (ret) {
-					tbv_peer_destroy(tbv_service_state,
-							 peer);
-					return ret;
-				}
-				pr_info("enabled tunnel service id=%d out_hop=%d remote_out_hop=%d tx_hop=%d rx_hop=%d\n",
-					svc->id,
-					rail->path.local_transmit_path,
-					rail->remote_transmit_path,
-					rail->path.tx_ring->hop,
-					rail->path.rx_ring->hop);
-			}
+			if (tbv_service_state->negotiate_native)
+				tbv_native_control_queue_rail(tbv_service_state,
+							      rail);
 		}
 	}
 

@@ -8,6 +8,7 @@
 #include <linux/refcount.h>
 #include <linux/types.h>
 #include <linux/uuid.h>
+#include <linux/workqueue.h>
 
 #define TBV_DRV_NAME "thunderbolt_ibverbs"
 #define TBV_ETH_ALEN 6
@@ -121,15 +122,21 @@ struct tbv_path {
 
 struct tbv_rail {
 	struct list_head node;
+	struct tbv_peer *peer;
+	struct tbv_state *native_work_state;
 	struct tbv_rail_key key;
 	struct tbv_path path;
+	struct delayed_work native_work;
 	u32 rail_id;
 	u32 remote_rail_id;
 	int remote_transmit_path;
 	int remote_tx_hop;
 	int remote_rx_hop;
+	u32 native_attempts;
+	int native_last_error;
 	bool active;
 	bool native_negotiated;
+	bool native_work_stop;
 };
 
 struct tbv_peer {
@@ -234,6 +241,11 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 void tbv_services_stop(struct tbv_state *state);
 int tbv_native_control_start(struct tbv_state *state);
 void tbv_native_control_stop(void);
+void tbv_native_control_init_rail(struct tbv_rail *rail,
+				  struct tbv_peer *peer);
+void tbv_native_control_queue_rail(struct tbv_state *state,
+				   struct tbv_rail *rail);
+void tbv_native_control_cancel_rail(struct tbv_rail *rail);
 int tbv_native_control_exchange(struct tbv_state *state, struct tbv_peer *peer,
 				struct tbv_rail *rail);
 void tbv_rail_key_init(struct tbv_rail_key *key, u64 route,

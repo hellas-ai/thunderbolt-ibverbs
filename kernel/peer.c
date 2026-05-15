@@ -14,6 +14,7 @@ static void tbv_peer_free_rails(struct tbv_peer *peer)
 	struct tbv_rail *tmp;
 
 	list_for_each_entry_safe(rail, tmp, &peer->rails, node) {
+		tbv_native_control_cancel_rail(rail);
 		tbv_path_destroy(&rail->path, peer->xd);
 		list_del(&rail->node);
 		kfree(rail);
@@ -80,6 +81,8 @@ int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key)
 	rail->remote_transmit_path = -1;
 	rail->remote_tx_hop = -1;
 	rail->remote_rx_hop = -1;
+	rail->native_last_error = 0;
+	tbv_native_control_init_rail(rail, peer);
 	tbv_path_default_config(peer->backend, &path_cfg);
 	tbv_path_init(&rail->path, &path_cfg);
 
