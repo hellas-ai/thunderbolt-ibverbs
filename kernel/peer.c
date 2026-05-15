@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: GPL-2.0
+
+#define pr_fmt(fmt) "thunderbolt_ibverbs: " fmt
+
+#include <linux/errno.h>
+#include <linux/slab.h>
+
+#include "tbv.h"
+
+static void tbv_peer_free_rails(struct tbv_peer *peer)
+{
+	struct tbv_rail *rail;
+	struct tbv_rail *tmp;
+
+	list_for_each_entry_safe(rail, tmp, &peer->rails, node) {
+		list_del(&rail->node);
+		kfree(rail);
+	}
+	peer->nr_rails = 0;
+}
+
+struct tbv_peer *tbv_peer_create(struct tbv_state *state,
+				 enum tbv_backend_type backend)
+{
+	struct tbv_peer *peer;
+
+	if (!tbv_backend_get(backend))
+		return ERR_PTR(-EINVAL);
+
+	peer = kzalloc(sizeof(*peer), GFP_KERNEL);
+	if (!peer)
+		return ERR_PTR(-ENOMEM);
+
+	refcount_set(&peer->refcnt, 1);
+	peer->backend = backend;
+	INIT_LIST_HEAD(&peer->rails);
+
+	mutex_lock(&state->lock);
+	peer->peer_id = state->next_peer_id++;
+	list_add_tail(&peer->node, &state->peers);
+	mutex_unlock(&state->lock);
+
+	pr_info("peer %u created backend=%s\n", peer->peer_id,
+		tbv_backend_name(backend));
+	return peer;
+}
+
+void tbv_peer_destroy(struct tbv_state *state, struct tbv_peer *peer)
+{
+	if (!peer)
+		return;
+
+	mutex_lock(&state->lock);
+	list_del_init(&peer->node);
+	mutex_unlock(&state->lock);
+
+	tbv_peer_free_rails(peer);
+	pr_info("peer %u destroyed\n", peer->peer_id);
+	kfree(peer);
+}
+
+int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key)
+{
+	struct tbv_rail *rail;
+	struct tbv_rail *pos;
+
+	rail = kzalloc(sizeof(*rail), GFP_KERNEL);
+	if (!rail)
+		return -ENOMEM;
+
+	rail->key = *key;
+	rail->rail_id = tbv_rail_key_hash(key);
+	rail->active = true;
+
+	list_for_each_entry(pos, &peer->rails, node) {
+		int cmp = tbv_rail_key_cmp(key, &pos->key);
+
+		if (!cmp) {
+			kfree(rail);
+			return -EEXIST;
+		}
+		if (cmp < 0) {
+			list_add_tail(&rail->node, &pos->node);
+			peer->nr_rails++;
+			return 0;
+		}
+	}
+
+	list_add_tail(&rail->node, &peer->rails);
+	peer->nr_rails++;
+	return 0;
+}

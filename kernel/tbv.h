@@ -168,6 +168,10 @@ void tbv_rail_key_init(struct tbv_rail_key *key, u64 route,
 int tbv_rail_key_cmp(const struct tbv_rail_key *a,
 		     const struct tbv_rail_key *b);
 u32 tbv_rail_key_hash(const struct tbv_rail_key *key);
+struct tbv_peer *tbv_peer_create(struct tbv_state *state,
+				 enum tbv_backend_type backend);
+void tbv_peer_destroy(struct tbv_state *state, struct tbv_peer *peer);
+int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key);
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);
 
