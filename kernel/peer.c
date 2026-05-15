@@ -102,6 +102,8 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 	rail->remote_tx_hop = -1;
 	rail->remote_rx_hop = -1;
 	rail->native_last_error = 0;
+	rail->native_ready_sent = false;
+	rail->native_remote_ready = false;
 	tbv_native_control_init_rail(rail, peer);
 	tbv_path_default_config(peer->backend, &path_cfg);
 	if (peer->backend == TBV_BACKEND_NATIVE &&

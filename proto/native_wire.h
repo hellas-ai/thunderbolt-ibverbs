@@ -38,6 +38,8 @@ static const tbv_wire_u8 tbv_native_wire_uuid[16] = {
 enum tbv_native_wire_op {
 	TBV_NATIVE_WIRE_OP_HELLO = 1,
 	TBV_NATIVE_WIRE_OP_HELLO_ACK = 2,
+	TBV_NATIVE_WIRE_OP_READY = 3,
+	TBV_NATIVE_WIRE_OP_READY_ACK = 4,
 };
 
 enum tbv_native_wire_cap {
@@ -154,7 +156,9 @@ tbv_native_wire_build_hello(void *buf, size_t size,
 		return -EINVAL;
 
 	if (op != TBV_NATIVE_WIRE_OP_HELLO &&
-	    op != TBV_NATIVE_WIRE_OP_HELLO_ACK)
+	    op != TBV_NATIVE_WIRE_OP_HELLO_ACK &&
+	    op != TBV_NATIVE_WIRE_OP_READY &&
+	    op != TBV_NATIVE_WIRE_OP_READY_ACK)
 		return -EINVAL;
 
 	if (size < TBV_NATIVE_WIRE_HELLO_MSG_SIZE)
@@ -206,7 +210,9 @@ tbv_native_wire_parse_hello(const void *buf, size_t size,
 		return -EINVAL;
 
 	if (tbv_wire_get_le32(p + 28) != TBV_NATIVE_WIRE_OP_HELLO &&
-	    tbv_wire_get_le32(p + 28) != TBV_NATIVE_WIRE_OP_HELLO_ACK)
+	    tbv_wire_get_le32(p + 28) != TBV_NATIVE_WIRE_OP_HELLO_ACK &&
+	    tbv_wire_get_le32(p + 28) != TBV_NATIVE_WIRE_OP_READY &&
+	    tbv_wire_get_le32(p + 28) != TBV_NATIVE_WIRE_OP_READY_ACK)
 		return -EINVAL;
 
 	if (info) {
@@ -225,7 +231,9 @@ tbv_native_wire_parse_hello(const void *buf, size_t size,
 
 	op = tbv_wire_get_le16(p + 6);
 	if (op != TBV_NATIVE_WIRE_OP_HELLO &&
-	    op != TBV_NATIVE_WIRE_OP_HELLO_ACK)
+	    op != TBV_NATIVE_WIRE_OP_HELLO_ACK &&
+	    op != TBV_NATIVE_WIRE_OP_READY &&
+	    op != TBV_NATIVE_WIRE_OP_READY_ACK)
 		return -EINVAL;
 
 	if (op != tbv_wire_get_le32((const tbv_wire_u8 *)buf + 28))

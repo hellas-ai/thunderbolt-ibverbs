@@ -334,7 +334,7 @@ static struct tbv_path *tbv_first_active_native_path_locked(struct tbv_state *st
 		if (peer->backend != TBV_BACKEND_NATIVE)
 			continue;
 		list_for_each_entry(rail, &peer->rails, node) {
-			if (rail->path.state == TBV_PATH_TUNNEL_ENABLED)
+			if (tbv_rail_data_ready(rail))
 				return &rail->path;
 		}
 	}
@@ -357,7 +357,7 @@ static struct tbv_path *tbv_select_native_data_path_locked(struct tbv_state *sta
 		if (peer->backend != TBV_BACKEND_NATIVE)
 			continue;
 		list_for_each_entry(rail, &peer->rails, node) {
-			if (rail->path.state == TBV_PATH_TUNNEL_ENABLED)
+			if (tbv_rail_data_ready(rail))
 				active++;
 		}
 	}
@@ -373,7 +373,7 @@ static struct tbv_path *tbv_select_native_data_path_locked(struct tbv_state *sta
 		if (peer->backend != TBV_BACKEND_NATIVE)
 			continue;
 		list_for_each_entry(rail, &peer->rails, node) {
-			if (rail->path.state != TBV_PATH_TUNNEL_ENABLED)
+			if (!tbv_rail_data_ready(rail))
 				continue;
 			if (idx++ == target)
 				return &rail->path;
@@ -396,7 +396,7 @@ static u32 tbv_collect_native_data_paths_locked(struct tbv_state *state,
 		if (peer->backend != TBV_BACKEND_NATIVE)
 			continue;
 		list_for_each_entry(rail, &peer->rails, node) {
-			if (rail->path.state != TBV_PATH_TUNNEL_ENABLED)
+			if (!tbv_rail_data_ready(rail))
 				continue;
 			if (count < max_paths)
 				paths[count] = &rail->path;
@@ -430,7 +430,7 @@ static bool tbv_ibdev_port_active(struct tbv_state *state)
 		struct tbv_rail *rail;
 
 		list_for_each_entry(rail, &peer->rails, node) {
-			if (rail->path.state == TBV_PATH_TUNNEL_ENABLED) {
+			if (tbv_rail_data_ready(rail)) {
 				active = true;
 				goto out;
 			}

@@ -161,9 +161,12 @@ struct tbv_rail {
 	int remote_tx_hop;
 	int remote_rx_hop;
 	u32 native_attempts;
+	u32 native_ready_attempts;
 	int native_last_error;
 	bool active;
 	bool native_negotiated;
+	bool native_ready_sent;
+	bool native_remote_ready;
 	bool native_work_stop;
 };
 
@@ -177,6 +180,13 @@ struct tbv_peer {
 	struct list_head rails;
 	u32 nr_rails;
 };
+
+static inline bool tbv_rail_data_ready(const struct tbv_rail *rail)
+{
+	return rail &&
+	       rail->path.state == TBV_PATH_TUNNEL_ENABLED &&
+	       rail->native_remote_ready;
+}
 
 struct tbv_tbnet_identity {
 	enum tbv_tbnet_identity_mode mode;

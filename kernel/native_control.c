@@ -13,6 +13,7 @@
 #include "tbv.h"
 
 #define TBV_NATIVE_HELLO_RETRIES 5
+#define TBV_NATIVE_READY_RETRIES 10
 #define TBV_NATIVE_HELLO_TIMEOUT_MS 1000
 #define TBV_NATIVE_HELLO_RETRY_DELAY_MS 200
 #define TBV_NATIVE_HELLO_INITIAL_DELAY_MS 100
@@ -69,6 +70,23 @@ static void tbv_native_control_fill_hello(const struct tbv_state *state,
 	hello->path_flags = tbv_native_control_path_flags(&rail->path);
 }
 
+static bool tbv_native_control_ready_initiator(const struct tb_xdomain *xd)
+{
+	if (!xd || !xd->local_uuid || !xd->remote_uuid)
+		return true;
+
+	return memcmp(xd->local_uuid, xd->remote_uuid,
+		      sizeof(*xd->local_uuid)) < 0;
+}
+
+static u8 tbv_native_control_sequence(const struct tbv_rail *rail)
+{
+	if (rail->path.local_transmit_path >= 0)
+		return rail->path.local_transmit_path & 0x3;
+
+	return rail->rail_id & 0x3;
+}
+
 void tbv_native_control_init_rail(struct tbv_rail *rail,
 				  struct tbv_peer *peer)
 {
@@ -82,7 +100,10 @@ void tbv_native_control_queue_rail(struct tbv_state *state,
 	rail->native_work_state = state;
 	WRITE_ONCE(rail->native_work_stop, false);
 	rail->native_attempts = 0;
+	rail->native_ready_attempts = 0;
 	rail->native_last_error = 0;
+	rail->native_ready_sent = false;
+	rail->native_remote_ready = false;
 	schedule_delayed_work(&rail->native_work,
 			      msecs_to_jiffies(TBV_NATIVE_HELLO_INITIAL_DELAY_MS));
 }
@@ -106,6 +127,7 @@ static int tbv_native_control_snapshot(struct tbv_state *state,
 				       const struct tbv_native_wire_info *info,
 				       u32 rail_id,
 				       bool require_matching_rail,
+				       bool require_tunnel_enabled,
 				       struct tbv_native_wire_hello *hello,
 				       struct tb_xdomain **xd)
 {
@@ -123,6 +145,9 @@ static int tbv_native_control_snapshot(struct tbv_state *state,
 			if (rail->key.route != info->route)
 				continue;
 			if (require_matching_rail && rail->rail_id != rail_id)
+				continue;
+			if (require_tunnel_enabled &&
+			    rail->path.state != TBV_PATH_TUNNEL_ENABLED)
 				continue;
 
 			tbv_native_control_fill_hello(state, peer, rail,
@@ -182,6 +207,36 @@ static int tbv_native_control_apply_ack(struct tbv_state *state,
 	return tbv_native_control_apply_remote(state, info, remote, true);
 }
 
+static int tbv_native_control_mark_remote_ready(struct tbv_state *state,
+						const struct tbv_native_wire_info *info,
+						const struct tbv_native_wire_hello *remote)
+{
+	struct tbv_peer *peer;
+	int ret = -ENOENT;
+
+	mutex_lock(&state->lock);
+	list_for_each_entry(peer, &state->peers, node) {
+		struct tbv_rail *rail;
+
+		if (peer->backend != TBV_BACKEND_NATIVE)
+			continue;
+
+		list_for_each_entry(rail, &peer->rails, node) {
+			if (rail->key.route != info->route ||
+			    rail->rail_id != remote->rail_id)
+				continue;
+
+			rail->native_remote_ready = true;
+			ret = 0;
+			goto out;
+		}
+	}
+
+out:
+	mutex_unlock(&state->lock);
+	return ret;
+}
+
 static int tbv_native_control_handle(const void *buf, size_t size, void *data)
 {
 	struct tbv_state *state = data;
@@ -212,12 +267,50 @@ static int tbv_native_control_handle(const void *buf, size_t size, void *data)
 		return 0;
 	}
 
+	if (info.op == TBV_NATIVE_WIRE_OP_READY_ACK)
+		return 0;
+
+	if (info.op == TBV_NATIVE_WIRE_OP_READY) {
+		memset(&local, 0, sizeof(local));
+		ret = tbv_native_control_snapshot(state, &info,
+						  remote.rail_id, true,
+						  true,
+						  &local, &xd);
+		if (ret) {
+			pr_warn_ratelimited("native READY route=0x%llx rail=0x%x has no tunnel-enabled peer rail\n",
+					    info.route, remote.rail_id);
+			return 1;
+		}
+
+		ret = tbv_native_control_mark_remote_ready(state, &info,
+							  &remote);
+		if (!ret)
+			pr_info("native READY received route=0x%llx rail=0x%x\n",
+				info.route, remote.rail_id);
+
+		ret = tbv_native_wire_build_hello(reply, sizeof(reply),
+						  &local,
+						  TBV_NATIVE_WIRE_OP_READY_ACK,
+						  0, info.seq, local.route,
+						  info.xdomain_sequence);
+		if (ret >= 0)
+			ret = tb_xdomain_response(xd, reply, sizeof(reply),
+						  TB_CFG_PKG_XDOMAIN_RESP);
+
+		if (ret < 0)
+			pr_warn("native READY_ACK route=0x%llx rail=0x%x failed: %d\n",
+				info.route, remote.rail_id, ret);
+
+		tb_xdomain_put(xd);
+		return 1;
+	}
+
 	if (info.op != TBV_NATIVE_WIRE_OP_HELLO)
 		return 0;
 
 	memset(&local, 0, sizeof(local));
 	ret = tbv_native_control_snapshot(state, &info, remote.rail_id, true,
-					  &local, &xd);
+					  false, &local, &xd);
 	if (ret) {
 		pr_warn("native HELLO route=0x%llx rail=0x%x has no matching peer rail\n",
 			info.route, remote.rail_id);
@@ -271,7 +364,8 @@ static int tbv_native_control_exchange_once(struct tbv_state *state,
 	tbv_native_control_fill_hello(state, peer, rail, &local);
 	ret = tbv_native_wire_build_hello(request, sizeof(request), &local,
 					  TBV_NATIVE_WIRE_OP_HELLO, 0,
-					  rail->rail_id, local.route, 0);
+					  rail->rail_id, local.route,
+					  tbv_native_control_sequence(rail));
 	if (ret < 0)
 		return ret;
 
@@ -297,6 +391,57 @@ static int tbv_native_control_exchange_once(struct tbv_state *state,
 	pr_info("native HELLO negotiated route=0x%llx rail=0x%x remote_out=%u remote_tx=%u remote_rx=%u attempt=%u\n",
 		info.route, remote.rail_id, remote.transmit_path,
 		remote.tx_hop, remote.rx_hop, attempt);
+	return 0;
+}
+
+static int tbv_native_control_ready_once(struct tbv_state *state,
+					 struct tbv_peer *peer,
+					 struct tbv_rail *rail)
+{
+	struct tbv_native_wire_hello local;
+	struct tbv_native_wire_hello remote;
+	u8 response[TBV_NATIVE_WIRE_HELLO_MSG_SIZE];
+	u8 request[TBV_NATIVE_WIRE_HELLO_MSG_SIZE];
+	struct tbv_native_wire_info info;
+	int ret;
+
+	if (peer->backend != TBV_BACKEND_NATIVE)
+		return 0;
+
+	if (rail->path.state != TBV_PATH_TUNNEL_ENABLED)
+		return -EINVAL;
+
+	tbv_native_control_fill_hello(state, peer, rail, &local);
+	ret = tbv_native_wire_build_hello(request, sizeof(request), &local,
+					  TBV_NATIVE_WIRE_OP_READY, 0,
+					  rail->rail_id, local.route,
+					  tbv_native_control_sequence(rail));
+	if (ret < 0)
+		return ret;
+
+	memset(response, 0, sizeof(response));
+	ret = tb_xdomain_request(peer->xd, request, sizeof(request),
+				 TB_CFG_PKG_XDOMAIN_REQ, response,
+				 sizeof(response),
+				 TB_CFG_PKG_XDOMAIN_RESP,
+				 TBV_NATIVE_HELLO_TIMEOUT_MS);
+	if (ret)
+		return ret;
+
+	ret = tbv_native_wire_parse_hello(response, sizeof(response), &remote,
+					 &info);
+	if (ret)
+		return ret;
+	if (info.op != TBV_NATIVE_WIRE_OP_READY_ACK ||
+	    remote.rail_id != rail->rail_id)
+		return -EPROTO;
+
+	ret = tbv_native_control_mark_remote_ready(state, &info, &remote);
+	if (ret)
+		return ret;
+
+	pr_info("native READY sent route=0x%llx rail=0x%x\n",
+		info.route, rail->rail_id);
 	return 0;
 }
 
@@ -383,6 +528,26 @@ static void tbv_native_control_work(struct work_struct *work)
 			rail->path.local_transmit_path,
 			rail->remote_transmit_path,
 			rail->path.tx_ring->hop, rail->path.rx_ring->hop);
+	}
+
+	if (state->enable_tunnels &&
+	    rail->path.state == TBV_PATH_TUNNEL_ENABLED &&
+	    !rail->native_remote_ready &&
+	    tbv_native_control_ready_initiator(peer->xd)) {
+		attempt = ++rail->native_ready_attempts;
+		ret = tbv_native_control_ready_once(state, peer, rail);
+		rail->native_last_error = ret;
+		if (ret) {
+			if (attempt < TBV_NATIVE_READY_RETRIES) {
+				retry = true;
+			} else {
+				pr_warn("native READY route=0x%llx rail=0x%x failed after %u attempts: %d\n",
+					rail->key.route, rail->rail_id,
+					attempt, ret);
+			}
+			goto out;
+		}
+		rail->native_ready_sent = true;
 	}
 
 out:
