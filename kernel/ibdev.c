@@ -278,7 +278,8 @@ static struct tbv_path *tbv_first_active_native_path_locked(struct tbv_state *st
 	return NULL;
 }
 
-static struct tbv_path *tbv_select_native_data_path_locked(struct tbv_state *state)
+static struct tbv_path *tbv_select_native_data_path_locked(struct tbv_state *state,
+							  u32 selector)
 {
 	struct tbv_peer *peer;
 	u32 active = 0;
@@ -299,8 +300,7 @@ static struct tbv_path *tbv_select_native_data_path_locked(struct tbv_state *sta
 	if (!active)
 		return NULL;
 
-	target = (u32)atomic_inc_return(&state->data_path_rr) - 1;
-	target %= active;
+	target = selector % active;
 
 	list_for_each_entry(peer, &state->peers, node) {
 		struct tbv_rail *rail;
@@ -920,7 +920,8 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 
 	tbv_qp_queue_send(tqp, ctx);
 	mutex_lock(&tqp->owner->lock);
-	path = tbv_select_native_data_path_locked(tqp->owner);
+	path = tbv_select_native_data_path_locked(tqp->owner,
+						  tqp->base.qp_num);
 	ret = path ? tbv_path_reserve_data(path, nfrags) : -ENOTCONN;
 	if (ret) {
 		mutex_unlock(&tqp->owner->lock);

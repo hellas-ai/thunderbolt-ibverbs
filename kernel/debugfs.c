@@ -32,8 +32,6 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "verbs_mrs: %d\n", atomic_read(&state->verbs_mrs));
 	seq_printf(s, "verbs_recv_wqes: %d\n",
 		   atomic_read(&state->verbs_recv_wqes));
-	seq_printf(s, "data_path_rr: %d\n",
-		   atomic_read(&state->data_path_rr));
 	seq_printf(s, "data_wr_send: %lld\n",
 		   atomic64_read(&state->data_wr_send));
 	seq_printf(s, "data_wr_live: %lld\n",

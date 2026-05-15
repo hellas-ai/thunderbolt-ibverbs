@@ -226,7 +226,6 @@ struct tbv_state {
 	atomic_t verbs_qps;
 	atomic_t verbs_mrs;
 	atomic_t verbs_recv_wqes;
-	atomic_t data_path_rr;
 	atomic64_t data_wr_send;
 	atomic64_t data_wr_live;
 	atomic64_t data_wr_no_path;
