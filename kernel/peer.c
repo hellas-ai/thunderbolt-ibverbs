@@ -36,6 +36,7 @@ struct tbv_peer *tbv_peer_create(struct tbv_state *state,
 		return ERR_PTR(-ENOMEM);
 
 	refcount_set(&peer->refcnt, 1);
+	peer->state = state;
 	peer->backend = backend;
 	peer->xd = tb_xdomain_get(xd);
 	INIT_LIST_HEAD(&peer->rails);
@@ -84,7 +85,7 @@ int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key)
 	rail->native_last_error = 0;
 	tbv_native_control_init_rail(rail, peer);
 	tbv_path_default_config(peer->backend, &path_cfg);
-	tbv_path_init(&rail->path, &path_cfg);
+	tbv_path_init(&rail->path, &path_cfg, rail);
 
 	list_for_each_entry(pos, &peer->rails, node) {
 		int cmp = tbv_rail_key_cmp(key, &pos->key);

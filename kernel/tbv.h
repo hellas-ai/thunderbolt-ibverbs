@@ -7,6 +7,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/refcount.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/uuid.h>
 #include <linux/workqueue.h>
@@ -116,8 +117,16 @@ struct tbv_path_config {
 struct tbv_path {
 	enum tbv_path_state state;
 	struct tbv_path_config cfg;
+	struct tbv_rail *rail;
 	struct tb_ring *tx_ring;
 	struct tb_ring *rx_ring;
+	struct tbv_data_frame *tx_frames;
+	struct tbv_data_frame *rx_frames;
+	u32 tx_frame_count;
+	u32 rx_frame_count;
+	spinlock_t tx_lock;
+	struct list_head tx_free;
+	atomic_t tx_inflight;
 	int local_transmit_path;
 	int remote_transmit_path;
 };
@@ -146,6 +155,7 @@ struct tbv_rail {
 struct tbv_peer {
 	struct list_head node;
 	refcount_t refcnt;
+	struct tbv_state *state;
 	u32 peer_id;
 	enum tbv_backend_type backend;
 	struct tb_xdomain *xd;
@@ -204,6 +214,27 @@ struct tbv_state {
 	atomic_t verbs_qps;
 	atomic_t verbs_mrs;
 	atomic_t verbs_recv_wqes;
+	atomic64_t data_wr_send;
+	atomic64_t data_wr_live;
+	atomic64_t data_wr_no_path;
+	atomic64_t data_wr_copied;
+	atomic64_t data_wr_copy_error;
+	atomic64_t data_wr_path_send;
+	atomic64_t data_wr_path_send_error;
+	atomic64_t data_tx_accepted;
+	atomic64_t data_tx_posted;
+	atomic64_t data_tx_completed;
+	atomic64_t data_tx_canceled;
+	atomic64_t data_tx_errors;
+	atomic64_t data_rx_completed;
+	atomic64_t data_rx_bad_frame;
+	atomic64_t data_rx_bad_header;
+	atomic64_t data_rx_send;
+	atomic64_t data_rx_ack;
+	atomic64_t data_rx_no_qp;
+	atomic64_t data_rx_no_recv;
+	atomic64_t data_rx_copy_error;
+	atomic64_t data_cq_overflow;
 	struct xarray verbs_mrs_xa;
 	struct xarray verbs_qps_xa;
 	struct tbv_ibdev *ibdev;
@@ -220,8 +251,10 @@ struct tbv_service_config {
 };
 
 struct tb_property_dir;
+struct tbv_data_frame;
 struct tb_ring;
 struct tb_xdomain;
+typedef void (*tbv_path_tx_done_fn)(void *ctx, int status);
 extern const uuid_t tbv_native_service_uuid;
 
 int tbv_config_parse(struct tbv_config *cfg, const char *compat,
@@ -238,6 +271,7 @@ const char *tbv_backend_name(enum tbv_backend_type type);
 
 int tbv_ibdev_start(struct tbv_state *state, bool register_verbs);
 void tbv_ibdev_stop(struct tbv_state *state);
+void tbv_ibdev_rx_frame(struct tbv_state *state, const void *data, u32 len);
 
 int tbv_tbnet_identity_check_config(const struct tbv_resolved_config *cfg);
 int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,
@@ -279,7 +313,7 @@ int tbv_peer_add_rail(struct tbv_peer *peer, const struct tbv_rail_key *key);
 void tbv_path_default_config(enum tbv_backend_type backend,
 			     struct tbv_path_config *cfg);
 void tbv_path_init(struct tbv_path *path,
-		   const struct tbv_path_config *cfg);
+		   const struct tbv_path_config *cfg, struct tbv_rail *rail);
 void tbv_path_reset(struct tbv_path *path);
 const char *tbv_path_state_name(enum tbv_path_state state);
 int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
@@ -287,6 +321,8 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 int tbv_path_start_rings(struct tbv_path *path);
 int tbv_path_enable_tunnel(struct tbv_path *path, struct tb_xdomain *xd,
 			   int remote_transmit_path);
+int tbv_path_send(struct tbv_path *path, const void *data, u32 len,
+		  tbv_path_tx_done_fn done, void *done_ctx);
 void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd);
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);

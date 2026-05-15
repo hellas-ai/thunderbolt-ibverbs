@@ -32,6 +32,48 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "verbs_mrs: %d\n", atomic_read(&state->verbs_mrs));
 	seq_printf(s, "verbs_recv_wqes: %d\n",
 		   atomic_read(&state->verbs_recv_wqes));
+	seq_printf(s, "data_wr_send: %lld\n",
+		   atomic64_read(&state->data_wr_send));
+	seq_printf(s, "data_wr_live: %lld\n",
+		   atomic64_read(&state->data_wr_live));
+	seq_printf(s, "data_wr_no_path: %lld\n",
+		   atomic64_read(&state->data_wr_no_path));
+	seq_printf(s, "data_wr_copied: %lld\n",
+		   atomic64_read(&state->data_wr_copied));
+	seq_printf(s, "data_wr_copy_error: %lld\n",
+		   atomic64_read(&state->data_wr_copy_error));
+	seq_printf(s, "data_wr_path_send: %lld\n",
+		   atomic64_read(&state->data_wr_path_send));
+	seq_printf(s, "data_wr_path_send_error: %lld\n",
+		   atomic64_read(&state->data_wr_path_send_error));
+	seq_printf(s, "data_tx_accepted: %lld\n",
+		   atomic64_read(&state->data_tx_accepted));
+	seq_printf(s, "data_tx_posted: %lld\n",
+		   atomic64_read(&state->data_tx_posted));
+	seq_printf(s, "data_tx_completed: %lld\n",
+		   atomic64_read(&state->data_tx_completed));
+	seq_printf(s, "data_tx_canceled: %lld\n",
+		   atomic64_read(&state->data_tx_canceled));
+	seq_printf(s, "data_tx_errors: %lld\n",
+		   atomic64_read(&state->data_tx_errors));
+	seq_printf(s, "data_rx_completed: %lld\n",
+		   atomic64_read(&state->data_rx_completed));
+	seq_printf(s, "data_rx_bad_frame: %lld\n",
+		   atomic64_read(&state->data_rx_bad_frame));
+	seq_printf(s, "data_rx_bad_header: %lld\n",
+		   atomic64_read(&state->data_rx_bad_header));
+	seq_printf(s, "data_rx_send: %lld\n",
+		   atomic64_read(&state->data_rx_send));
+	seq_printf(s, "data_rx_ack: %lld\n",
+		   atomic64_read(&state->data_rx_ack));
+	seq_printf(s, "data_rx_no_qp: %lld\n",
+		   atomic64_read(&state->data_rx_no_qp));
+	seq_printf(s, "data_rx_no_recv: %lld\n",
+		   atomic64_read(&state->data_rx_no_recv));
+	seq_printf(s, "data_rx_copy_error: %lld\n",
+		   atomic64_read(&state->data_rx_copy_error));
+	seq_printf(s, "data_cq_overflow: %lld\n",
+		   atomic64_read(&state->data_cq_overflow));
 	return 0;
 }
 
