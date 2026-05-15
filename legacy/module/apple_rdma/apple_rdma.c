@@ -46,11 +46,14 @@
 #include <linux/io.h>
 #include <linux/pci.h>
 #include <linux/ktime.h>
+#include <linux/if_arp.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/inetdevice.h>
 #include <linux/inet.h>
 #include <linux/string.h>
 #include <linux/hex.h>
+#include <net/arp.h>
 #include <net/addrconf.h>
 #include <net/net_namespace.h>
 
@@ -377,6 +380,16 @@ module_param(apple_max_uc_qps, uint, 0644);
 MODULE_PARM_DESC(apple_max_uc_qps,
 		 "Maximum simultaneous UC QPs allowed per Apple peer; 0 disables (default: 1)");
 
+static bool tbnet_arp_proxy;
+module_param(tbnet_arp_proxy, bool, 0444);
+MODULE_PARM_DESC(tbnet_arp_proxy,
+		 "Proxy ARP for the RDMA GID IPv4 address on the companion Thunderbolt-net interface (default: false)");
+
+static char *tbnet_arp_netdev = "auto";
+module_param(tbnet_arp_netdev, charp, 0444);
+MODULE_PARM_DESC(tbnet_arp_netdev,
+		 "Thunderbolt-net netdev used for tbnet_arp_proxy: 'auto' = thunderbolt<domain> (default: auto)");
+
 struct ardma_peer;
 struct ardma_qp;
 
@@ -494,10 +507,14 @@ struct ardma_ibdev {
 	struct ib_device base;
 	struct ardma_peer *peer;
 	struct net_device *netdev;
+	struct net_device *tbnet_arp_dev;
 	struct notifier_block netdev_nb;
 	struct mutex netdev_lock;
 	char netdev_name[IFNAMSIZ];
+	char tbnet_arp_name[IFNAMSIZ];
+	__be32 tbnet_arp_addr;
 	bool netdev_nb_registered;
+	bool tbnet_arp_registered;
 	bool shutting_down;
 };
 
@@ -709,6 +726,8 @@ struct ardma_peer {
 	atomic64_t tx_zcopy_frames;
 	atomic64_t tx_pool_frames;
 	atomic64_t tx_dynamic_frames;
+	atomic64_t tbnet_arp_requests;
+	atomic64_t tbnet_arp_replies;
 	atomic_t raw_rx_credits_reserved;
 	atomic64_t raw_rx_bytes_reserved;
 	unsigned int extra_lane_count;
@@ -1507,6 +1526,187 @@ static void ardma_peer_netdev_name(const struct ardma_peer *peer, char *buf,
 		return;
 	}
 	snprintf(buf, buflen, "thunderbolt%d", peer->xd->tb->index);
+}
+
+static void ardma_peer_tbnet_arp_name(const struct ardma_peer *peer, char *buf,
+				      size_t buflen)
+{
+	if (tbnet_arp_netdev && *tbnet_arp_netdev &&
+	    strcmp(tbnet_arp_netdev, "auto")) {
+		strscpy(buf, tbnet_arp_netdev, buflen);
+		return;
+	}
+
+	snprintf(buf, buflen, "thunderbolt%d", peer->xd->tb->index);
+}
+
+static bool ardma_netdev_first_ipv4(struct net_device *netdev, __be32 *addr)
+{
+	struct in_device *in_dev;
+	struct in_ifaddr *ifa;
+	bool found = false;
+
+	if (!netdev || !addr)
+		return false;
+
+	rcu_read_lock();
+	in_dev = __in_dev_get_rcu(netdev);
+	if (in_dev) {
+		in_dev_for_each_ifa_rcu(ifa, in_dev) {
+			if (!ifa->ifa_address)
+				continue;
+			*addr = ifa->ifa_address;
+			found = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return found;
+}
+
+static rx_handler_result_t ardma_tbnet_arp_rx(struct sk_buff **pskb)
+{
+	struct sk_buff *skb = *pskb;
+	struct net_device *netdev = skb->dev;
+	struct ardma_ibdev *dev;
+	struct arphdr *arp;
+	unsigned char *arp_ptr;
+	unsigned char *sha;
+	__be32 sip;
+	__be32 tip;
+	unsigned int arp_len;
+
+	if (skb->protocol != htons(ETH_P_ARP))
+		return RX_HANDLER_PASS;
+
+	dev = rcu_dereference(netdev->rx_handler_data);
+	if (!dev || !dev->peer)
+		return RX_HANDLER_PASS;
+
+	arp_len = sizeof(*arp) + 2 * ETH_ALEN + 2 * sizeof(__be32);
+	if (!pskb_may_pull(skb, arp_len))
+		return RX_HANDLER_PASS;
+
+	arp = (struct arphdr *)skb->data;
+	if (arp->ar_hrd != htons(ARPHRD_ETHER) ||
+	    arp->ar_pro != htons(ETH_P_IP) ||
+	    arp->ar_hln != ETH_ALEN ||
+	    arp->ar_pln != sizeof(__be32) ||
+	    arp->ar_op != htons(ARPOP_REQUEST))
+		return RX_HANDLER_PASS;
+
+	arp_ptr = (unsigned char *)(arp + 1);
+	sha = arp_ptr;
+	arp_ptr += ETH_ALEN;
+	memcpy(&sip, arp_ptr, sizeof(sip));
+	arp_ptr += sizeof(sip);
+	arp_ptr += ETH_ALEN;
+	memcpy(&tip, arp_ptr, sizeof(tip));
+
+	if (tip != READ_ONCE(dev->tbnet_arp_addr))
+		return RX_HANDLER_PASS;
+	if (is_zero_ether_addr(sha) || ether_addr_equal(sha, netdev->dev_addr))
+		return RX_HANDLER_PASS;
+
+	atomic64_inc(&dev->peer->tbnet_arp_requests);
+	arp_send(ARPOP_REPLY, ETH_P_ARP, sip, netdev, tip, sha,
+		 netdev->dev_addr, sha);
+	atomic64_inc(&dev->peer->tbnet_arp_replies);
+	pr_debug("proxy ARP reply on %s for %pI4 to %pI4/%pM\n",
+		 netdev_name(netdev), &tip, &sip, sha);
+
+	return RX_HANDLER_PASS;
+}
+
+static int ardma_start_tbnet_arp_proxy(struct ardma_ibdev *dev)
+{
+	struct net_device *netdev;
+	__be32 addr;
+	int ret;
+
+	if (!tbnet_arp_proxy)
+		return 0;
+	if (!dev || !dev->peer || !dev->netdev)
+		return -EINVAL;
+
+	if (!ardma_netdev_first_ipv4(dev->netdev, &addr)) {
+		pr_err("tbnet_arp_proxy requested but GID netdev %s has no IPv4 address\n",
+		       dev->netdev_name);
+		return -EADDRNOTAVAIL;
+	}
+
+	ardma_peer_tbnet_arp_name(dev->peer, dev->tbnet_arp_name,
+				  sizeof(dev->tbnet_arp_name));
+	netdev = dev_get_by_name(&init_net, dev->tbnet_arp_name);
+	if (!netdev) {
+		pr_err("tbnet_arp_proxy netdev '%s' not found\n",
+		       dev->tbnet_arp_name);
+		return -ENODEV;
+	}
+
+	if (netdev == dev->netdev) {
+		pr_info("tbnet_arp_proxy not needed: GID netdev and TBnet netdev are both %s\n",
+			dev->netdev_name);
+		dev_put(netdev);
+		return 0;
+	}
+
+	if (netdev->type != ARPHRD_ETHER || netdev->addr_len != ETH_ALEN) {
+		pr_err("tbnet_arp_proxy netdev %s is not Ethernet-like\n",
+		       dev->tbnet_arp_name);
+		dev_put(netdev);
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(dev->tbnet_arp_addr, addr);
+
+	rtnl_lock();
+	ret = netdev_rx_handler_register(netdev, ardma_tbnet_arp_rx, dev);
+	rtnl_unlock();
+	if (ret) {
+		pr_err("tbnet_arp_proxy failed to register RX handler on %s: %d\n",
+		       dev->tbnet_arp_name, ret);
+		dev_put(netdev);
+		return ret;
+	}
+
+	dev->tbnet_arp_dev = netdev;
+	dev->tbnet_arp_registered = true;
+	pr_info("tbnet_arp_proxy answering %pI4 on %s as %pM for GID netdev %s\n",
+		&dev->tbnet_arp_addr, dev->tbnet_arp_name,
+		netdev->dev_addr, dev->netdev_name);
+	return 0;
+}
+
+static void ardma_stop_tbnet_arp_proxy_locked(struct ardma_ibdev *dev,
+					      bool rtnl_held)
+{
+	struct net_device *netdev;
+
+	if (!dev)
+		return;
+
+	netdev = dev->tbnet_arp_dev;
+	if (!netdev)
+		return;
+
+	if (dev->tbnet_arp_registered) {
+		if (!rtnl_held)
+			rtnl_lock();
+		netdev_rx_handler_unregister(netdev);
+		if (!rtnl_held)
+			rtnl_unlock();
+		dev->tbnet_arp_registered = false;
+	}
+
+	dev->tbnet_arp_dev = NULL;
+	dev_put(netdev);
+}
+
+static void ardma_stop_tbnet_arp_proxy(struct ardma_ibdev *dev)
+{
+	ardma_stop_tbnet_arp_proxy_locked(dev, false);
 }
 
 static int ardma_bind_qp_peer(struct ardma_qp *qp, struct ardma_peer *peer)
@@ -4384,6 +4584,11 @@ static int ardma_netdev_event(struct notifier_block *nb,
 	switch (event) {
 	case NETDEV_UNREGISTER:
 		mutex_lock(&dev->netdev_lock);
+		if (dev->tbnet_arp_dev == netdev) {
+			pr_info("TBnet ARP proxy netdev %s unregistering; disabling proxy\n",
+				netdev_name(netdev));
+			ardma_stop_tbnet_arp_proxy_locked(dev, true);
+		}
 		if (dev->netdev == netdev) {
 			pr_info("CM netdev %s unregistering; detaching GID netdev\n",
 				netdev_name(netdev));
@@ -4466,6 +4671,10 @@ static int ardma_register_ibdev(struct ardma_peer *peer)
 		goto err_unregister_ibdev;
 	dev->netdev_nb_registered = true;
 
+	ret = ardma_start_tbnet_arp_proxy(dev);
+	if (ret)
+		goto err_unregister_notifier;
+
 	peer->ibdev = dev;
 	pr_info("registered ib_device %s for peer %s route=%d-%llx using GID netdev %s\n",
 		dev_name(&dev->base.dev), dev_name(&peer->svc->dev),
@@ -4473,6 +4682,9 @@ static int ardma_register_ibdev(struct ardma_peer *peer)
 		dev->netdev_name);
 	return 0;
 
+err_unregister_notifier:
+	unregister_netdevice_notifier(&dev->netdev_nb);
+	dev->netdev_nb_registered = false;
 err_unregister_ibdev:
 	ib_unregister_device(&dev->base);
 err_clear_netdev:
@@ -4497,6 +4709,7 @@ static void ardma_unregister_ibdev(struct ardma_peer *peer)
 	 * pointer is still armed, the synthetic event is indistinguishable from a
 	 * real thunderbolt0 unregister.
 	 */
+	ardma_stop_tbnet_arp_proxy(dev);
 	mutex_lock(&dev->netdev_lock);
 	dev->shutting_down = true;
 	ardma_detach_netdev_locked(dev);
@@ -5129,6 +5342,18 @@ static int ardma_stats_show(struct seq_file *m, void *unused)
 		   (long long)atomic64_read(&peer->tx_pool_frames));
 	seq_printf(m, "tx_dynamic_frames: %lld\n",
 		   (long long)atomic64_read(&peer->tx_dynamic_frames));
+	if (peer->ibdev) {
+		seq_printf(m, "tbnet_arp_proxy: %u\n",
+			   peer->ibdev->tbnet_arp_registered);
+		seq_printf(m, "tbnet_arp_netdev: %s\n",
+			   peer->ibdev->tbnet_arp_name);
+		seq_printf(m, "tbnet_arp_addr: %pI4\n",
+			   &peer->ibdev->tbnet_arp_addr);
+	}
+	seq_printf(m, "tbnet_arp_requests: %lld\n",
+		   (long long)atomic64_read(&peer->tbnet_arp_requests));
+	seq_printf(m, "tbnet_arp_replies: %lld\n",
+		   (long long)atomic64_read(&peer->tbnet_arp_replies));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(ardma_stats);
