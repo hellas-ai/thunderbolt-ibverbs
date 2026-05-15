@@ -644,6 +644,7 @@ static void tbv_send_ctx_get(struct tbv_send_ctx *send)
 static void tbv_send_ctx_put(struct tbv_send_ctx *send)
 {
 	if (refcount_dec_and_test(&send->refs)) {
+		atomic64_dec(&send->tqp->owner->data_wr_live);
 		tbv_qp_put(send->tqp);
 		kfree(send);
 	}
@@ -961,6 +962,7 @@ err_release_reservation:
 err_release_segs:
 	tbv_release_send_segments(segs, nsegs);
 err_put_qp:
+	atomic64_dec(&tqp->owner->data_wr_live);
 	tbv_qp_put(tqp);
 	return ret;
 }
