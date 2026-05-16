@@ -385,6 +385,11 @@ module_param(apple_max_uc_qps, uint, 0644);
 MODULE_PARM_DESC(apple_max_uc_qps,
 		 "Maximum simultaneous UC QPs allowed per Apple peer; 0 disables (default: 1)");
 
+static unsigned int apple_tx_max_inflight_wr = 1;
+module_param(apple_tx_max_inflight_wr, uint, 0644);
+MODULE_PARM_DESC(apple_tx_max_inflight_wr,
+		 "Maximum in-flight SEND WRs per Apple QP before post_send waits; 0 disables (default: 1)");
+
 static bool tbnet_arp_proxy;
 module_param(tbnet_arp_proxy, bool, 0444);
 MODULE_PARM_DESC(tbnet_arp_proxy,
@@ -496,7 +501,9 @@ struct ardma_qp {
 	struct delayed_work rx_timeout_work;
 
 	spinlock_t send_lock;
+	wait_queue_head_t send_wait;
 	u64 last_post_send_ns;
+	atomic_t apple_tx_inflight_wrs;
 	spinlock_t tx_pool_lock;
 	struct list_head tx_pool_free;
 	struct ardma_tx_frame *tx_pool;
@@ -557,6 +564,7 @@ struct ardma_send_ctx {
 	atomic_t pending;
 	atomic_t failed;
 	bool signaled;
+	bool tx_window_reserved;
 };
 
 struct ardma_tx_frame {
@@ -2600,6 +2608,44 @@ static void ardma_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
 
 /* ----- Apple-shaped TX ------------------------------------------- */
 
+static int ardma_apple_tx_window_acquire(struct ardma_qp *qp)
+{
+	struct ardma_peer *peer = qp->peer;
+
+	if (!peer || !peer->remote_is_apple)
+		return 0;
+
+	for (;;) {
+		unsigned int max = READ_ONCE(apple_tx_max_inflight_wr);
+		int cur;
+
+		if (!max)
+			return 0;
+		if (READ_ONCE(qp->closing))
+			return -ESHUTDOWN;
+
+		cur = atomic_read(&qp->apple_tx_inflight_wrs);
+		if (cur < max &&
+		    atomic_cmpxchg(&qp->apple_tx_inflight_wrs, cur,
+				   cur + 1) == cur)
+			return 1;
+
+		if (wait_event_interruptible(qp->send_wait,
+				READ_ONCE(qp->closing) ||
+				!READ_ONCE(apple_tx_max_inflight_wr) ||
+				atomic_read(&qp->apple_tx_inflight_wrs) <
+				READ_ONCE(apple_tx_max_inflight_wr)))
+			return -ERESTARTSYS;
+	}
+}
+
+static void ardma_apple_tx_window_release(struct ardma_qp *qp)
+{
+	if (WARN_ON_ONCE(atomic_dec_return(&qp->apple_tx_inflight_wrs) < 0))
+		atomic_set(&qp->apple_tx_inflight_wrs, 0);
+	wake_up_all(&qp->send_wait);
+}
+
 static void ardma_tx_ctx_put(struct ardma_send_ctx *ctx, bool failed)
 {
 	struct ardma_cq *send_cq =
@@ -2627,6 +2673,8 @@ static void ardma_tx_ctx_put(struct ardma_send_ctx *ctx, bool failed)
 					   atomic_read(&ctx->failed));
 			ardma_cq_push_wc(send_cq, &wc);
 		}
+		if (ctx->tx_window_reserved)
+			ardma_apple_tx_window_release(ctx->qp);
 		ardma_qp_put(ctx->qp);
 		kfree(ctx);
 	}
@@ -3333,6 +3381,7 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 	unsigned int marker_mode;
 	bool raw_mode;
 	bool use_single_desc;
+	int tx_window_reserved;
 	int ret;
 
 	if (!READ_ONCE(tx_enabled)) {
@@ -3429,9 +3478,15 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 	}
 
 	chunks = raw_mode ? total / chunk_len : DIV_ROUND_UP(total, chunk_len);
+	tx_window_reserved = ardma_apple_tx_window_acquire(qp);
+	if (tx_window_reserved < 0)
+		return tx_window_reserved;
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
-	if (!ctx)
+	if (!ctx) {
+		if (tx_window_reserved)
+			ardma_apple_tx_window_release(qp);
 		return -ENOMEM;
+	}
 	ctx->qp = qp;
 	ctx->wr_id = wr->wr_id;
 	ctx->wr_cqe = wr->wr_cqe;
@@ -3440,6 +3495,7 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 	ctx->total_len = total;
 	ctx->blocks = chunks;
 	ctx->signaled = qp->sq_sig_all || (wr->send_flags & IB_SEND_SIGNALED);
+	ctx->tx_window_reserved = tx_window_reserved;
 	atomic_set(&ctx->pending, 1);
 	atomic_set(&ctx->failed, 0);
 	ardma_qp_get(qp);
@@ -3879,6 +3935,11 @@ static int ardma_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	qp->qp_type = attr->qp_type;
 	qp->init_attr = *attr;
 	qp->init_attr.cap.max_send_wr = min_t(u32, attr->cap.max_send_wr, 4095);
+	if (attr->qp_type == IB_QPT_UC && peer && peer->remote_is_apple &&
+	    READ_ONCE(apple_tx_max_inflight_wr))
+		qp->init_attr.cap.max_send_wr =
+			min_t(u32, qp->init_attr.cap.max_send_wr,
+			      READ_ONCE(apple_tx_max_inflight_wr));
 	qp->init_attr.cap.max_recv_wr = min_t(u32, attr->cap.max_recv_wr, 4095);
 	qp->init_attr.cap.max_send_sge = min_t(u32, attr->cap.max_send_sge,
 					       ARDMA_MAX_SGE);
@@ -3891,6 +3952,8 @@ static int ardma_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	init_waitqueue_head(&qp->ref_wait);
 	spin_lock_init(&qp->recv_lock);
 	spin_lock_init(&qp->send_lock);
+	init_waitqueue_head(&qp->send_wait);
+	atomic_set(&qp->apple_tx_inflight_wrs, 0);
 	spin_lock_init(&qp->tx_pool_lock);
 	INIT_LIST_HEAD(&qp->recv_q);
 	INIT_LIST_HEAD(&qp->qps_link);
@@ -4095,6 +4158,7 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	if (qp->state != IB_QPS_RESET)
 		qp->state = IB_QPS_ERR;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
+	wake_up_all(&qp->send_wait);
 
 	ardma_log_rx_event(qp->peer, ARDMA_RX_EVT_QP_DESTROY, ibqp->qp_num,
 			   qp->attr.dest_qp_num, 0, refcount_read(&qp->refs),
@@ -5378,6 +5442,8 @@ static int ardma_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "paths_enabled: %u\n", peer->paths_enabled);
 	seq_printf(m, "active_uc_qps: %u\n", READ_ONCE(peer->active_uc_qps));
 	seq_printf(m, "apple_max_uc_qps: %u\n", READ_ONCE(apple_max_uc_qps));
+	seq_printf(m, "apple_tx_max_inflight_wr: %u\n",
+		   READ_ONCE(apple_tx_max_inflight_wr));
 	seq_printf(m, "raw_rx_credits_reserved: %d\n",
 		   atomic_read(&peer->raw_rx_credits_reserved));
 	seq_printf(m, "raw_rx_credit_budget: %u\n",
@@ -5674,6 +5740,8 @@ static int ardma_nhi_stall_dump_show(struct seq_file *m, void *unused)
 	seq_printf(m, "paths_enabled: %u\n", peer->paths_enabled);
 	seq_printf(m, "active_uc_qps: %u\n", READ_ONCE(peer->active_uc_qps));
 	seq_printf(m, "apple_max_uc_qps: %u\n", READ_ONCE(apple_max_uc_qps));
+	seq_printf(m, "apple_tx_max_inflight_wr: %u\n",
+		   READ_ONCE(apple_tx_max_inflight_wr));
 	seq_printf(m, "raw_rx_credits_reserved: %d\n",
 		   atomic_read(&peer->raw_rx_credits_reserved));
 	seq_printf(m, "raw_rx_credit_budget: %u\n",
