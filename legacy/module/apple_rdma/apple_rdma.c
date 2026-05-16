@@ -123,6 +123,11 @@
 #define ARDMA_NHI_OPT_ENABLE		BIT(31)
 #define ARDMA_DESC_FLAGS_SHIFT	20
 
+static size_t ardma_ring_size(const struct tb_ring *ring)
+{
+	return ring ? (size_t)ring->size : 0;
+}
+
 struct ardma_ring_desc {
 	u64 phys;
 	u32 meta;
@@ -5684,7 +5689,7 @@ static int ardma_nhi_stall_dump_show(struct seq_file *m, void *unused)
 	seq_printf(m, "remote_is_apple: %u\n", peer->remote_is_apple);
 	seq_printf(m, "rx_raw_wire: %u\n", peer->rx_raw_wire);
 	seq_printf(m, "tx_marker_mode: %u\n", READ_ONCE(tx_marker_mode));
-	seq_printf(m, "ring_depth: %zu\n", tb_ring_size(peer->rx_ring));
+	seq_printf(m, "ring_depth: %zu\n", ardma_ring_size(peer->rx_ring));
 	seq_printf(m, "rx_posted_frames: %u\n", peer->rx_posted_frames);
 	seq_printf(m, "rx_frame_capacity: %u\n", peer->rx_frame_capacity);
 	seq_printf(m, "rx_frames: %lld\n",
@@ -5740,7 +5745,7 @@ static int ardma_nhi_rings_show(struct seq_file *m, void *unused)
 		   dev_name(&peer->svc->dev), receive_path, peer->paths_enabled,
 		   peer->remote_is_apple, READ_ONCE(tx_raw_mode), READ_ONCE(tx_e2e),
 		   peer->rx_raw_wire, READ_ONCE(rx_poll_mode),
-		   READ_ONCE(tx_marker_mode), tb_ring_size(peer->rx_ring),
+		   READ_ONCE(tx_marker_mode), ardma_ring_size(peer->rx_ring),
 		   peer->rx_posted_frames, peer->rx_frame_capacity);
 	seq_puts(m, "# TX reg low16=controller tail, high16=host producer.\n");
 	seq_puts(m, "# RX reg low16=host consumer, high16=controller tail.\n");
@@ -5774,7 +5779,7 @@ static int ardma_nhi_all_rings_show(struct seq_file *m, void *unused)
 		   peer->local_in_hop, peer->local_out_hop, hop_count,
 		   peer->remote_is_apple, READ_ONCE(tx_raw_mode), READ_ONCE(tx_e2e),
 		   peer->rx_raw_wire, READ_ONCE(rx_poll_mode),
-		   READ_ONCE(tx_marker_mode), tb_ring_size(peer->rx_ring),
+		   READ_ONCE(tx_marker_mode), ardma_ring_size(peer->rx_ring),
 		   peer->rx_posted_frames, peer->rx_frame_capacity);
 	seq_puts(m, "# All active NHI rings on this controller, including thunderbolt-net.\n");
 	seq_puts(m, "# TX reg low16=controller tail, high16=host producer.\n");
