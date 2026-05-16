@@ -75,7 +75,7 @@
 #define ARDMA_RAW_SPLIT_USER_SIZE	16
 #define ARDMA_FRAME_SPLIT_USER_SIZE	12
 #define ARDMA_TAIL_USER_SIZE	240
-#define ARDMA_DEFAULT_RING_DEPTH	16384
+#define ARDMA_DEFAULT_RING_DEPTH	32768
 #define ARDMA_MIN_RING_DEPTH		256
 #define ARDMA_MAX_RING_DEPTH		32768
 #define ARDMA_RING_RESERVE		64
@@ -292,7 +292,7 @@ MODULE_PARM_DESC(tx_zcopy,
 static unsigned int ring_depth = ARDMA_DEFAULT_RING_DEPTH;
 module_param(ring_depth, uint, 0444);
 MODULE_PARM_DESC(ring_depth,
-		 "NHI TX/RX ring depth, power of two, 256..32768; load-time only (default: 16384)");
+		 "NHI TX/RX ring depth, power of two, 256..32768; load-time only (default: 32768)");
 
 static unsigned int path_lanes = 1;
 module_param(path_lanes, uint, 0444);
@@ -355,10 +355,10 @@ module_param(enable_paths_on_setup, bool, 0444);
 MODULE_PARM_DESC(enable_paths_on_setup,
 		 "Enable Thunderbolt DMA paths during probe; disable for TB-IP coexistence diagnostics (default: true)");
 
-static bool disable_paths_on_idle = true;
+static bool disable_paths_on_idle;
 module_param(disable_paths_on_idle, bool, 0644);
 MODULE_PARM_DESC(disable_paths_on_idle,
-		 "Disable Thunderbolt DMA paths when the last UC QP is destroyed (default: true)");
+		 "Disable Thunderbolt DMA paths when the last UC QP is destroyed (default: false)");
 
 static bool raw_rx_credit_guard = true;
 module_param(raw_rx_credit_guard, bool, 0644);
