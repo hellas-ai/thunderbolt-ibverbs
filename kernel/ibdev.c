@@ -65,7 +65,7 @@ module_param(zcopy_min_bytes, uint, 0644);
 MODULE_PARM_DESC(zcopy_min_bytes,
 		 "Minimum native SEND/WRITE/READ-response bytes before zero-copy page streaming is used; 0 disables zero-copy");
 
-static uint apple_tx_max_inflight_wr = 1;
+static uint apple_tx_max_inflight_wr = 2;
 module_param(apple_tx_max_inflight_wr, uint, 0644);
 MODULE_PARM_DESC(apple_tx_max_inflight_wr,
 		 "Maximum Apple-compatible UC SEND work requests in flight per QP; 0 disables the software window");
