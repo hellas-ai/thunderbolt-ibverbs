@@ -47,10 +47,6 @@
 #define TBV_APPLE_PENDING_RX_DEFAULT_SLOTS 4096
 #define TBV_APPLE_PENDING_RX_MAX_SLOTS 16384
 #define TBV_APPLE_PENDING_RX_TOTAL_BYTES_DEFAULT (64u * 1024u * 1024u)
-#define TBV_APPLE_SLOT_WIRE_SIZE 256
-#define TBV_APPLE_FRAME_SLOT_USER_SIZE 252
-#define TBV_APPLE_FRAME_SPLIT_USER_SIZE 12
-#define TBV_APPLE_TAIL_USER_SIZE 240
 
 static char *roce_netdev;
 module_param(roce_netdev, charp, 0444);
@@ -2722,80 +2718,17 @@ static int tbv_apple_rx_copy_frame(struct tbv_state *state,
 				   u32 dst_off, const void *payload, u32 len,
 				   u32 *delivered, u32 *out_user_len)
 {
-	u32 num_slots = len / TBV_APPLE_SLOT_WIRE_SIZE;
-	u32 tail = len - num_slots * TBV_APPLE_SLOT_WIRE_SIZE;
-	u32 normal_slots = num_slots;
-	u32 user_len = 0;
-	const u8 *p = payload;
-	u32 i;
 	int ret;
+	u32 user_len = 0;
 
-	if (!tail && num_slots)
-		normal_slots--;
-
-	for (i = 0; i < normal_slots; i++) {
-		ret = tbv_apple_rx_copy_piece(state, wqe, dst_off,
-					      p + i * TBV_APPLE_SLOT_WIRE_SIZE,
-					      TBV_APPLE_FRAME_SLOT_USER_SIZE,
-					      delivered, &user_len);
-		if (ret)
-			return ret;
-	}
-
-	if (!tail && num_slots) {
-		const u8 *slot = p + normal_slots * TBV_APPLE_SLOT_WIRE_SIZE;
-
-		ret = tbv_apple_rx_copy_piece(state, wqe, dst_off, slot,
-					      TBV_APPLE_FRAME_SPLIT_USER_SIZE,
-					      delivered, &user_len);
-		if (ret)
-			return ret;
-		ret = tbv_apple_rx_copy_piece(state, wqe, dst_off,
-					      slot + TBV_APPLE_FRAME_SPLIT_USER_SIZE + 4,
-					      TBV_APPLE_TAIL_USER_SIZE,
-					      delivered, &user_len);
-		if (ret)
-			return ret;
-	} else if (tail > TBV_APPLE_TAIL_USER_SIZE) {
-		const u8 *frag = p + normal_slots * TBV_APPLE_SLOT_WIRE_SIZE;
-		u32 prefix = tail - TBV_APPLE_TAIL_USER_SIZE;
-
-		/* Short terminal descriptors carry user bytes followed by the
-		 * four silicon trailer bytes. Longer terminal descriptors are
-		 * split as [prefix user][trailer][240 tail user].
-		 */
-		if (prefix <= 4) {
-			ret = tbv_apple_rx_copy_piece(state, wqe, dst_off,
-						      frag, tail - 4,
-						      delivered, &user_len);
-			if (ret)
-				return ret;
-			goto out;
-		}
-
-		prefix -= 4;
-		if (prefix > TBV_APPLE_FRAME_SPLIT_USER_SIZE)
-			return -EINVAL;
-
-		ret = tbv_apple_rx_copy_piece(state, wqe, dst_off, frag,
-					      prefix, delivered, &user_len);
-		if (ret)
-			return ret;
-		ret = tbv_apple_rx_copy_piece(state, wqe, dst_off,
-					      frag + prefix + 4,
-					      TBV_APPLE_TAIL_USER_SIZE,
-					      delivered, &user_len);
-		if (ret)
-			return ret;
-	} else if (tail) {
-		ret = tbv_apple_rx_copy_piece(state, wqe, dst_off,
-					      p + normal_slots * TBV_APPLE_SLOT_WIRE_SIZE,
-					      tail, delivered, &user_len);
-		if (ret)
-			return ret;
-	}
-
-out:
+	/* Apple RX rings run in NHI FRAME mode. The controller has already
+	 * assembled the raw 256-byte slot stream and stripped silicon-owned
+	 * trailer bytes, so the callback length is user payload length.
+	 */
+	ret = tbv_apple_rx_copy_piece(state, wqe, dst_off, payload, len,
+				      delivered, &user_len);
+	if (ret)
+		return ret;
 	*out_user_len = user_len;
 	return 0;
 }
@@ -2805,76 +2738,12 @@ static int tbv_apple_rx_copy_frame_to_buf(struct tbv_qp *tqp,
 					  const void *payload, u32 len,
 					  u32 *out_user_len)
 {
-	u32 num_slots = len / TBV_APPLE_SLOT_WIRE_SIZE;
-	u32 tail = len - num_slots * TBV_APPLE_SLOT_WIRE_SIZE;
-	u32 normal_slots = num_slots;
-	u32 user_len = 0;
-	const u8 *data = payload;
-	u32 i;
 	int ret;
+	u32 user_len = 0;
 
-	if (!tail && num_slots)
-		normal_slots--;
-
-	for (i = 0; i < normal_slots; i++) {
-		ret = tbv_apple_rx_copy_piece_to_buf(tqp, p,
-						     data + i * TBV_APPLE_SLOT_WIRE_SIZE,
-						     TBV_APPLE_FRAME_SLOT_USER_SIZE,
-						     &user_len);
-		if (ret)
-			return ret;
-	}
-
-	if (!tail && num_slots) {
-		const u8 *slot = data + normal_slots * TBV_APPLE_SLOT_WIRE_SIZE;
-
-		ret = tbv_apple_rx_copy_piece_to_buf(tqp, p, slot,
-						     TBV_APPLE_FRAME_SPLIT_USER_SIZE,
-						     &user_len);
-		if (ret)
-			return ret;
-		ret = tbv_apple_rx_copy_piece_to_buf(tqp, p,
-						     slot + TBV_APPLE_FRAME_SPLIT_USER_SIZE + 4,
-						     TBV_APPLE_TAIL_USER_SIZE,
-						     &user_len);
-		if (ret)
-			return ret;
-	} else if (tail > TBV_APPLE_TAIL_USER_SIZE) {
-		const u8 *frag = data + normal_slots * TBV_APPLE_SLOT_WIRE_SIZE;
-		u32 prefix = tail - TBV_APPLE_TAIL_USER_SIZE;
-
-		/* See tbv_apple_rx_copy_frame(). */
-		if (prefix <= 4) {
-			ret = tbv_apple_rx_copy_piece_to_buf(tqp, p, frag,
-							     tail - 4,
-							     &user_len);
-			if (ret)
-				return ret;
-			goto out;
-		}
-
-		prefix -= 4;
-		if (prefix > TBV_APPLE_FRAME_SPLIT_USER_SIZE)
-			return -EINVAL;
-
-		ret = tbv_apple_rx_copy_piece_to_buf(tqp, p, frag, prefix,
-						     &user_len);
-		if (ret)
-			return ret;
-		ret = tbv_apple_rx_copy_piece_to_buf(tqp, p, frag + prefix + 4,
-						     TBV_APPLE_TAIL_USER_SIZE,
-						     &user_len);
-		if (ret)
-			return ret;
-	} else if (tail) {
-		ret = tbv_apple_rx_copy_piece_to_buf(tqp, p,
-						     data + normal_slots * TBV_APPLE_SLOT_WIRE_SIZE,
-						     tail, &user_len);
-		if (ret)
-			return ret;
-	}
-
-out:
+	ret = tbv_apple_rx_copy_piece_to_buf(tqp, p, payload, len, &user_len);
+	if (ret)
+		return ret;
 	*out_user_len = user_len;
 	return 0;
 }
