@@ -70,6 +70,11 @@ module_param(apple_tx_max_inflight_wr, uint, 0644);
 MODULE_PARM_DESC(apple_tx_max_inflight_wr,
 		 "Maximum Apple-compatible UC SEND work requests in flight per QP; 0 disables the software window");
 
+static uint apple_tx_max_inflight_frames;
+module_param(apple_tx_max_inflight_frames, uint, 0644);
+MODULE_PARM_DESC(apple_tx_max_inflight_frames,
+		 "Maximum Apple-compatible 4 KiB FA57 frames in flight per QP; 0 disables the frame window");
+
 static uint apple_rx_pending_bytes = TBV_APPLE_MAX_MSG_SIZE;
 module_param(apple_rx_pending_bytes, uint, 0644);
 MODULE_PARM_DESC(apple_rx_pending_bytes,
@@ -189,6 +194,7 @@ struct tbv_qp {
 	u32 recv_credits_advertised;
 	u32 remote_recv_credits;
 	atomic_t apple_tx_inflight;
+	atomic_t apple_tx_inflight_frames;
 	u32 send_psn;
 	u32 rx_expected_psn;
 	struct tbv_rx_message rx_msg;
@@ -236,6 +242,8 @@ struct tbv_send_ctx {
 	bool signaled;
 	bool completed;
 	bool apple_window_acquired;
+	bool apple_window_wr_acquired;
+	u32 apple_window_frames;
 };
 
 struct tbv_read_ctx {
@@ -291,7 +299,9 @@ static void tbv_send_ctx_put(struct tbv_send_ctx *send);
 static bool tbv_send_complete(struct tbv_send_ctx *send, int status);
 static void tbv_send_tx_done(void *ctx, int status);
 static void tbv_apple_send_tx_done(void *ctx, int status);
-static int tbv_qp_acquire_apple_tx_window(struct tbv_qp *tqp);
+static int tbv_qp_acquire_apple_tx_window(struct tbv_qp *tqp, u32 frames,
+					  bool *wr_acquired,
+					  u32 *frames_acquired);
 static void tbv_read_ctx_put(struct tbv_read_ctx *read);
 static bool tbv_read_complete(struct tbv_read_ctx *read, int status);
 static void tbv_read_tx_done(void *ctx, int status);
@@ -1008,6 +1018,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	init_waitqueue_head(&tqp->apple_tx_wait);
 	refcount_set(&tqp->refs, 1);
 	atomic_set(&tqp->apple_tx_inflight, 0);
+	atomic_set(&tqp->apple_tx_inflight_frames, 0);
 	init_completion(&tqp->refs_zero);
 	INIT_LIST_HEAD(&tqp->pending_sends);
 	INIT_LIST_HEAD(&tqp->pending_reads);
@@ -1187,6 +1198,18 @@ static void tbv_send_ctx_put(struct tbv_send_ctx *send)
 	}
 }
 
+static void tbv_qp_release_apple_tx_window(struct tbv_qp *tqp,
+					   bool wr_acquired,
+					   u32 frames_acquired)
+{
+	if (wr_acquired)
+		atomic_dec(&tqp->apple_tx_inflight);
+	if (frames_acquired)
+		atomic_sub(frames_acquired, &tqp->apple_tx_inflight_frames);
+	if (wr_acquired || frames_acquired)
+		wake_up_all(&tqp->apple_tx_wait);
+}
+
 static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 {
 	struct tbv_qp *tqp = send->tqp;
@@ -1203,9 +1226,10 @@ static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 		return false;
 
 	if (send->apple_window_acquired) {
-		atomic_dec(&tqp->apple_tx_inflight);
+		tbv_qp_release_apple_tx_window(tqp,
+						send->apple_window_wr_acquired,
+						send->apple_window_frames);
 		send->apple_window_acquired = false;
-		wake_up_all(&tqp->apple_tx_wait);
 	}
 
 	if (send->signaled) {
@@ -1515,6 +1539,8 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	u32 nfrags;
 	u32 remaining;
 	int nsegs = 0;
+	bool apple_wr_acquired = false;
+	u32 apple_frames_acquired = 0;
 	bool sent_any = false;
 	int ret;
 
@@ -1550,16 +1576,18 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		goto err_release_segs;
 	}
 
-	ret = tbv_qp_acquire_apple_tx_window(tqp);
+	nfrags = DIV_ROUND_UP(total_len, TBV_APPLE_FRAME_SIZE);
+
+	ret = tbv_qp_acquire_apple_tx_window(tqp, nfrags,
+					     &apple_wr_acquired,
+					     &apple_frames_acquired);
 	if (ret)
 		goto err_put_path;
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx) {
-		if (READ_ONCE(apple_tx_max_inflight_wr)) {
-			atomic_dec(&tqp->apple_tx_inflight);
-			wake_up_all(&tqp->apple_tx_wait);
-		}
+		tbv_qp_release_apple_tx_window(tqp, apple_wr_acquired,
+					       apple_frames_acquired);
 		ret = -ENOMEM;
 		goto err_put_path;
 	}
@@ -1569,7 +1597,9 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	ctx->wr_id = wr->wr_id;
 	ctx->signaled = !!(wr->send_flags & IB_SEND_SIGNALED);
 	ctx->wc_opcode = IB_WC_SEND;
-	ctx->apple_window_acquired = !!READ_ONCE(apple_tx_max_inflight_wr);
+	ctx->apple_window_wr_acquired = apple_wr_acquired;
+	ctx->apple_window_frames = apple_frames_acquired;
+	ctx->apple_window_acquired = apple_wr_acquired || apple_frames_acquired;
 	INIT_LIST_HEAD(&ctx->node);
 
 	spin_lock_irqsave(&tqp->lock, flags);
@@ -1577,7 +1607,6 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	tqp->send_psn = tbv_psn_next(ctx->psn);
 	spin_unlock_irqrestore(&tqp->lock, flags);
 
-	nfrags = DIV_ROUND_UP(total_len, TBV_APPLE_FRAME_SIZE);
 	remaining = nfrags;
 	atomic_set(&ctx->apple_pending, nfrags);
 	tbv_qp_queue_send(tqp, ctx);
@@ -3026,43 +3055,72 @@ static void tbv_qp_return_remote_recv_credit(struct tbv_qp *tqp)
 	wake_up_all(&tqp->credit_wait);
 }
 
-static bool tbv_qp_try_acquire_apple_tx_window(struct tbv_qp *tqp, int *ret)
+static u32 tbv_apple_tx_frame_charge(u32 frames, unsigned int max_frames)
 {
-	unsigned int max = READ_ONCE(apple_tx_max_inflight_wr);
-	int cur;
+	if (!max_frames)
+		return 0;
+	return min_t(u32, frames, max_frames);
+}
 
-	if (!max) {
+static bool tbv_qp_try_acquire_apple_tx_window(struct tbv_qp *tqp, u32 frames,
+					       bool *wr_acquired,
+					       u32 *frames_acquired,
+					       int *ret)
+{
+	unsigned int max_wr = READ_ONCE(apple_tx_max_inflight_wr);
+	unsigned int max_frames = READ_ONCE(apple_tx_max_inflight_frames);
+	u32 frame_charge = tbv_apple_tx_frame_charge(frames, max_frames);
+	unsigned long flags;
+	bool acquired = false;
+
+	if (!max_wr && !max_frames) {
+		*wr_acquired = false;
+		*frames_acquired = 0;
 		*ret = 0;
 		return true;
 	}
 
-	if (READ_ONCE(tqp->closing)) {
+	spin_lock_irqsave(&tqp->lock, flags);
+	if (tqp->closing) {
 		*ret = -ECANCELED;
-		return true;
-	}
+		acquired = true;
+	} else {
+		int cur_wr = atomic_read(&tqp->apple_tx_inflight);
+		int cur_frames = atomic_read(&tqp->apple_tx_inflight_frames);
+		bool wr_ok = !max_wr || cur_wr < max_wr;
+		bool frames_ok = !max_frames ||
+			cur_frames + frame_charge <= max_frames;
 
-	cur = atomic_read(&tqp->apple_tx_inflight);
-	while (cur < max) {
-		int old = atomic_cmpxchg(&tqp->apple_tx_inflight, cur,
-					 cur + 1);
-
-		if (old == cur) {
+		if (wr_ok && frames_ok) {
+			if (max_wr)
+				atomic_inc(&tqp->apple_tx_inflight);
+			if (frame_charge)
+				atomic_add(frame_charge,
+					   &tqp->apple_tx_inflight_frames);
+			*wr_acquired = !!max_wr;
+			*frames_acquired = frame_charge;
 			*ret = 0;
-			return true;
+			acquired = true;
 		}
-		cur = old;
 	}
-
-	return false;
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	return acquired;
 }
 
-static int tbv_qp_acquire_apple_tx_window(struct tbv_qp *tqp)
+static int tbv_qp_acquire_apple_tx_window(struct tbv_qp *tqp, u32 frames,
+					  bool *wr_acquired,
+					  u32 *frames_acquired)
 {
 	int ret = -ETIMEDOUT;
 	long waited;
 
+	*wr_acquired = false;
+	*frames_acquired = 0;
 	waited = wait_event_timeout(tqp->apple_tx_wait,
 				    tbv_qp_try_acquire_apple_tx_window(tqp,
+								       frames,
+								       wr_acquired,
+								       frames_acquired,
 								       &ret),
 				    msecs_to_jiffies(5000));
 	return waited ? ret : -ETIMEDOUT;
