@@ -335,6 +335,7 @@ struct tbv_state {
 	atomic64_t data_rx_reorder_delivered;
 	atomic64_t data_rx_reorder_dropped;
 	atomic64_t data_rx_reorder_window;
+	atomic64_t data_rx_pending_discarded;
 	atomic64_t data_cq_overflow;
 	struct xarray verbs_mrs_xa;
 	struct xarray verbs_qps_xa;

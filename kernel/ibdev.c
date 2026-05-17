@@ -281,6 +281,7 @@ static int tbv_rx_copy_to_wqe(struct tbv_state *state,
 static void tbv_qp_flush_reorder(struct tbv_qp *tqp);
 static void tbv_rx_drain_reorder_locked(struct tbv_state *state,
 					struct tbv_qp *tqp);
+static void tbv_qp_flush_apple_pending(struct tbv_qp *tqp);
 static void tbv_apple_rx_drain_pending_locked(struct tbv_state *state,
 					      struct tbv_qp *tqp);
 static void tbv_qp_advertise_recv_credits(struct tbv_qp *tqp);
@@ -1028,6 +1029,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	tbv_qp_put(tqp);
 	wait_for_completion(&tqp->refs_zero);
 	tbv_qp_flush_reorder(tqp);
+	tbv_qp_flush_apple_pending(tqp);
 	for (i = 0; i < TBV_APPLE_PENDING_RX_SLOTS; i++)
 		kvfree(tqp->apple_pending[i].buf);
 
@@ -1933,10 +1935,14 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	fragment_striping = tqp->owner->native_fragment_striping;
 	wr_striping = tqp->owner->native_wr_striping;
 
+	if (tbv_should_zcopy_payload(total_len) && fragment_striping)
+		atomic64_inc(&tqp->owner->data_wr_zcopy_fallback);
+
 	if (!fragment_striping && tbv_should_zcopy_payload(total_len) &&
 	    tbv_send_segments_zcopy_safe(segs, nsegs, total_len)) {
 		struct tbv_send_page_stream *stream;
 
+		atomic64_inc(&tqp->owner->data_wr_zcopy);
 		memset(&hdr, 0, sizeof(hdr));
 		if (send_with_imm)
 			hdr.opcode = TBV_NATIVE_DATA_OP_SEND_IMM;
@@ -2008,6 +2014,8 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		atomic64_inc(&tqp->owner->data_tx_accepted);
 		return 0;
 	}
+	if (!fragment_striping && tbv_should_zcopy_payload(total_len))
+		atomic64_inc(&tqp->owner->data_wr_zcopy_fallback);
 
 	atomic64_inc(&tqp->owner->data_wr_copied);
 	mutex_lock(&tqp->owner->lock);
@@ -2344,6 +2352,23 @@ static void tbv_apple_pending_reset(struct tbv_apple_pending_rx *p)
 	p->status = IB_WC_SUCCESS;
 	p->active = false;
 	p->ready = false;
+}
+
+static void tbv_qp_flush_apple_pending(struct tbv_qp *tqp)
+{
+	u32 i;
+
+	for (i = 0; i < TBV_APPLE_PENDING_RX_SLOTS; i++) {
+		struct tbv_apple_pending_rx *p = &tqp->apple_pending[i];
+
+		if ((p->active || p->ready) && tqp->owner)
+			atomic64_inc(&tqp->owner->data_rx_pending_discarded);
+		tbv_apple_pending_reset(p);
+	}
+	tqp->apple_pending_head = 0;
+	tqp->apple_pending_tail = 0;
+	tqp->apple_pending_ready_count = 0;
+	tqp->apple_pending_active = -1;
 }
 
 static struct tbv_apple_pending_rx *

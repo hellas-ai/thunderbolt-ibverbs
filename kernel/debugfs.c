@@ -131,6 +131,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_reorder_dropped));
 	seq_printf(s, "data_rx_reorder_window: %lld\n",
 		   atomic64_read(&state->data_rx_reorder_window));
+	seq_printf(s, "data_rx_pending_discarded: %lld\n",
+		   atomic64_read(&state->data_rx_pending_discarded));
 	seq_printf(s, "data_cq_overflow: %lld\n",
 		   atomic64_read(&state->data_cq_overflow));
 	return 0;
