@@ -35,6 +35,7 @@
 #define TBV_IBDEV_MAX_READ_CTX 128
 #define TBV_IBDEV_QPN_MIN 0x900
 #define TBV_IBDEV_QPN_MAX 0x00ffffff
+#define TBV_APPLE_PRIMARY_QPN TBV_IBDEV_QPN_MIN
 #define TBV_IBDEV_PAGE_SIZE_CAP (SZ_4K | SZ_2M | SZ_1G)
 #define TBV_PSN_MASK 0x00ffffffu
 #define TBV_RX_REORDER_MAX_MESSAGES 64
@@ -321,9 +322,19 @@ static u32 tbv_qp_max_msg_size(const struct tbv_qp *tqp)
 static u32 tbv_apple_qpn_from_path(const struct tbv_path *path)
 {
 	if (!path || path->cfg.receive_path < 0)
-		return TBV_IBDEV_QPN_MIN;
+		return TBV_APPLE_PRIMARY_QPN;
 
 	return (u32)path->cfg.receive_path << TBV_APPLE_QPN_SHIFT;
+}
+
+static int tbv_alloc_qpn(const struct tbv_state *state)
+{
+	if (tbv_state_apple_only(state))
+		return ida_alloc_range(&tbv_qpn_ida, TBV_APPLE_PRIMARY_QPN,
+				       TBV_APPLE_PRIMARY_QPN, GFP_KERNEL);
+
+	return ida_alloc_range(&tbv_qpn_ida, TBV_IBDEV_QPN_MIN,
+			       TBV_IBDEV_QPN_MAX, GFP_KERNEL);
 }
 
 static struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev)
@@ -724,6 +735,8 @@ static int tbv_query_device(struct ib_device *ibdev,
 			    struct ib_device_attr *attr,
 			    struct ib_udata *udata)
 {
+	bool apple = tbv_state_apple_only(tbv_ibdev_state(ibdev));
+
 	memset(attr, 0, sizeof(*attr));
 	attr->vendor_id = 0x1d6b;
 	attr->vendor_part_id = 0x5442;
@@ -734,7 +747,7 @@ static int tbv_query_device(struct ib_device *ibdev,
 	attr->kernel_cap_flags = IBK_LOCAL_DMA_LKEY;
 	attr->max_mr_size = U64_MAX;
 	attr->page_size_cap = TBV_IBDEV_PAGE_SIZE_CAP;
-	attr->max_qp = TBV_IBDEV_MAX_QP;
+	attr->max_qp = apple ? 1 : TBV_IBDEV_MAX_QP;
 	attr->max_qp_wr = TBV_IBDEV_MAX_QP_WR;
 	attr->max_send_sge = TBV_IBDEV_MAX_SGE;
 	attr->max_recv_sge = TBV_IBDEV_MAX_SGE;
@@ -743,9 +756,10 @@ static int tbv_query_device(struct ib_device *ibdev,
 	attr->max_cqe = TBV_IBDEV_MAX_CQE;
 	attr->max_mr = 1024;
 	attr->max_pd = 256;
-	attr->max_qp_rd_atom = TBV_IBDEV_MAX_READ_CTX;
-	attr->max_res_rd_atom = TBV_IBDEV_MAX_QP * TBV_IBDEV_MAX_READ_CTX;
-	attr->max_qp_init_rd_atom = TBV_IBDEV_MAX_READ_CTX;
+	attr->max_qp_rd_atom = apple ? 0 : TBV_IBDEV_MAX_READ_CTX;
+	attr->max_res_rd_atom = apple ? 0 :
+				 TBV_IBDEV_MAX_QP * TBV_IBDEV_MAX_READ_CTX;
+	attr->max_qp_init_rd_atom = apple ? 0 : TBV_IBDEV_MAX_READ_CTX;
 	attr->atomic_cap = IB_ATOMIC_NONE;
 	attr->max_pkeys = 1;
 	attr->local_ca_ack_delay = 15;
@@ -915,6 +929,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 			 struct ib_udata *udata)
 {
 	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
+	struct tbv_state *state = tbv_ibdev_state(qp->device);
 	unsigned long flags;
 	int qpn;
 	int ret;
@@ -923,8 +938,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 		return -EOPNOTSUPP;
 	if (init_attr->qp_type != IB_QPT_RC && init_attr->qp_type != IB_QPT_UC)
 		return -EOPNOTSUPP;
-	if (tbv_state_apple_only(tbv_ibdev_state(qp->device)) &&
-	    init_attr->qp_type != IB_QPT_UC)
+	if (tbv_state_apple_only(state) && init_attr->qp_type != IB_QPT_UC)
 		return -EOPNOTSUPP;
 	if (init_attr->cap.max_send_wr > TBV_IBDEV_MAX_QP_WR ||
 	    init_attr->cap.max_recv_wr > TBV_IBDEV_MAX_QP_WR ||
@@ -932,8 +946,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	    init_attr->cap.max_recv_sge > TBV_IBDEV_MAX_SGE)
 		return -EINVAL;
 
-	qpn = ida_alloc_range(&tbv_qpn_ida, TBV_IBDEV_QPN_MIN,
-			      TBV_IBDEV_QPN_MAX, GFP_KERNEL);
+	qpn = tbv_alloc_qpn(state);
 	if (qpn < 0)
 		return qpn;
 
@@ -948,7 +961,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	}
 
 	tqp->init_attr = *init_attr;
-	tqp->owner = tbv_ibdev_state(qp->device);
+	tqp->owner = state;
 	spin_lock_init(&tqp->lock);
 	mutex_init(&tqp->rx_lock);
 	init_waitqueue_head(&tqp->credit_wait);
