@@ -79,12 +79,12 @@ MODULE_PARM_DESC(apple_tx_max_inflight_frames,
 static uint apple_tx_pace_us;
 module_param(apple_tx_pace_us, uint, 0644);
 MODULE_PARM_DESC(apple_tx_pace_us,
-		 "Microseconds to sleep between Apple-compatible FA57 TX frames; 0 disables pacing");
+		 "Microseconds to sleep between Apple-compatible FA57 TX frame groups; 0 disables pacing");
 
 static uint apple_tx_pace_interval_frames = 1;
 module_param(apple_tx_pace_interval_frames, uint, 0644);
 MODULE_PARM_DESC(apple_tx_pace_interval_frames,
-		 "Apply Apple-compatible TX pacing every N FA57 frames; 0 is treated as 1");
+		 "Apply Apple-compatible TX pacing every N non-terminal FA57 frames; 0 is treated as 1");
 
 static uint apple_rx_pending_bytes = TBV_APPLE_MAX_MSG_SIZE;
 module_param(apple_rx_pending_bytes, uint, 0644);
