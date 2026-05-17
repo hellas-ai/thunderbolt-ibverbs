@@ -17,6 +17,7 @@
 #define TBV_CONTROL_FRAME_SIZE 256
 #define TBV_CONTROL_QUEUE_MULTIPLIER 4
 #define TBV_DATA_QUEUE_MULTIPLIER 4
+#define TBV_DATA_PACKET_POOL_LIMIT 1024
 #define TBV_TX_POLL_DELAY msecs_to_jiffies(1)
 
 struct tbv_data_frame {
@@ -67,6 +68,13 @@ static u32 tbv_path_control_packet_count(const struct tbv_path *path)
 	return clamp_t(u32, count, 64, 4096);
 }
 
+static u32 tbv_path_data_packet_count(const struct tbv_path *path)
+{
+	u32 count = path->cfg.tx_ring_size * TBV_DATA_QUEUE_MULTIPLIER;
+
+	return min_t(u32, count, TBV_DATA_PACKET_POOL_LIMIT);
+}
+
 static void tbv_path_tx_packet_release(struct tbv_tx_packet *packet, int status)
 {
 	struct tbv_path *path = packet->path;
@@ -86,6 +94,13 @@ static void tbv_path_tx_packet_release(struct tbv_tx_packet *packet, int status)
 
 	if (packet->zcopy) {
 		kfree(packet);
+		return;
+	}
+
+	if (!packet->control && packet->pooled) {
+		spin_lock_irqsave(&path->tx_lock, flags);
+		list_add_tail(&packet->node, &path->tx_data_free);
+		spin_unlock_irqrestore(&path->tx_lock, flags);
 		return;
 	}
 
@@ -162,6 +177,7 @@ void tbv_path_init(struct tbv_path *path,
 	spin_lock_init(&path->tx_lock);
 	INIT_LIST_HEAD(&path->tx_free);
 	INIT_LIST_HEAD(&path->tx_control_free);
+	INIT_LIST_HEAD(&path->tx_data_free);
 	INIT_LIST_HEAD(&path->tx_control_queue);
 	INIT_LIST_HEAD(&path->tx_data_queue);
 	INIT_DELAYED_WORK(&path->tx_poll_work, tbv_path_tx_poll_work);
@@ -181,6 +197,7 @@ void tbv_path_reset(struct tbv_path *path)
 	spin_lock_init(&path->tx_lock);
 	INIT_LIST_HEAD(&path->tx_free);
 	INIT_LIST_HEAD(&path->tx_control_free);
+	INIT_LIST_HEAD(&path->tx_data_free);
 	INIT_LIST_HEAD(&path->tx_control_queue);
 	INIT_LIST_HEAD(&path->tx_data_queue);
 	INIT_DELAYED_WORK(&path->tx_poll_work, tbv_path_tx_poll_work);
@@ -516,6 +533,56 @@ static void tbv_path_free_control_packets(struct tbv_path *path)
 	INIT_LIST_HEAD(&path->tx_control_free);
 }
 
+static int tbv_path_alloc_data_packets(struct tbv_path *path)
+{
+	struct tbv_tx_packet *packets;
+	u32 count = tbv_path_data_packet_count(path);
+	u32 i;
+
+	if (!path->rail || !path->rail->peer ||
+	    path->rail->peer->backend != TBV_BACKEND_APPLE)
+		return 0;
+
+	packets = kcalloc(count, sizeof(*packets), GFP_KERNEL);
+	if (!packets)
+		return -ENOMEM;
+
+	for (i = 0; i < count; i++) {
+		struct tbv_tx_packet *packet = &packets[i];
+
+		INIT_LIST_HEAD(&packet->node);
+		packet->path = path;
+		packet->buf = kmalloc(TBV_DATA_FRAME_SIZE, GFP_KERNEL);
+		if (!packet->buf)
+			goto err;
+		packet->pooled = true;
+		list_add_tail(&packet->node, &path->tx_data_free);
+	}
+
+	path->tx_data_packets = packets;
+	path->tx_data_packet_count = count;
+	return 0;
+
+err:
+	while (i-- > 0)
+		kfree(packets[i].buf);
+	kfree(packets);
+	INIT_LIST_HEAD(&path->tx_data_free);
+	return -ENOMEM;
+}
+
+static void tbv_path_free_data_packets(struct tbv_path *path)
+{
+	u32 i;
+
+	for (i = 0; i < path->tx_data_packet_count; i++)
+		kfree(path->tx_data_packets[i].buf);
+	kfree(path->tx_data_packets);
+	path->tx_data_packets = NULL;
+	path->tx_data_packet_count = 0;
+	INIT_LIST_HEAD(&path->tx_data_free);
+}
+
 static int tbv_path_post_rx_frame(struct tbv_data_frame *f)
 {
 	struct tbv_path *path = f->path;
@@ -604,10 +671,14 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 		goto err_tx_frames;
 	if (tbv_path_alloc_control_packets(path))
 		goto err_rx_frames;
+	if (tbv_path_alloc_data_packets(path))
+		goto err_control_packets;
 
 	path->state = TBV_PATH_RING_ALLOCATED;
 	return 0;
 
+err_control_packets:
+	tbv_path_free_control_packets(path);
 err_rx_frames:
 	tbv_path_free_frames(path, false);
 err_tx_frames:
@@ -709,6 +780,35 @@ tbv_path_alloc_data_packet(struct tbv_path *path, const void *data, u32 len,
 						  done_ctx);
 	if (!packet)
 		kfree(buf);
+	return packet;
+}
+
+static struct tbv_tx_packet *tbv_path_alloc_pooled_data_packet(
+	struct tbv_path *path, u32 len, tbv_path_tx_done_fn done, void *done_ctx)
+{
+	struct tbv_tx_packet *packet;
+	unsigned long flags;
+
+	spin_lock_irqsave(&path->tx_lock, flags);
+	if (list_empty(&path->tx_data_free)) {
+		spin_unlock_irqrestore(&path->tx_lock, flags);
+		return NULL;
+	}
+
+	packet = list_first_entry(&path->tx_data_free, struct tbv_tx_packet,
+				  node);
+	list_del_init(&packet->node);
+	spin_unlock_irqrestore(&path->tx_lock, flags);
+
+	packet->len = len;
+	packet->done = done;
+	packet->done_ctx = done_ctx;
+	packet->sof = TBV_DATA_PDF_FRAME_START;
+	packet->eof = TBV_DATA_PDF_FRAME_END;
+	packet->control = false;
+	packet->queued = false;
+	packet->zcopy = false;
+	packet->unmap_dma = false;
 	return packet;
 }
 
@@ -1142,6 +1242,61 @@ int tbv_path_send_marked_owned(struct tbv_path *path, void *data, u32 len,
 	return 0;
 }
 
+int tbv_path_send_marked_fill(struct tbv_path *path, u32 len,
+			      u8 sof, u8 eof, unsigned int send_flags,
+			      tbv_path_tx_fill_fn fill, void *fill_ctx,
+			      tbv_path_tx_done_fn done, void *done_ctx)
+{
+	struct tbv_tx_packet *packet;
+	u8 *buf;
+	int ret;
+
+	if (!fill)
+		return -EINVAL;
+	if (!len || len > TBV_DATA_FRAME_SIZE ||
+	    (send_flags & ~(TBV_PATH_SEND_CONTROL | TBV_PATH_SEND_DEFER)) ||
+	    (send_flags & TBV_PATH_SEND_CONTROL))
+		return -EINVAL;
+
+	packet = tbv_path_alloc_pooled_data_packet(path, len, done, done_ctx);
+	if (packet) {
+		ret = fill(fill_ctx, packet->buf, len);
+		if (ret) {
+			packet->done = NULL;
+			packet->done_ctx = NULL;
+			tbv_path_tx_packet_release(packet, ret);
+			return ret;
+		}
+	} else {
+		buf = kmalloc(len, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+		ret = fill(fill_ctx, buf, len);
+		if (ret) {
+			kfree(buf);
+			return ret;
+		}
+		packet = tbv_path_alloc_data_packet_owned(path, buf, len,
+							  done, done_ctx);
+		if (!packet) {
+			kfree(buf);
+			return -ENOMEM;
+		}
+	}
+
+	packet->sof = sof;
+	packet->eof = eof;
+	ret = tbv_path_enqueue_data(path, packet,
+				    send_flags & TBV_PATH_SEND_DEFER);
+	if (ret) {
+		packet->done = NULL;
+		packet->done_ctx = NULL;
+		tbv_path_tx_packet_release(packet, ret);
+		return ret;
+	}
+	return 0;
+}
+
 static void tbv_path_release_packet_list(struct list_head *packets, int status)
 {
 	while (!list_empty(packets)) {
@@ -1398,6 +1553,7 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 		path->tx_ring = NULL;
 		path->local_tx_hop = -1;
 	}
+	tbv_path_free_data_packets(path);
 	tbv_path_free_control_packets(path);
 
 	path->state = TBV_PATH_STOPPED;

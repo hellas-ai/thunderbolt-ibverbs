@@ -136,9 +136,11 @@ struct tbv_path {
 	struct tbv_data_frame *tx_frames;
 	struct tbv_data_frame *rx_frames;
 	struct tbv_tx_packet *tx_control_packets;
+	struct tbv_tx_packet *tx_data_packets;
 	u32 tx_frame_count;
 	u32 rx_frame_count;
 	u32 tx_control_packet_count;
+	u32 tx_data_packet_count;
 	u32 tx_control_queued;
 	u32 tx_data_queued;
 	u32 tx_data_reserved;
@@ -146,6 +148,7 @@ struct tbv_path {
 	spinlock_t tx_lock;
 	struct list_head tx_free;
 	struct list_head tx_control_free;
+	struct list_head tx_data_free;
 	struct list_head tx_control_queue;
 	struct list_head tx_data_queue;
 	struct delayed_work tx_poll_work;
@@ -362,6 +365,7 @@ struct page;
 struct tb_ring;
 struct tb_xdomain;
 typedef void (*tbv_path_tx_done_fn)(void *ctx, int status);
+typedef int (*tbv_path_tx_fill_fn)(void *ctx, void *dst, u32 len);
 typedef int (*tbv_path_next_page_fn)(void *ctx, struct page **page,
 				     u32 *page_off, u32 *length,
 				     tbv_path_tx_done_fn *done,
@@ -463,6 +467,10 @@ int tbv_path_send_owned(struct tbv_path *path, void *data, u32 len,
 int tbv_path_send_marked_owned(struct tbv_path *path, void *data, u32 len,
 			       u8 sof, u8 eof, unsigned int flags,
 			       tbv_path_tx_done_fn done, void *done_ctx);
+int tbv_path_send_marked_fill(struct tbv_path *path, u32 len,
+			      u8 sof, u8 eof, unsigned int flags,
+			      tbv_path_tx_fill_fn fill, void *fill_ctx,
+			      tbv_path_tx_done_fn done, void *done_ctx);
 int tbv_path_send_page_stream(struct tbv_path *path,
 			      const struct tbv_native_data_header *hdr,
 			      u32 total_length, unsigned int flags,

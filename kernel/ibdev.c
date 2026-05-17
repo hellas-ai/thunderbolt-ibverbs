@@ -276,6 +276,13 @@ struct tbv_send_page_stream {
 	int nsegs;
 };
 
+struct tbv_apple_send_fill {
+	const struct tbv_send_segment *segs;
+	struct tbv_qp *tqp;
+	u32 offset;
+	int nsegs;
+};
+
 static DEFINE_IDA(tbv_qpn_ida);
 static atomic_t tbv_mr_key = ATOMIC_INIT(1);
 
@@ -1485,6 +1492,18 @@ static void tbv_apple_send_tx_done(void *ctx, int status)
 	tbv_send_ctx_put(send);
 }
 
+static int tbv_apple_send_fill(void *ctx, void *dst, u32 len)
+{
+	struct tbv_apple_send_fill *fill = ctx;
+	int ret;
+
+	ret = tbv_copy_send_range(fill->segs, fill->nsegs, fill->offset, dst,
+				  len);
+	if (ret)
+		atomic64_inc(&fill->tqp->owner->data_wr_copy_error);
+	return ret;
+}
+
 static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 {
 	struct tbv_send_segment segs[TBV_IBDEV_MAX_SGE];
@@ -1571,29 +1590,20 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		u32 payload_len = min_t(u32, total_len - offset,
 					TBV_APPLE_FRAME_SIZE);
 		bool last = offset + payload_len == total_len;
-		u8 *frame;
-
-		frame = kmalloc(payload_len, GFP_KERNEL);
-		if (!frame) {
-			ret = -ENOMEM;
-			goto err_release_reservation;
-		}
-
-		ret = tbv_copy_send_range(segs, nsegs, offset, frame,
-					  payload_len);
-		if (ret) {
-			kfree(frame);
-			atomic64_inc(&tqp->owner->data_wr_copy_error);
-			goto err_release_reservation;
-		}
+		struct tbv_apple_send_fill fill = {
+			.segs = segs,
+			.tqp = tqp,
+			.offset = offset,
+			.nsegs = nsegs,
+		};
 
 		tbv_send_ctx_get(ctx);
 		atomic64_inc(&tqp->owner->data_wr_path_send);
-		ret = tbv_path_send_marked_owned(path, frame, payload_len,
-						 1, last ? 3 : 2,
-						 TBV_PATH_SEND_DEFER,
-						 tbv_apple_send_tx_done,
-						 ctx);
+		ret = tbv_path_send_marked_fill(path, payload_len,
+						1, last ? 3 : 2,
+						TBV_PATH_SEND_DEFER,
+						tbv_apple_send_fill, &fill,
+						tbv_apple_send_tx_done, ctx);
 		if (ret) {
 			tbv_send_ctx_put(ctx);
 			atomic64_inc(&tqp->owner->data_wr_path_send_error);
