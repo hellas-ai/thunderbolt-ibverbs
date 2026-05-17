@@ -49,6 +49,7 @@ help:
 	@echo "  apple_tx_max_inflight_frames=<N>"
 	@echo "  apple_tx_pace_us=<N>"
 	@echo "  apple_tx_pace_interval_frames=<N>"
+	@echo "  apple_tx_pace_after_frames=<N>"
 	@echo "  apple_rx_pending_bytes=<bytes>"
 	@echo "  apple_rx_pending_slots=<N>"
 	@echo "  apple_rx_pending_total_bytes=<bytes>"

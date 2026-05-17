@@ -86,6 +86,11 @@ module_param(apple_tx_pace_interval_frames, uint, 0644);
 MODULE_PARM_DESC(apple_tx_pace_interval_frames,
 		 "Apply Apple-compatible TX pacing every N non-terminal FA57 frames; 0 is treated as 1");
 
+static uint apple_tx_pace_after_frames;
+module_param(apple_tx_pace_after_frames, uint, 0644);
+MODULE_PARM_DESC(apple_tx_pace_after_frames,
+		 "Start Apple-compatible TX pacing after this many queued FA57 frames in a QP burst; 0 starts immediately");
+
 static uint apple_rx_pending_bytes = TBV_APPLE_MAX_MSG_SIZE;
 module_param(apple_rx_pending_bytes, uint, 0644);
 MODULE_PARM_DESC(apple_rx_pending_bytes,
@@ -206,6 +211,7 @@ struct tbv_qp {
 	u32 remote_recv_credits;
 	atomic_t apple_tx_inflight;
 	atomic_t apple_tx_inflight_frames;
+	atomic_t apple_tx_pace_queued_frames;
 	u32 send_psn;
 	u32 rx_expected_psn;
 	struct tbv_rx_message rx_msg;
@@ -1030,6 +1036,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	refcount_set(&tqp->refs, 1);
 	atomic_set(&tqp->apple_tx_inflight, 0);
 	atomic_set(&tqp->apple_tx_inflight_frames, 0);
+	atomic_set(&tqp->apple_tx_pace_queued_frames, 0);
 	init_completion(&tqp->refs_zero);
 	INIT_LIST_HEAD(&tqp->pending_sends);
 	INIT_LIST_HEAD(&tqp->pending_reads);
@@ -1217,6 +1224,9 @@ static void tbv_qp_release_apple_tx_window(struct tbv_qp *tqp,
 		atomic_dec(&tqp->apple_tx_inflight);
 	if (frames_acquired)
 		atomic_sub(frames_acquired, &tqp->apple_tx_inflight_frames);
+	if (atomic_read(&tqp->apple_tx_inflight) <= 0 &&
+	    atomic_read(&tqp->apple_tx_inflight_frames) <= 0)
+		atomic_set(&tqp->apple_tx_pace_queued_frames, 0);
 	if (wr_acquired || frames_acquired)
 		wake_up_all(&tqp->apple_tx_wait);
 }
@@ -1633,6 +1643,8 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		u32 frame_index;
 		unsigned int pace_us;
 		unsigned int pace_interval;
+		unsigned int pace_after;
+		int queued_frames = 0;
 		struct tbv_apple_send_fill fill = {
 			.segs = segs,
 			.tqp = tqp,
@@ -1660,9 +1672,14 @@ static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 
 		pace_us = READ_ONCE(apple_tx_pace_us);
 		pace_interval = READ_ONCE(apple_tx_pace_interval_frames);
+		pace_after = READ_ONCE(apple_tx_pace_after_frames);
 		if (!pace_interval)
 			pace_interval = 1;
+		if (pace_us)
+			queued_frames =
+				atomic_inc_return(&tqp->apple_tx_pace_queued_frames);
 		if (offset < total_len && pace_us &&
+		    (unsigned int)queued_frames > pace_after &&
 		    frame_index % pace_interval == 0)
 			usleep_range(pace_us, pace_us + 10);
 	}
