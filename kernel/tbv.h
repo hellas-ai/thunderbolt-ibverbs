@@ -252,7 +252,9 @@ struct tbv_tbnet_identity {
 	atomic64_t minimal_login_rx;
 	atomic64_t minimal_login_tx;
 	atomic64_t minimal_packet_rx;
+	atomic64_t minimal_packet_tx_posted;
 	atomic64_t minimal_packet_tx;
+	atomic64_t minimal_packet_tx_errors;
 	atomic64_t minimal_path_errors;
 	atomic64_t arp_requests;
 	atomic64_t arp_replies;

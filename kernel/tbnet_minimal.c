@@ -15,6 +15,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/errno.h>
 #include <linux/etherdevice.h>
+#include <linux/highmem.h>
 #include <linux/jhash.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -30,7 +31,7 @@
 #define TBV_TBNET_MIN_LOGIN_TIMEOUT_MS	500
 #define TBV_TBNET_MIN_LOGIN_RETRIES	60
 #define TBV_TBNET_MIN_LOGOUT_TIMEOUT_MS	1000
-#define TBV_TBNET_MIN_RING_SIZE		64
+#define TBV_TBNET_MIN_RING_SIZE		256
 #define TBV_TBNET_MIN_FRAME_SIZE	SZ_4K
 #define TBV_TBNET_E2E			BIT(0)
 #define TBV_TBNET_MATCH_FRAGS_ID	BIT(1)
@@ -50,6 +51,7 @@ struct tbv_tbnet_minimal_frame {
 	struct ring_frame frame;
 	struct list_head node;
 	struct tbv_tbnet_minimal_session *session;
+	struct page *page;
 	void *buf;
 	dma_addr_t dma;
 	bool tx;
@@ -197,14 +199,16 @@ tbv_tbnet_minimal_alloc_frame_array(struct tbv_tbnet_minimal_session *session,
 		INIT_LIST_HEAD(&f->frame.list);
 		f->session = session;
 		f->tx = tx;
-		f->buf = kzalloc(TBV_TBNET_MIN_FRAME_SIZE, GFP_KERNEL);
-		if (!f->buf)
+		f->page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!f->page)
 			goto err;
+		f->buf = page_address(f->page);
 
-		f->dma = dma_map_single(dma_dev, f->buf,
-					TBV_TBNET_MIN_FRAME_SIZE, dir);
+		f->dma = dma_map_page(dma_dev, f->page, 0,
+				      TBV_TBNET_MIN_FRAME_SIZE, dir);
 		if (dma_mapping_error(dma_dev, f->dma)) {
-			kfree(f->buf);
+			__free_page(f->page);
+			f->page = NULL;
 			f->buf = NULL;
 			goto err;
 		}
@@ -225,11 +229,13 @@ err:
 	while (i--) {
 		struct tbv_tbnet_minimal_frame *f = &frames[i];
 
-		if (!f->buf)
+		if (!f->page)
 			continue;
-		dma_unmap_single(dma_dev, f->dma, TBV_TBNET_MIN_FRAME_SIZE,
-				 dir);
-		kfree(f->buf);
+		dma_unmap_page(dma_dev, f->dma, TBV_TBNET_MIN_FRAME_SIZE,
+			       dir);
+		__free_page(f->page);
+		f->page = NULL;
+		f->buf = NULL;
 	}
 	kfree(frames);
 	return -ENOMEM;
@@ -249,11 +255,11 @@ tbv_tbnet_minimal_free_frame_array(struct tbv_tbnet_minimal_frame *frames,
 	for (i = 0; i < TBV_TBNET_MIN_RING_SIZE; i++) {
 		struct tbv_tbnet_minimal_frame *f = &frames[i];
 
-		if (!f->buf)
+		if (!f->page)
 			continue;
-		dma_unmap_single(dma_dev, f->dma, TBV_TBNET_MIN_FRAME_SIZE,
-				 tx ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
-		kfree(f->buf);
+		dma_unmap_page(dma_dev, f->dma, TBV_TBNET_MIN_FRAME_SIZE,
+			       tx ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+		__free_page(f->page);
 	}
 	kfree(frames);
 }
@@ -423,11 +429,13 @@ tbv_tbnet_minimal_send_frame(struct tbv_tbnet_minimal_session *session,
 
 	ret = tb_ring_tx(session->tx_ring, &f->frame);
 	if (!ret) {
+		atomic64_inc(&session->identity->minimal_packet_tx_posted);
 		schedule_delayed_work(&session->tx_poll_work,
 				      msecs_to_jiffies(1));
 		return 0;
 	}
 
+	atomic64_inc(&session->identity->minimal_packet_tx_errors);
 	atomic_dec(&session->tx_inflight);
 	spin_lock_irqsave(&session->tx_lock, flags);
 	list_add_tail(&f->node, &session->tx_free);
