@@ -440,9 +440,15 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 
 	tbv_service_state = state;
 
+	if (state->cfg.tbnet_identity == TBV_TBNET_ID_MINIMAL_PACKET) {
+		ret = tbv_tbnet_minimal_start(&state->tbnet_identity);
+		if (ret)
+			goto err_clear;
+	}
+
 	ret = tbv_native_control_start(state);
 	if (ret)
-		goto err_clear;
+		goto err_stop_minimal;
 
 	ret = tbv_register_native_dirs(state, service_cfg->native_prtcstns);
 	if (ret)
@@ -472,6 +478,8 @@ err_unregister_apple:
 	}
 err_unregister_native:
 	tbv_unregister_native_dirs(state);
+err_stop_minimal:
+	tbv_tbnet_minimal_stop(&state->tbnet_identity);
 err_clear:
 	tbv_native_control_stop(state);
 	tbv_service_state = NULL;
@@ -485,6 +493,7 @@ void tbv_services_stop(struct tbv_state *state)
 		state->services_registered = false;
 	}
 
+	tbv_tbnet_minimal_stop(&state->tbnet_identity);
 	tbv_native_control_stop(state);
 
 	if (state->apple_dir) {

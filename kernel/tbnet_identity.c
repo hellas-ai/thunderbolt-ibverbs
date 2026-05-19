@@ -2,9 +2,10 @@
 /*
  * Apple-compatible TBnet identity policy.
  *
- * This file will eventually own the minimal ThunderboltIP identity backend.
- * For now it validates profile combinations so the public module starts with
- * explicit behavior instead of hidden Mac-specific assumptions.
+ * This file owns mode selection, stock Thunderbolt-net proxying, and shared
+ * ThunderboltIP/ARP helpers. The minimal packet backend lives in
+ * tbnet_minimal.c so the stock and owned-packet paths remain mechanically
+ * separate.
  */
 
 #define pr_fmt(fmt) "thunderbolt_ibverbs: " fmt
@@ -38,13 +39,6 @@
 #define TBV_ARPOP_REQUEST		1
 #define TBV_ARPOP_REPLY		2
 
-enum tbv_tbip_type {
-	TBV_TBIP_LOGIN,
-	TBV_TBIP_LOGIN_RESPONSE,
-	TBV_TBIP_LOGOUT,
-	TBV_TBIP_STATUS,
-};
-
 struct tbv_tbip_header {
 	u32 route_hi;
 	u32 route_lo;
@@ -69,6 +63,15 @@ struct tbv_tbip_login_response {
 	u32 receiver_mac[2];
 	u32 receiver_mac_len;
 	u32 reserved[4];
+};
+
+struct tbv_tbip_logout {
+	struct tbv_tbip_header hdr;
+};
+
+struct tbv_tbip_status {
+	struct tbv_tbip_header hdr;
+	u32 status;
 };
 
 struct tbv_ethhdr {
@@ -154,32 +157,136 @@ int tbv_tbip_build_login_response(void *buf, size_t size,
 	return sizeof(*msg);
 }
 
-int tbv_tbip_parse_login(const void *buf, size_t size,
-			 struct tbv_tbip_login_params *params)
+int tbv_tbip_build_logout(void *buf, size_t size,
+			  const struct tbv_tbip_control *ctrl)
 {
-	const struct tbv_tbip_login *msg = buf;
+	struct tbv_tbip_logout *msg = buf;
+
+	if (!buf || !ctrl)
+		return -EINVAL;
+	if (size < sizeof(*msg))
+		return -ENOSPC;
+
+	memset(msg, 0, sizeof(*msg));
+	tbv_tbip_fill_header(&msg->hdr, ctrl, TBV_TBIP_LOGOUT, sizeof(*msg));
+	return sizeof(*msg);
+}
+
+int tbv_tbip_build_status(void *buf, size_t size,
+			  const struct tbv_tbip_status_params *params)
+{
+	struct tbv_tbip_status *msg = buf;
 
 	if (!buf || !params)
 		return -EINVAL;
 	if (size < sizeof(*msg))
+		return -ENOSPC;
+
+	memset(msg, 0, sizeof(*msg));
+	tbv_tbip_fill_header(&msg->hdr, &params->ctrl, TBV_TBIP_STATUS,
+			     sizeof(*msg));
+	msg->status = params->status;
+	return sizeof(*msg);
+}
+
+static int tbv_tbip_parse_header(const void *buf, size_t size,
+				 enum tbv_tbip_type *type,
+				 struct tbv_tbip_control *ctrl)
+{
+	const struct tbv_tbip_header *hdr = buf;
+
+	if (!buf)
 		return -EINVAL;
-	if (!uuid_equal(&msg->hdr.uuid, &tbv_tbip_uuid))
+	if (size < sizeof(*hdr))
+		return -EINVAL;
+	if (!uuid_equal(&hdr->uuid, &tbv_tbip_uuid))
 		return -EPROTO;
-	if (msg->hdr.type != TBV_TBIP_LOGIN)
+
+	switch (hdr->type) {
+	case TBV_TBIP_LOGIN:
+	case TBV_TBIP_LOGIN_RESPONSE:
+	case TBV_TBIP_LOGOUT:
+	case TBV_TBIP_STATUS:
+		break;
+	default:
+		return -EPROTO;
+	}
+
+	if (type)
+		*type = hdr->type;
+	if (ctrl) {
+		memset(ctrl, 0, sizeof(*ctrl));
+		ctrl->route = ((u64)hdr->route_hi << 32) | hdr->route_lo;
+		ctrl->route &= ~BIT_ULL(63);
+		ctrl->sequence = (hdr->length_sn & TBV_TBIP_HDR_SN_MASK) >>
+				 TBV_TBIP_HDR_SN_SHIFT;
+		uuid_copy(&ctrl->initiator_uuid, &hdr->initiator_uuid);
+		uuid_copy(&ctrl->target_uuid, &hdr->target_uuid);
+		ctrl->command_id = hdr->command_id;
+	}
+
+	return 0;
+}
+
+int tbv_tbip_parse_type(const void *buf, size_t size,
+			enum tbv_tbip_type *type,
+			struct tbv_tbip_control *ctrl)
+{
+	if (!type)
+		return -EINVAL;
+
+	return tbv_tbip_parse_header(buf, size, type, ctrl);
+}
+
+int tbv_tbip_parse_login(const void *buf, size_t size,
+			 struct tbv_tbip_login_params *params)
+{
+	const struct tbv_tbip_login *msg = buf;
+	enum tbv_tbip_type type;
+	int ret;
+
+	if (!params)
+		return -EINVAL;
+	if (size < sizeof(*msg))
+		return -EINVAL;
+
+	ret = tbv_tbip_parse_header(buf, size, &type, &params->ctrl);
+	if (ret)
+		return ret;
+	if (type != TBV_TBIP_LOGIN)
 		return -EPROTO;
 	if (msg->proto_version != TBV_TBIP_LOGIN_PROTO_VERSION)
 		return -EPROTONOSUPPORT;
 
-	memset(params, 0, sizeof(*params));
-	params->ctrl.route = ((u64)msg->hdr.route_hi << 32) |
-			     msg->hdr.route_lo;
-	params->ctrl.route &= ~BIT_ULL(63);
-	params->ctrl.sequence = (msg->hdr.length_sn & TBV_TBIP_HDR_SN_MASK) >>
-				TBV_TBIP_HDR_SN_SHIFT;
-	uuid_copy(&params->ctrl.initiator_uuid, &msg->hdr.initiator_uuid);
-	uuid_copy(&params->ctrl.target_uuid, &msg->hdr.target_uuid);
-	params->ctrl.command_id = msg->hdr.command_id;
 	params->transmit_path = msg->transmit_path;
+	return 0;
+}
+
+int tbv_tbip_parse_login_response(const void *buf, size_t size,
+				  struct tbv_tbip_login_response_result *result)
+{
+	const struct tbv_tbip_login_response *msg = buf;
+	enum tbv_tbip_type type;
+	int ret;
+
+	if (!result)
+		return -EINVAL;
+	if (size < sizeof(*msg))
+		return -EINVAL;
+
+	memset(result, 0, sizeof(*result));
+	ret = tbv_tbip_parse_header(buf, size, &type, &result->ctrl);
+	if (ret)
+		return ret;
+	if (type != TBV_TBIP_LOGIN_RESPONSE)
+		return -EPROTO;
+	if (msg->receiver_mac_len > TBV_ETH_ALEN)
+		return -EPROTO;
+
+	result->status = msg->status;
+	result->receiver_mac_len = msg->receiver_mac_len;
+	memcpy(result->receiver_mac, msg->receiver_mac,
+	       min_t(u32, msg->receiver_mac_len, TBV_ETH_ALEN));
 	return 0;
 }
 
@@ -396,16 +503,63 @@ static unsigned long tbv_tbnet_identity_packet_state(struct net_device *dev)
 	return state;
 }
 
-static int tbv_tbnet_identity_refresh_locked(struct tbv_tbnet_identity *identity)
+static void tbv_tbnet_identity_put_gid_locked(struct tbv_tbnet_identity *identity)
+{
+	if (identity->gid_dev) {
+		dev_put(identity->gid_dev);
+		identity->gid_dev = NULL;
+	}
+	identity->proxy_ipv4 = 0;
+}
+
+static int
+tbv_tbnet_identity_refresh_minimal_locked(struct tbv_tbnet_identity *identity)
+{
+	struct net_device *gid_dev;
+	__be32 proxy_ipv4;
+
+	if (!identity->gid_netdev_name[0]) {
+		tbv_tbnet_identity_put_gid_locked(identity);
+		tbv_tbnet_minimal_recompute_state_locked(identity);
+		return 0;
+	}
+
+	gid_dev = dev_get_by_name(&init_net, identity->gid_netdev_name);
+	if (!gid_dev) {
+		tbv_tbnet_identity_put_gid_locked(identity);
+		tbv_tbnet_minimal_recompute_state_locked(identity);
+		return 0;
+	}
+
+	proxy_ipv4 = tbv_netdev_first_ipv4_rtnl(gid_dev);
+	if (!proxy_ipv4) {
+		dev_put(gid_dev);
+		tbv_tbnet_identity_put_gid_locked(identity);
+		tbv_tbnet_minimal_recompute_state_locked(identity);
+		return 0;
+	}
+
+	if (identity->gid_dev == gid_dev && identity->proxy_ipv4 == proxy_ipv4) {
+		dev_put(gid_dev);
+		tbv_tbnet_minimal_recompute_state_locked(identity);
+		return 0;
+	}
+
+	tbv_tbnet_identity_put_gid_locked(identity);
+	identity->gid_dev = gid_dev;
+	identity->proxy_ipv4 = proxy_ipv4;
+	tbv_tbnet_minimal_recompute_state_locked(identity);
+	return 0;
+}
+
+static int
+tbv_tbnet_identity_refresh_stock_proxy_locked(struct tbv_tbnet_identity *identity)
 {
 	struct net_device *tbnet_dev;
 	struct net_device *gid_dev;
 	unsigned long packet_state;
 	__be32 proxy_ipv4;
 	int ret;
-
-	if (identity->mode != TBV_TBNET_ID_STOCK_PROXY)
-		return 0;
 
 	if (!identity->tbnet_netdev_name[0] || !identity->gid_netdev_name[0]) {
 		tbv_tbnet_identity_disarm_locked(identity);
@@ -474,6 +628,18 @@ static int tbv_tbnet_identity_refresh_locked(struct tbv_tbnet_identity *identity
 		identity->tbnet_netdev_name, &proxy_ipv4,
 		identity->gid_netdev_name);
 	return 0;
+}
+
+static int tbv_tbnet_identity_refresh_locked(struct tbv_tbnet_identity *identity)
+{
+	switch (identity->mode) {
+	case TBV_TBNET_ID_STOCK_PROXY:
+		return tbv_tbnet_identity_refresh_stock_proxy_locked(identity);
+	case TBV_TBNET_ID_MINIMAL_PACKET:
+		return tbv_tbnet_identity_refresh_minimal_locked(identity);
+	default:
+		return 0;
+	}
 }
 
 static rx_handler_result_t tbv_tbnet_identity_rx_handler(struct sk_buff **pskb)
@@ -579,6 +745,39 @@ static int tbv_tbnet_identity_inetaddr_event(struct notifier_block *nb,
 	return NOTIFY_DONE;
 }
 
+static void tbv_tbnet_identity_unregister_notifiers(struct tbv_tbnet_identity *identity)
+{
+	if (identity->inetaddr_nb_registered) {
+		unregister_inetaddr_notifier(&identity->inetaddr_nb);
+		identity->inetaddr_nb_registered = false;
+	}
+
+	if (identity->netdev_nb_registered) {
+		unregister_netdevice_notifier(&identity->netdev_nb);
+		identity->netdev_nb_registered = false;
+	}
+}
+
+static int tbv_tbnet_identity_register_notifiers(struct tbv_tbnet_identity *identity)
+{
+	int ret;
+
+	identity->netdev_nb.notifier_call = tbv_tbnet_identity_netdev_event;
+	ret = register_netdevice_notifier(&identity->netdev_nb);
+	if (ret)
+		return ret;
+	identity->netdev_nb_registered = true;
+
+	identity->inetaddr_nb.notifier_call = tbv_tbnet_identity_inetaddr_event;
+	ret = register_inetaddr_notifier(&identity->inetaddr_nb);
+	if (ret) {
+		tbv_tbnet_identity_unregister_notifiers(identity);
+		return ret;
+	}
+	identity->inetaddr_nb_registered = true;
+	return 0;
+}
+
 int tbv_tbnet_identity_check_config(const struct tbv_resolved_config *cfg)
 {
 	const struct tbv_config *requested = &cfg->requested;
@@ -594,6 +793,12 @@ int tbv_tbnet_identity_check_config(const struct tbv_resolved_config *cfg)
 	     cfg->tbnet_identity == TBV_TBNET_ID_STOCK_PROXY)) {
 		pr_err("tbnet=block conflicts with tbnet_identity=%s\n",
 		       tbv_tbnet_identity_name(cfg->tbnet_identity));
+		return -EINVAL;
+	}
+
+	if (cfg->tbnet_identity == TBV_TBNET_ID_MINIMAL_PACKET &&
+	    requested->tbnet == TBV_TBNET_ALLOW) {
+		pr_err("tbnet_identity=minimal_packet owns the ThunderboltIP network service; use tbnet=block or tbnet=prefer_rdma\n");
 		return -EINVAL;
 	}
 
@@ -617,6 +822,7 @@ int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,
 	memset(identity, 0, sizeof(*identity));
 	identity->mode = cfg->tbnet_identity;
 	mutex_init(&identity->lock);
+	INIT_LIST_HEAD(&identity->minimal_sessions);
 
 	if (!cfg->apple_enabled || cfg->tbnet_identity == TBV_TBNET_ID_OFF)
 		return 0;
@@ -651,21 +857,8 @@ int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,
 			return ret;
 		}
 
-		identity->netdev_nb.notifier_call =
-			tbv_tbnet_identity_netdev_event;
-		ret = register_netdevice_notifier(&identity->netdev_nb);
+		ret = tbv_tbnet_identity_register_notifiers(identity);
 		if (ret) {
-			mutex_destroy(&identity->lock);
-			return ret;
-		}
-		identity->netdev_nb_registered = true;
-
-		identity->inetaddr_nb.notifier_call =
-			tbv_tbnet_identity_inetaddr_event;
-		ret = register_inetaddr_notifier(&identity->inetaddr_nb);
-		if (ret) {
-			unregister_netdevice_notifier(&identity->netdev_nb);
-			identity->netdev_nb_registered = false;
 			rtnl_lock();
 			mutex_lock(&identity->lock);
 			tbv_tbnet_identity_disarm_locked(identity);
@@ -689,9 +882,32 @@ int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,
 		return 0;
 
 	case TBV_TBNET_ID_MINIMAL_PACKET:
-		pr_err("tbnet_identity=minimal_packet is designed but not implemented\n");
-		mutex_destroy(&identity->lock);
-		return -EOPNOTSUPP;
+		gid_name = identity_cfg ? identity_cfg->gid_netdev : "auto";
+		gid_name = tbv_identity_resolve_gid_name(gid_name);
+		ret = tbv_identity_copy_netdev_name(identity->gid_netdev_name,
+						    gid_name,
+						    "tbnet_identity_gid");
+		if (ret) {
+			mutex_destroy(&identity->lock);
+			return ret;
+		}
+
+		ret = tbv_tbnet_identity_register_notifiers(identity);
+		if (ret) {
+			mutex_destroy(&identity->lock);
+			return ret;
+		}
+
+		rtnl_lock();
+		mutex_lock(&identity->lock);
+		tbv_tbnet_identity_refresh_locked(identity);
+		mutex_unlock(&identity->lock);
+		rtnl_unlock();
+
+		pr_info("TBnet identity uses minimal ThunderboltIP packet responder gid=%s\n",
+			identity->gid_netdev_name[0] ?
+			identity->gid_netdev_name : "<unset>");
+		return 0;
 
 	case TBV_TBNET_ID_AUTO:
 	case TBV_TBNET_ID_OFF:
@@ -702,15 +918,8 @@ int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,
 
 void tbv_tbnet_identity_stop(struct tbv_tbnet_identity *identity)
 {
-	if (identity->inetaddr_nb_registered) {
-		unregister_inetaddr_notifier(&identity->inetaddr_nb);
-		identity->inetaddr_nb_registered = false;
-	}
-
-	if (identity->netdev_nb_registered) {
-		unregister_netdevice_notifier(&identity->netdev_nb);
-		identity->netdev_nb_registered = false;
-	}
+	tbv_tbnet_identity_unregister_notifiers(identity);
+	tbv_tbnet_minimal_stop(identity);
 
 	rtnl_lock();
 	mutex_lock(&identity->lock);

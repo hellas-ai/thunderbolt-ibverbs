@@ -38,6 +38,18 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   &state->tbnet_identity.proxy_ipv4);
 	seq_printf(s, "tbnet_identity_rx_handler: %u\n",
 		   state->tbnet_identity.rx_handler_registered);
+	seq_printf(s, "tbnet_identity_minimal_started: %u\n",
+		   state->tbnet_identity.minimal_started);
+	seq_printf(s, "tbnet_identity_minimal_login_rx: %lld\n",
+		   atomic64_read(&state->tbnet_identity.minimal_login_rx));
+	seq_printf(s, "tbnet_identity_minimal_login_tx: %lld\n",
+		   atomic64_read(&state->tbnet_identity.minimal_login_tx));
+	seq_printf(s, "tbnet_identity_minimal_packet_rx: %lld\n",
+		   atomic64_read(&state->tbnet_identity.minimal_packet_rx));
+	seq_printf(s, "tbnet_identity_minimal_packet_tx: %lld\n",
+		   atomic64_read(&state->tbnet_identity.minimal_packet_tx));
+	seq_printf(s, "tbnet_identity_minimal_path_errors: %lld\n",
+		   atomic64_read(&state->tbnet_identity.minimal_path_errors));
 	seq_printf(s, "tbnet_identity_arp_requests: %lld\n",
 		   atomic64_read(&state->tbnet_identity.arp_requests));
 	seq_printf(s, "tbnet_identity_arp_replies: %lld\n",

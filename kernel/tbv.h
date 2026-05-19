@@ -37,6 +37,9 @@
 #define TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE	BIT(2)
 #define TBV_TBNET_ID_STATE_FULL_IP_ACTIVE	BIT(3)
 
+struct tb_property_dir;
+struct tbv_tbnet_minimal_session;
+
 enum tbv_compat_mode {
 	TBV_COMPAT_AUTO,
 	TBV_COMPAT_FORCE,
@@ -231,6 +234,8 @@ struct tbv_tbnet_identity {
 	enum tbv_tbnet_identity_mode mode;
 	unsigned long state;
 	struct mutex lock;
+	struct list_head minimal_sessions;
+	struct tb_property_dir *minimal_dir;
 	char tbnet_netdev_name[IFNAMSIZ];
 	char gid_netdev_name[IFNAMSIZ];
 	struct net_device *tbnet_dev;
@@ -238,13 +243,28 @@ struct tbv_tbnet_identity {
 	struct notifier_block netdev_nb;
 	struct notifier_block inetaddr_nb;
 	__be32 proxy_ipv4;
+	bool minimal_dir_registered;
+	bool minimal_driver_registered;
+	bool minimal_started;
 	bool netdev_nb_registered;
 	bool inetaddr_nb_registered;
 	bool rx_handler_registered;
+	atomic64_t minimal_login_rx;
+	atomic64_t minimal_login_tx;
+	atomic64_t minimal_packet_rx;
+	atomic64_t minimal_packet_tx;
+	atomic64_t minimal_path_errors;
 	atomic64_t arp_requests;
 	atomic64_t arp_replies;
 	atomic64_t arp_ignored;
 	atomic64_t arp_errors;
+};
+
+enum tbv_tbip_type {
+	TBV_TBIP_LOGIN,
+	TBV_TBIP_LOGIN_RESPONSE,
+	TBV_TBIP_LOGOUT,
+	TBV_TBIP_STATUS,
 };
 
 struct tbv_tbip_control {
@@ -264,6 +284,18 @@ struct tbv_tbip_login_response_params {
 	struct tbv_tbip_control ctrl;
 	u32 status;
 	u8 receiver_mac[TBV_ETH_ALEN];
+};
+
+struct tbv_tbip_status_params {
+	struct tbv_tbip_control ctrl;
+	u32 status;
+};
+
+struct tbv_tbip_login_response_result {
+	struct tbv_tbip_control ctrl;
+	u32 status;
+	u8 receiver_mac[TBV_ETH_ALEN];
+	u32 receiver_mac_len;
 };
 
 struct tbv_tbnet_arp_proxy {
@@ -410,11 +442,23 @@ int tbv_tbip_build_login(void *buf, size_t size,
 			 const struct tbv_tbip_login_params *params);
 int tbv_tbip_build_login_response(void *buf, size_t size,
 				  const struct tbv_tbip_login_response_params *params);
+int tbv_tbip_build_logout(void *buf, size_t size,
+			  const struct tbv_tbip_control *ctrl);
+int tbv_tbip_build_status(void *buf, size_t size,
+			  const struct tbv_tbip_status_params *params);
+int tbv_tbip_parse_type(const void *buf, size_t size,
+			enum tbv_tbip_type *type,
+			struct tbv_tbip_control *ctrl);
 int tbv_tbip_parse_login(const void *buf, size_t size,
 			 struct tbv_tbip_login_params *params);
+int tbv_tbip_parse_login_response(const void *buf, size_t size,
+				  struct tbv_tbip_login_response_result *result);
 int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
 				    const void *request, size_t request_size,
 				    const struct tbv_tbnet_arp_proxy *proxy);
+int tbv_tbnet_minimal_start(struct tbv_tbnet_identity *identity);
+void tbv_tbnet_minimal_stop(struct tbv_tbnet_identity *identity);
+void tbv_tbnet_minimal_recompute_state_locked(struct tbv_tbnet_identity *identity);
 struct tb_property_dir *tbv_service_create_native_dir(void);
 struct tb_property_dir *tbv_service_create_apple_dir(u32 prtcstns);
 int tbv_services_start(struct tbv_state *state, bool bind_services,

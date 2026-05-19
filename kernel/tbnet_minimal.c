@@ -1,0 +1,1016 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Minimal ThunderboltIP packet identity backend.
+ *
+ * This is not a replacement for Linux's full thunderbolt_net driver. It owns
+ * only the small packet surface the Apple-compatible RDMA backend needs:
+ * ThunderboltIP LOGIN/LOGOUT, one framed packet path, and ARP replies for the
+ * RDMA GID. Other Ethernet traffic is intentionally ignored.
+ */
+
+#define pr_fmt(fmt) "thunderbolt_ibverbs: " fmt
+
+#include <linux/bitops.h>
+#include <linux/delay.h>
+#include <linux/dma-mapping.h>
+#include <linux/errno.h>
+#include <linux/etherdevice.h>
+#include <linux/jhash.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/thunderbolt.h>
+#include <linux/uuid.h>
+#include <linux/workqueue.h>
+
+#include "tbv.h"
+
+#define TBV_TBNET_MIN_LOGIN_DELAY_MS	4500
+#define TBV_TBNET_MIN_LOGIN_TIMEOUT_MS	500
+#define TBV_TBNET_MIN_LOGIN_RETRIES	60
+#define TBV_TBNET_MIN_LOGOUT_TIMEOUT_MS	1000
+#define TBV_TBNET_MIN_RING_SIZE		64
+#define TBV_TBNET_MIN_FRAME_SIZE	SZ_4K
+#define TBV_TBNET_E2E			BIT(0)
+#define TBV_TBNET_MATCH_FRAGS_ID	BIT(1)
+#define TBV_TBNET_64K_FRAMES		BIT(2)
+#define TBV_TBNET_L0_PORT_NUM(route)	((route) & GENMASK(5, 0))
+#define TBV_TBNET_PDF_FRAME_START	1
+#define TBV_TBNET_PDF_FRAME_END		2
+
+struct tbv_tbnet_frame_header {
+	__le32 frame_size;
+	__le16 frame_index;
+	__le16 frame_id;
+	__le32 frame_count;
+} __packed;
+
+struct tbv_tbnet_minimal_frame {
+	struct ring_frame frame;
+	struct list_head node;
+	struct tbv_tbnet_minimal_session *session;
+	void *buf;
+	dma_addr_t dma;
+	bool tx;
+};
+
+struct tbv_tbnet_minimal_session {
+	struct list_head node;
+	struct tbv_tbnet_identity *identity;
+	const struct tb_service *svc;
+	struct tb_xdomain *xd;
+	struct tb_protocol_handler handler;
+	struct mutex lock;
+	spinlock_t tx_lock;
+	struct delayed_work login_work;
+	struct work_struct connected_work;
+	struct work_struct disconnect_work;
+	struct work_struct rx_work;
+	struct delayed_work tx_poll_work;
+	struct tb_ring *tx_ring;
+	struct tb_ring *rx_ring;
+	struct tbv_tbnet_minimal_frame *tx_frames;
+	struct tbv_tbnet_minimal_frame *rx_frames;
+	struct list_head tx_free;
+	atomic_t command_id;
+	atomic_t frame_id;
+	atomic_t tx_inflight;
+	u8 mac[TBV_ETH_ALEN];
+	int local_transmit_path;
+	int remote_transmit_path;
+	int login_retries;
+	bool rings_started;
+	bool path_enabled;
+	bool login_sent;
+	bool login_received;
+	bool removing;
+};
+
+/* Network property directory UUID: c66189ca-1cce-4195-bdb8-49592e5f5a4f */
+static const uuid_t tbv_tbnet_dir_uuid =
+	UUID_INIT(0xc66189ca, 0x1cce, 0x4195, 0xbd, 0xb8,
+		  0x49, 0x59, 0x2e, 0x5f, 0x5a, 0x4f);
+
+/* ThunderboltIP protocol UUID: 798f589e-3616-8a47-97c6-5664a920c8dd */
+static const uuid_t tbv_tbnet_svc_uuid =
+	UUID_INIT(0x798f589e, 0x3616, 0x8a47, 0x97, 0xc6,
+		  0x56, 0x64, 0xa9, 0x20, 0xc8, 0xdd);
+
+static struct tbv_tbnet_identity *tbv_tbnet_minimal_identity;
+
+static void tbv_tbnet_minimal_login_work(struct work_struct *work);
+static void tbv_tbnet_minimal_connected_work(struct work_struct *work);
+static void tbv_tbnet_minimal_disconnect_work(struct work_struct *work);
+static void tbv_tbnet_minimal_rx_work(struct work_struct *work);
+static void tbv_tbnet_minimal_tx_poll_work(struct work_struct *work);
+
+static void
+tbv_tbnet_minimal_fill_reply_ctrl(struct tbv_tbnet_minimal_session *session,
+				  const struct tbv_tbip_control *request,
+				  struct tbv_tbip_control *reply)
+{
+	memset(reply, 0, sizeof(*reply));
+	reply->route = request->route;
+	reply->sequence = request->sequence;
+	uuid_copy(&reply->initiator_uuid, session->xd->local_uuid);
+	uuid_copy(&reply->target_uuid, session->xd->remote_uuid);
+	reply->command_id = request->command_id;
+}
+
+static bool
+tbv_tbnet_minimal_ctrl_matches(const struct tbv_tbnet_minimal_session *session,
+			       const struct tbv_tbip_control *ctrl)
+{
+	return ctrl->route == session->xd->route &&
+	       uuid_equal(&ctrl->initiator_uuid, session->xd->remote_uuid) &&
+	       uuid_equal(&ctrl->target_uuid, session->xd->local_uuid);
+}
+
+static u32 tbv_tbnet_minimal_frame_len(const struct ring_frame *frame)
+{
+	return frame->size ? frame->size : (u32)TBV_TBNET_MIN_FRAME_SIZE;
+}
+
+static void tbv_tbnet_minimal_generate_mac(struct tbv_tbnet_minimal_session *s)
+{
+	u8 phy_port = tb_phy_port_from_link(TBV_TBNET_L0_PORT_NUM(s->xd->route));
+	u32 hash;
+
+	s->mac[0] = (phy_port << 4) | 0x02;
+	hash = jhash2((const u32 *)s->xd->local_uuid, 4, 0);
+	memcpy(s->mac + 1, &hash, sizeof(hash));
+	hash = jhash2((const u32 *)s->xd->local_uuid, 4, hash);
+	s->mac[5] = hash & 0xff;
+}
+
+static void
+tbv_tbnet_minimal_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
+			      bool canceled)
+{
+	struct tbv_tbnet_minimal_frame *f =
+		container_of(frame, struct tbv_tbnet_minimal_frame, frame);
+	struct tbv_tbnet_minimal_session *session = f->session;
+	unsigned long flags;
+
+	dma_sync_single_for_cpu(tb_ring_dma_device(ring), f->dma,
+				TBV_TBNET_MIN_FRAME_SIZE, DMA_TO_DEVICE);
+	f->frame.size = 0;
+	f->frame.flags = 0;
+	f->frame.sof = TBV_TBNET_PDF_FRAME_START;
+	f->frame.eof = TBV_TBNET_PDF_FRAME_END;
+
+	spin_lock_irqsave(&session->tx_lock, flags);
+	list_add_tail(&f->node, &session->tx_free);
+	spin_unlock_irqrestore(&session->tx_lock, flags);
+	atomic_dec(&session->tx_inflight);
+
+	if (!canceled)
+		atomic64_inc(&session->identity->minimal_packet_tx);
+}
+
+static void tbv_tbnet_minimal_rx_ready(void *data)
+{
+	struct tbv_tbnet_minimal_session *session = data;
+
+	schedule_work(&session->rx_work);
+}
+
+static int
+tbv_tbnet_minimal_alloc_frame_array(struct tbv_tbnet_minimal_session *session,
+				    struct tbv_tbnet_minimal_frame **out,
+				    struct tb_ring *ring, bool tx)
+{
+	struct device *dma_dev = tb_ring_dma_device(ring);
+	enum dma_data_direction dir = tx ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
+	struct tbv_tbnet_minimal_frame *frames;
+	u32 i;
+
+	frames = kcalloc(TBV_TBNET_MIN_RING_SIZE, sizeof(*frames), GFP_KERNEL);
+	if (!frames)
+		return -ENOMEM;
+
+	for (i = 0; i < TBV_TBNET_MIN_RING_SIZE; i++) {
+		struct tbv_tbnet_minimal_frame *f = &frames[i];
+
+		INIT_LIST_HEAD(&f->node);
+		INIT_LIST_HEAD(&f->frame.list);
+		f->session = session;
+		f->tx = tx;
+		f->buf = kzalloc(TBV_TBNET_MIN_FRAME_SIZE, GFP_KERNEL);
+		if (!f->buf)
+			goto err;
+
+		f->dma = dma_map_single(dma_dev, f->buf,
+					TBV_TBNET_MIN_FRAME_SIZE, dir);
+		if (dma_mapping_error(dma_dev, f->dma)) {
+			kfree(f->buf);
+			f->buf = NULL;
+			goto err;
+		}
+
+		f->frame.buffer_phy = f->dma;
+		f->frame.sof = TBV_TBNET_PDF_FRAME_START;
+		f->frame.eof = TBV_TBNET_PDF_FRAME_END;
+		if (tx) {
+			f->frame.callback = tbv_tbnet_minimal_tx_complete;
+			list_add_tail(&f->node, &session->tx_free);
+		}
+	}
+
+	*out = frames;
+	return 0;
+
+err:
+	while (i--) {
+		struct tbv_tbnet_minimal_frame *f = &frames[i];
+
+		if (!f->buf)
+			continue;
+		dma_unmap_single(dma_dev, f->dma, TBV_TBNET_MIN_FRAME_SIZE,
+				 dir);
+		kfree(f->buf);
+	}
+	kfree(frames);
+	return -ENOMEM;
+}
+
+static void
+tbv_tbnet_minimal_free_frame_array(struct tbv_tbnet_minimal_frame *frames,
+				   struct tb_ring *ring, bool tx)
+{
+	struct device *dma_dev;
+	u32 i;
+
+	if (!frames || !ring)
+		return;
+
+	dma_dev = tb_ring_dma_device(ring);
+	for (i = 0; i < TBV_TBNET_MIN_RING_SIZE; i++) {
+		struct tbv_tbnet_minimal_frame *f = &frames[i];
+
+		if (!f->buf)
+			continue;
+		dma_unmap_single(dma_dev, f->dma, TBV_TBNET_MIN_FRAME_SIZE,
+				 tx ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+		kfree(f->buf);
+	}
+	kfree(frames);
+}
+
+static int tbv_tbnet_minimal_prime_rx(struct tbv_tbnet_minimal_session *session)
+{
+	u32 i;
+	int ret;
+
+	for (i = 0; i < TBV_TBNET_MIN_RING_SIZE; i++) {
+		struct tbv_tbnet_minimal_frame *f = &session->rx_frames[i];
+
+		f->frame.size = 0;
+		f->frame.flags = 0;
+		ret = tb_ring_rx(session->rx_ring, &f->frame);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int
+tbv_tbnet_minimal_alloc_rings(struct tbv_tbnet_minimal_session *session)
+{
+	unsigned int flags = RING_FLAG_FRAME;
+	u16 sof_mask = BIT(TBV_TBNET_PDF_FRAME_START);
+	u16 eof_mask = BIT(TBV_TBNET_PDF_FRAME_END);
+	int e2e_tx_hop = 0;
+	int hopid;
+	int ret;
+
+	if (session->svc->prtcstns & TBV_TBNET_E2E)
+		flags |= RING_FLAG_E2E;
+
+	session->tx_ring = tb_ring_alloc_tx(session->xd->tb->nhi, -1,
+					    TBV_TBNET_MIN_RING_SIZE, flags);
+	if (!session->tx_ring)
+		return -ENOMEM;
+
+	hopid = tb_xdomain_alloc_out_hopid(session->xd, -1);
+	if (hopid < 0) {
+		ret = hopid;
+		goto err_tx_ring;
+	}
+	session->local_transmit_path = hopid;
+
+	if (flags & RING_FLAG_E2E)
+		e2e_tx_hop = session->tx_ring->hop;
+
+	session->rx_ring = tb_ring_alloc_rx(session->xd->tb->nhi, -1,
+					    TBV_TBNET_MIN_RING_SIZE, flags,
+					    e2e_tx_hop, sof_mask, eof_mask,
+					    tbv_tbnet_minimal_rx_ready,
+					    session);
+	if (!session->rx_ring) {
+		ret = -ENOMEM;
+		goto err_out_hop;
+	}
+
+	ret = tbv_tbnet_minimal_alloc_frame_array(session, &session->tx_frames,
+						 session->tx_ring, true);
+	if (ret)
+		goto err_rx_ring;
+
+	ret = tbv_tbnet_minimal_alloc_frame_array(session, &session->rx_frames,
+						 session->rx_ring, false);
+	if (ret)
+		goto err_tx_frames;
+
+	return 0;
+
+err_tx_frames:
+	tbv_tbnet_minimal_free_frame_array(session->tx_frames,
+					   session->tx_ring, true);
+	session->tx_frames = NULL;
+err_rx_ring:
+	tb_ring_free(session->rx_ring);
+	session->rx_ring = NULL;
+err_out_hop:
+	tb_xdomain_release_out_hopid(session->xd, session->local_transmit_path);
+	session->local_transmit_path = 0;
+err_tx_ring:
+	tb_ring_free(session->tx_ring);
+	session->tx_ring = NULL;
+	return ret;
+}
+
+void tbv_tbnet_minimal_recompute_state_locked(struct tbv_tbnet_identity *identity)
+{
+	struct tbv_tbnet_minimal_session *session;
+	unsigned long state = 0;
+
+	if (identity->mode != TBV_TBNET_ID_MINIMAL_PACKET)
+		return;
+
+	list_for_each_entry(session, &identity->minimal_sessions, node) {
+		if (!READ_ONCE(session->path_enabled))
+			continue;
+		state |= TBV_TBNET_ID_STATE_CARRIER;
+		state |= TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE;
+		break;
+	}
+
+	if ((state & TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE) &&
+	    identity->proxy_ipv4)
+		state |= TBV_TBNET_ID_STATE_NEIGHBOR_READY;
+
+	identity->state = state;
+}
+
+static void tbv_tbnet_minimal_recompute_state(struct tbv_tbnet_identity *identity)
+{
+	mutex_lock(&identity->lock);
+	tbv_tbnet_minimal_recompute_state_locked(identity);
+	mutex_unlock(&identity->lock);
+}
+
+static int
+tbv_tbnet_minimal_send_frame(struct tbv_tbnet_minimal_session *session,
+			     const void *payload, u32 payload_len)
+{
+	struct tbv_tbnet_minimal_frame *f;
+	struct tbv_tbnet_frame_header *hdr;
+	unsigned long flags;
+	u16 frame_id;
+	int ret;
+
+	if (!payload_len ||
+	    payload_len > TBV_TBNET_MIN_FRAME_SIZE - sizeof(*hdr))
+		return -EINVAL;
+
+	mutex_lock(&session->lock);
+	if (!session->path_enabled || session->removing) {
+		mutex_unlock(&session->lock);
+		return -ENETDOWN;
+	}
+	mutex_unlock(&session->lock);
+
+	spin_lock_irqsave(&session->tx_lock, flags);
+	if (list_empty(&session->tx_free)) {
+		spin_unlock_irqrestore(&session->tx_lock, flags);
+		return -ENOMEM;
+	}
+	f = list_first_entry(&session->tx_free, struct tbv_tbnet_minimal_frame,
+			     node);
+	list_del_init(&f->node);
+	atomic_inc(&session->tx_inflight);
+	spin_unlock_irqrestore(&session->tx_lock, flags);
+
+	memset(f->buf, 0, TBV_TBNET_MIN_FRAME_SIZE);
+	hdr = f->buf;
+	frame_id = (u16)atomic_inc_return(&session->frame_id);
+	hdr->frame_size = cpu_to_le32(payload_len);
+	hdr->frame_index = cpu_to_le16(0);
+	hdr->frame_id = cpu_to_le16(frame_id);
+	hdr->frame_count = cpu_to_le32(1);
+	memcpy(hdr + 1, payload, payload_len);
+
+	f->frame.size = sizeof(*hdr) + payload_len;
+	f->frame.flags = 0;
+	f->frame.sof = TBV_TBNET_PDF_FRAME_START;
+	f->frame.eof = TBV_TBNET_PDF_FRAME_END;
+	dma_sync_single_for_device(tb_ring_dma_device(session->tx_ring),
+				   f->dma, TBV_TBNET_MIN_FRAME_SIZE,
+				   DMA_TO_DEVICE);
+
+	ret = tb_ring_tx(session->tx_ring, &f->frame);
+	if (!ret) {
+		schedule_delayed_work(&session->tx_poll_work,
+				      msecs_to_jiffies(1));
+		return 0;
+	}
+
+	atomic_dec(&session->tx_inflight);
+	spin_lock_irqsave(&session->tx_lock, flags);
+	list_add_tail(&f->node, &session->tx_free);
+	spin_unlock_irqrestore(&session->tx_lock, flags);
+	return ret;
+}
+
+static int
+tbv_tbnet_minimal_send_arp_reply(struct tbv_tbnet_minimal_session *session,
+				 const void *request, u32 request_len)
+{
+	struct tbv_tbnet_arp_proxy proxy;
+	u8 reply[sizeof(struct tbv_tbnet_frame_header) + 64];
+	__be32 proxy_ipv4;
+	int ret;
+
+	proxy_ipv4 = READ_ONCE(session->identity->proxy_ipv4);
+	if (!proxy_ipv4)
+		return -ENOENT;
+
+	memset(&proxy, 0, sizeof(proxy));
+	proxy.ipv4 = proxy_ipv4;
+	memcpy(proxy.mac, session->mac, sizeof(proxy.mac));
+
+	ret = tbv_tbnet_arp_reply_for_request(reply, sizeof(reply),
+					      request, request_len, &proxy);
+	if (ret <= 0)
+		return ret;
+
+	atomic64_inc(&session->identity->arp_requests);
+	ret = tbv_tbnet_minimal_send_frame(session, reply, ret);
+	if (ret) {
+		atomic64_inc(&session->identity->arp_errors);
+		return ret;
+	}
+
+	atomic64_inc(&session->identity->arp_replies);
+	return 0;
+}
+
+static void
+tbv_tbnet_minimal_handle_rx_frame(struct tbv_tbnet_minimal_session *session,
+				  struct tbv_tbnet_minimal_frame *f,
+				  u32 frame_len)
+{
+	const struct tbv_tbnet_frame_header *hdr = f->buf;
+	u32 payload_len;
+	u32 frame_count;
+	u16 frame_index;
+	int ret;
+
+	if (frame_len < sizeof(*hdr)) {
+		atomic64_inc(&session->identity->minimal_path_errors);
+		return;
+	}
+
+	payload_len = le32_to_cpu(hdr->frame_size);
+	frame_count = le32_to_cpu(hdr->frame_count);
+	frame_index = le16_to_cpu(hdr->frame_index);
+	if (!payload_len || payload_len > frame_len - sizeof(*hdr) ||
+	    frame_count != 1 || frame_index != 0) {
+		atomic64_inc(&session->identity->minimal_path_errors);
+		return;
+	}
+
+	atomic64_inc(&session->identity->minimal_packet_rx);
+	ret = tbv_tbnet_minimal_send_arp_reply(session, hdr + 1, payload_len);
+	if (ret == -ENOENT)
+		atomic64_inc(&session->identity->arp_ignored);
+}
+
+static void tbv_tbnet_minimal_rx_work(struct work_struct *work)
+{
+	struct tbv_tbnet_minimal_session *session =
+		container_of(work, struct tbv_tbnet_minimal_session, rx_work);
+	struct device *dma_dev;
+	struct ring_frame *frame;
+
+	if (!session->rx_ring)
+		return;
+
+	dma_dev = tb_ring_dma_device(session->rx_ring);
+	while ((frame = tb_ring_poll(session->rx_ring))) {
+		struct tbv_tbnet_minimal_frame *f =
+			container_of(frame, struct tbv_tbnet_minimal_frame,
+				     frame);
+
+		dma_sync_single_for_cpu(dma_dev, f->dma,
+					TBV_TBNET_MIN_FRAME_SIZE,
+					DMA_FROM_DEVICE);
+		tbv_tbnet_minimal_handle_rx_frame(session, f,
+				tbv_tbnet_minimal_frame_len(frame));
+		dma_sync_single_for_device(dma_dev, f->dma,
+					   TBV_TBNET_MIN_FRAME_SIZE,
+					   DMA_FROM_DEVICE);
+		frame->size = 0;
+		frame->flags = 0;
+		if (tb_ring_rx(session->rx_ring, frame)) {
+			atomic64_inc(&session->identity->minimal_path_errors);
+			break;
+		}
+	}
+
+	tb_ring_poll_complete(session->rx_ring);
+}
+
+static void tbv_tbnet_minimal_tx_poll_work(struct work_struct *work)
+{
+	struct tbv_tbnet_minimal_session *session =
+		container_of(to_delayed_work(work),
+			     struct tbv_tbnet_minimal_session, tx_poll_work);
+	struct ring_frame *frame;
+	u32 completed = 0;
+
+	if (!session->tx_ring)
+		return;
+
+	while ((frame = tb_ring_poll(session->tx_ring))) {
+		if (frame->callback)
+			frame->callback(session->tx_ring, frame, false);
+		completed++;
+	}
+
+	if (atomic_read(&session->tx_inflight) > 0 || completed)
+		schedule_delayed_work(&session->tx_poll_work,
+				      msecs_to_jiffies(1));
+}
+
+static void tbv_tbnet_minimal_teardown_path(struct tbv_tbnet_minimal_session *s)
+{
+	mutex_lock(&s->lock);
+	if (s->path_enabled) {
+		tb_xdomain_disable_paths(s->xd, s->local_transmit_path,
+					 s->tx_ring->hop,
+					 s->remote_transmit_path,
+					 s->rx_ring->hop);
+		tb_xdomain_release_in_hopid(s->xd, s->remote_transmit_path);
+		s->path_enabled = false;
+		s->remote_transmit_path = 0;
+	}
+	if (s->rings_started) {
+		tb_ring_stop(s->rx_ring);
+		tb_ring_stop(s->tx_ring);
+		s->rings_started = false;
+	}
+	s->login_sent = false;
+	s->login_received = false;
+	s->login_retries = 0;
+	mutex_unlock(&s->lock);
+
+	tbv_tbnet_minimal_recompute_state(s->identity);
+}
+
+static void tbv_tbnet_minimal_connected_work(struct work_struct *work)
+{
+	struct tbv_tbnet_minimal_session *session =
+		container_of(work, struct tbv_tbnet_minimal_session,
+			     connected_work);
+	int remote_transmit_path;
+	bool connected;
+	int ret;
+
+	mutex_lock(&session->lock);
+	if (session->path_enabled || session->removing) {
+		mutex_unlock(&session->lock);
+		return;
+	}
+
+	connected = session->login_sent && session->login_received;
+	remote_transmit_path = session->remote_transmit_path;
+	mutex_unlock(&session->lock);
+	if (!connected)
+		return;
+
+	ret = tb_xdomain_alloc_in_hopid(session->xd, remote_transmit_path);
+	if (ret != remote_transmit_path) {
+		atomic64_inc(&session->identity->minimal_path_errors);
+		pr_warn("minimal TBnet failed to allocate Rx HopID %d: %d\n",
+			remote_transmit_path, ret);
+		return;
+	}
+
+	tb_ring_start(session->tx_ring);
+	tb_ring_start(session->rx_ring);
+	ret = tbv_tbnet_minimal_prime_rx(session);
+	if (ret) {
+		atomic64_inc(&session->identity->minimal_path_errors);
+		goto err_stop;
+	}
+
+	ret = tb_xdomain_enable_paths(session->xd, session->local_transmit_path,
+				      session->tx_ring->hop,
+				      remote_transmit_path,
+				      session->rx_ring->hop);
+	if (ret) {
+		atomic64_inc(&session->identity->minimal_path_errors);
+		pr_warn("minimal TBnet failed to enable packet path: %d\n",
+			ret);
+		goto err_stop;
+	}
+
+	mutex_lock(&session->lock);
+	session->rings_started = true;
+	session->path_enabled = true;
+	mutex_unlock(&session->lock);
+	tbv_tbnet_minimal_recompute_state(session->identity);
+	pr_info("minimal TBnet packet path active route=0x%llx tx_path=%d rx_path=%d tx_hop=%d rx_hop=%d\n",
+		session->xd->route, session->local_transmit_path,
+		remote_transmit_path, session->tx_ring->hop,
+		session->rx_ring->hop);
+	return;
+
+err_stop:
+	tb_ring_stop(session->rx_ring);
+	tb_ring_stop(session->tx_ring);
+	tb_xdomain_release_in_hopid(session->xd, remote_transmit_path);
+}
+
+static void tbv_tbnet_minimal_disconnect_work(struct work_struct *work)
+{
+	struct tbv_tbnet_minimal_session *session =
+		container_of(work, struct tbv_tbnet_minimal_session,
+			     disconnect_work);
+
+	tbv_tbnet_minimal_teardown_path(session);
+}
+
+static void tbv_tbnet_minimal_login_work(struct work_struct *work)
+{
+	struct tbv_tbnet_minimal_session *session =
+		container_of(to_delayed_work(work),
+			     struct tbv_tbnet_minimal_session, login_work);
+	struct tbv_tbip_login_response_result response;
+	struct tbv_tbip_login_params params;
+	u8 request[128];
+	u8 reply[128];
+	int ret;
+	int len;
+
+	mutex_lock(&session->lock);
+	if (session->path_enabled || session->removing) {
+		mutex_unlock(&session->lock);
+		return;
+	}
+	memset(&params, 0, sizeof(params));
+	params.ctrl.route = session->xd->route;
+	params.ctrl.sequence = session->login_retries % 4;
+	uuid_copy(&params.ctrl.initiator_uuid, session->xd->local_uuid);
+	uuid_copy(&params.ctrl.target_uuid, session->xd->remote_uuid);
+	params.ctrl.command_id = atomic_inc_return(&session->command_id);
+	params.transmit_path = session->local_transmit_path;
+	mutex_unlock(&session->lock);
+
+	len = tbv_tbip_build_login(request, sizeof(request), &params);
+	if (len < 0)
+		return;
+
+	memset(reply, 0, sizeof(reply));
+	atomic64_inc(&session->identity->minimal_login_tx);
+	ret = tb_xdomain_request(session->xd, request, len,
+				 TB_CFG_PKG_XDOMAIN_RESP, reply, sizeof(reply),
+				 TB_CFG_PKG_XDOMAIN_RESP,
+				 TBV_TBNET_MIN_LOGIN_TIMEOUT_MS);
+	if (!ret)
+		ret = tbv_tbip_parse_login_response(reply, sizeof(reply),
+						    &response);
+	if (!ret &&
+	    (!tbv_tbnet_minimal_ctrl_matches(session, &response.ctrl) ||
+	     response.status)) {
+		ret = -EPROTO;
+	}
+	if (ret) {
+		mutex_lock(&session->lock);
+		if (!session->removing &&
+		    session->login_retries++ < TBV_TBNET_MIN_LOGIN_RETRIES)
+			queue_delayed_work(system_long_wq,
+					   &session->login_work,
+					   msecs_to_jiffies(TBV_TBNET_MIN_LOGIN_DELAY_MS));
+		else if (!session->removing)
+			pr_info("minimal TBnet login timed out route=0x%llx\n",
+				session->xd->route);
+		mutex_unlock(&session->lock);
+		return;
+	}
+
+	mutex_lock(&session->lock);
+	session->login_retries = 0;
+	session->login_sent = true;
+	mutex_unlock(&session->lock);
+	queue_work(system_long_wq, &session->connected_work);
+}
+
+static int tbv_tbnet_minimal_send_login_response(
+	struct tbv_tbnet_minimal_session *session,
+	const struct tbv_tbip_login_params *request)
+{
+	struct tbv_tbip_login_response_params params;
+	u8 reply[128];
+	int len;
+
+	memset(&params, 0, sizeof(params));
+	tbv_tbnet_minimal_fill_reply_ctrl(session, &request->ctrl,
+					  &params.ctrl);
+	memcpy(params.receiver_mac, session->mac, sizeof(params.receiver_mac));
+	len = tbv_tbip_build_login_response(reply, sizeof(reply), &params);
+	if (len < 0)
+		return len;
+
+	return tb_xdomain_response(session->xd, reply, len,
+				   TB_CFG_PKG_XDOMAIN_RESP);
+}
+
+static int tbv_tbnet_minimal_send_status(
+	struct tbv_tbnet_minimal_session *session,
+	const struct tbv_tbip_control *request)
+{
+	struct tbv_tbip_status_params params;
+	u8 reply[128];
+	int len;
+
+	memset(&params, 0, sizeof(params));
+	tbv_tbnet_minimal_fill_reply_ctrl(session, request, &params.ctrl);
+	params.ctrl.command_id = atomic_inc_return(&session->command_id);
+	len = tbv_tbip_build_status(reply, sizeof(reply), &params);
+	if (len < 0)
+		return len;
+
+	return tb_xdomain_response(session->xd, reply, len,
+				   TB_CFG_PKG_XDOMAIN_RESP);
+}
+
+static int tbv_tbnet_minimal_handle_packet(const void *buf, size_t size,
+					   void *data)
+{
+	struct tbv_tbnet_minimal_session *session = data;
+	struct tbv_tbip_login_params login;
+	struct tbv_tbip_control ctrl;
+	enum tbv_tbip_type type;
+	int ret;
+
+	ret = tbv_tbip_parse_type(buf, size, &type, &ctrl);
+	if (ret || !tbv_tbnet_minimal_ctrl_matches(session, &ctrl))
+		return 0;
+
+	switch (type) {
+	case TBV_TBIP_LOGIN:
+		ret = tbv_tbip_parse_login(buf, size, &login);
+		if (ret)
+			return 1;
+		ret = tbv_tbnet_minimal_send_login_response(session, &login);
+		if (ret)
+			return 1;
+
+		atomic64_inc(&session->identity->minimal_login_rx);
+		mutex_lock(&session->lock);
+		if (!session->removing) {
+			session->login_received = true;
+			session->remote_transmit_path = login.transmit_path;
+			if (!session->login_sent)
+				queue_delayed_work(system_long_wq,
+						   &session->login_work, 0);
+		}
+		mutex_unlock(&session->lock);
+		queue_work(system_long_wq, &session->connected_work);
+		return 1;
+
+	case TBV_TBIP_LOGOUT:
+		tbv_tbnet_minimal_send_status(session, &ctrl);
+		queue_work(system_long_wq, &session->disconnect_work);
+		return 1;
+
+	default:
+		return 0;
+	}
+}
+
+static int tbv_tbnet_minimal_probe(struct tb_service *svc,
+				   const struct tb_service_id *id)
+{
+	struct tbv_tbnet_identity *identity = tbv_tbnet_minimal_identity;
+	struct tb_xdomain *xd = tb_service_parent(svc);
+	struct tbv_tbnet_minimal_session *session;
+	int ret;
+
+	if (!identity)
+		return -ENODEV;
+
+	session = kzalloc(sizeof(*session), GFP_KERNEL);
+	if (!session)
+		return -ENOMEM;
+
+	session->identity = identity;
+	session->svc = svc;
+	session->xd = xd;
+	session->local_transmit_path = 0;
+	session->remote_transmit_path = 0;
+	mutex_init(&session->lock);
+	spin_lock_init(&session->tx_lock);
+	INIT_LIST_HEAD(&session->tx_free);
+	INIT_DELAYED_WORK(&session->login_work, tbv_tbnet_minimal_login_work);
+	INIT_WORK(&session->connected_work, tbv_tbnet_minimal_connected_work);
+	INIT_WORK(&session->disconnect_work, tbv_tbnet_minimal_disconnect_work);
+	INIT_WORK(&session->rx_work, tbv_tbnet_minimal_rx_work);
+	INIT_DELAYED_WORK(&session->tx_poll_work,
+			  tbv_tbnet_minimal_tx_poll_work);
+	atomic_set(&session->command_id, 0);
+	atomic_set(&session->frame_id, 0);
+	atomic_set(&session->tx_inflight, 0);
+	tbv_tbnet_minimal_generate_mac(session);
+
+	ret = tbv_tbnet_minimal_alloc_rings(session);
+	if (ret)
+		goto err_free;
+
+	session->handler.uuid = &tbv_tbnet_svc_uuid;
+	session->handler.callback = tbv_tbnet_minimal_handle_packet;
+	session->handler.data = session;
+	tb_register_protocol_handler(&session->handler);
+
+	mutex_lock(&identity->lock);
+	list_add_tail(&session->node, &identity->minimal_sessions);
+	tbv_tbnet_minimal_recompute_state_locked(identity);
+	mutex_unlock(&identity->lock);
+
+	tb_service_set_drvdata(svc, session);
+	queue_delayed_work(system_long_wq, &session->login_work,
+			   msecs_to_jiffies(1000));
+	pr_info("bound minimal TBnet service id=%d route=0x%llx tx_path=%d mac=%pM prtcstns=0x%x\n",
+		svc->id, xd->route, session->local_transmit_path,
+		session->mac, svc->prtcstns);
+	return 0;
+
+err_free:
+	mutex_destroy(&session->lock);
+	kfree(session);
+	return ret;
+}
+
+static void
+tbv_tbnet_minimal_free_rings(struct tbv_tbnet_minimal_session *session)
+{
+	tbv_tbnet_minimal_free_frame_array(session->rx_frames, session->rx_ring,
+					   false);
+	session->rx_frames = NULL;
+	tbv_tbnet_minimal_free_frame_array(session->tx_frames, session->tx_ring,
+					   true);
+	session->tx_frames = NULL;
+
+	if (session->rx_ring) {
+		tb_ring_free(session->rx_ring);
+		session->rx_ring = NULL;
+	}
+	if (session->local_transmit_path > 0) {
+		tb_xdomain_release_out_hopid(session->xd,
+					     session->local_transmit_path);
+		session->local_transmit_path = 0;
+	}
+	if (session->tx_ring) {
+		tb_ring_free(session->tx_ring);
+		session->tx_ring = NULL;
+	}
+}
+
+static void
+tbv_tbnet_minimal_destroy_session(struct tbv_tbnet_minimal_session *session)
+{
+	struct tbv_tbnet_identity *identity = session->identity;
+
+	mutex_lock(&session->lock);
+	session->removing = true;
+	mutex_unlock(&session->lock);
+
+	cancel_delayed_work_sync(&session->login_work);
+	cancel_work_sync(&session->connected_work);
+	cancel_work_sync(&session->disconnect_work);
+	cancel_work_sync(&session->rx_work);
+	cancel_delayed_work_sync(&session->tx_poll_work);
+	tb_unregister_protocol_handler(&session->handler);
+	tbv_tbnet_minimal_teardown_path(session);
+
+	mutex_lock(&identity->lock);
+	list_del_init(&session->node);
+	tbv_tbnet_minimal_recompute_state_locked(identity);
+	mutex_unlock(&identity->lock);
+
+	tbv_tbnet_minimal_free_rings(session);
+	mutex_destroy(&session->lock);
+	kfree(session);
+}
+
+static void tbv_tbnet_minimal_remove(struct tb_service *svc)
+{
+	struct tbv_tbnet_minimal_session *session = tb_service_get_drvdata(svc);
+
+	tb_service_set_drvdata(svc, NULL);
+	if (session)
+		tbv_tbnet_minimal_destroy_session(session);
+}
+
+static const struct tb_service_id tbv_tbnet_minimal_ids[] = {
+	{ TB_SERVICE("network", 1) },
+	{ },
+};
+
+static struct tb_service_driver tbv_tbnet_minimal_driver = {
+	.driver = {
+		.owner = THIS_MODULE,
+		.name = "thunderbolt-ibverbs-tbnet",
+	},
+	.probe = tbv_tbnet_minimal_probe,
+	.remove = tbv_tbnet_minimal_remove,
+	.id_table = tbv_tbnet_minimal_ids,
+};
+
+int tbv_tbnet_minimal_start(struct tbv_tbnet_identity *identity)
+{
+	int ret;
+
+	if (identity->minimal_started)
+		return 0;
+
+	identity->minimal_dir = tb_property_create_dir(&tbv_tbnet_dir_uuid);
+	if (!identity->minimal_dir)
+		return -ENOMEM;
+
+	ret = tb_property_add_immediate(identity->minimal_dir, "prtcid", 1);
+	ret = ret ?: tb_property_add_immediate(identity->minimal_dir,
+					       "prtcvers", 1);
+	ret = ret ?: tb_property_add_immediate(identity->minimal_dir,
+					       "prtcrevs", 1);
+	ret = ret ?: tb_property_add_immediate(identity->minimal_dir,
+					       "prtcstns",
+					       TBV_TBNET_E2E |
+					       TBV_TBNET_MATCH_FRAGS_ID |
+					       TBV_TBNET_64K_FRAMES);
+	if (ret)
+		goto err_free_dir;
+
+	ret = tb_register_property_dir("network", identity->minimal_dir);
+	if (ret) {
+		pr_err("tbnet_identity=minimal_packet could not register the ThunderboltIP network service: %d; unload thunderbolt_net or use stock_proxy\n",
+		       ret);
+		goto err_free_dir;
+	}
+	identity->minimal_dir_registered = true;
+
+	tbv_tbnet_minimal_identity = identity;
+	ret = tb_register_service_driver(&tbv_tbnet_minimal_driver);
+	if (ret)
+		goto err_unregister_dir;
+	identity->minimal_driver_registered = true;
+	identity->minimal_started = true;
+	return 0;
+
+err_unregister_dir:
+	tbv_tbnet_minimal_identity = NULL;
+	tb_unregister_property_dir("network", identity->minimal_dir);
+	identity->minimal_dir_registered = false;
+err_free_dir:
+	tb_property_free_dir(identity->minimal_dir);
+	identity->minimal_dir = NULL;
+	return ret;
+}
+
+void tbv_tbnet_minimal_stop(struct tbv_tbnet_identity *identity)
+{
+	if (identity->mode != TBV_TBNET_ID_MINIMAL_PACKET)
+		return;
+
+	if (identity->minimal_driver_registered) {
+		tb_unregister_service_driver(&tbv_tbnet_minimal_driver);
+		identity->minimal_driver_registered = false;
+	}
+	tbv_tbnet_minimal_identity = NULL;
+
+	if (identity->minimal_dir_registered) {
+		tb_unregister_property_dir("network", identity->minimal_dir);
+		identity->minimal_dir_registered = false;
+	}
+	if (identity->minimal_dir) {
+		tb_property_free_dir(identity->minimal_dir);
+		identity->minimal_dir = NULL;
+	}
+
+	identity->minimal_started = false;
+}

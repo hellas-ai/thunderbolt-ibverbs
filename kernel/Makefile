@@ -7,7 +7,7 @@ KDIR ?= /lib/modules/$(KVER)/build
 PWD := $(shell pwd)
 
 obj-m := thunderbolt_ibverbs.o
-thunderbolt_ibverbs-y := main.o profile.o backend.o core.o debugfs.o ibdev.o native_control.o native_control_legacy.o native_control_xdomain.o path.o peer.o rail.o service.o tbnet_identity.o
+thunderbolt_ibverbs-y := main.o profile.o backend.o core.o debugfs.o ibdev.o native_control.o native_control_legacy.o native_control_xdomain.o path.o peer.o rail.o service.o tbnet_identity.o tbnet_minimal.o
 
 ccflags-y := -Wall -Wextra -Wno-unused-parameter
 
