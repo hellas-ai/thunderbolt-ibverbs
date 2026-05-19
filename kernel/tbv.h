@@ -155,6 +155,7 @@ struct tbv_path {
 	struct list_head tx_data_free;
 	struct list_head tx_control_queue;
 	struct list_head tx_data_queue;
+	struct list_head tx_zcopy_inflight;
 	struct delayed_work tx_poll_work;
 	atomic_t tx_inflight;
 	atomic64_t data_tx_enqueued;
@@ -564,6 +565,7 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 void tbv_path_kick_tx(struct tbv_path *path);
 u32 tbv_path_cancel_data_done_ctx(struct tbv_path *path,
 				  tbv_path_tx_done_fn done, void *done_ctx);
+u32 tbv_path_cancel_data_owner_ctx(struct tbv_path *path, void *owner_ctx);
 void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd);
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);

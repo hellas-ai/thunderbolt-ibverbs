@@ -193,6 +193,7 @@ struct tbv_qp {
 	struct mutex rx_lock;
 	wait_queue_head_t credit_wait;
 	wait_queue_head_t apple_tx_wait;
+	wait_queue_head_t refs_wait;
 	refcount_t refs;
 	struct completion refs_zero;
 	struct list_head pending_sends;
@@ -450,8 +451,12 @@ out:
 
 static void tbv_qp_put(struct tbv_qp *tqp)
 {
-	if (tqp && refcount_dec_and_test(&tqp->refs))
+	if (!tqp)
+		return;
+	if (refcount_dec_and_test(&tqp->refs))
 		complete(&tqp->refs_zero);
+	else
+		wake_up_all(&tqp->refs_wait);
 }
 
 static bool tbv_qp_get_live(struct tbv_qp *tqp)
@@ -588,10 +593,8 @@ static u32 tbv_cancel_send_ctx_packets(struct tbv_state *state,
 		    peer->backend != TBV_BACKEND_APPLE)
 			continue;
 		list_for_each_entry(rail, &peer->rails, node) {
-			canceled += tbv_path_cancel_data_done_ctx(
-				&rail->path, tbv_send_tx_done, send);
-			canceled += tbv_path_cancel_data_done_ctx(
-				&rail->path, tbv_apple_send_tx_done, send);
+			canceled += tbv_path_cancel_data_owner_ctx(
+				&rail->path, send);
 		}
 	}
 	mutex_unlock(&state->lock);
@@ -1067,6 +1070,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	mutex_init(&tqp->rx_lock);
 	init_waitqueue_head(&tqp->credit_wait);
 	init_waitqueue_head(&tqp->apple_tx_wait);
+	init_waitqueue_head(&tqp->refs_wait);
 	refcount_set(&tqp->refs, 1);
 	atomic_set(&tqp->apple_tx_inflight, 0);
 	atomic_set(&tqp->apple_tx_inflight_frames, 0);
@@ -1108,12 +1112,6 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	wake_up_all(&tqp->credit_wait);
 	wake_up_all(&tqp->apple_tx_wait);
 
-	if (tqp->owner) {
-		xa_lock_irqsave(&tqp->owner->verbs_qps_xa, flags);
-		__xa_erase(&tqp->owner->verbs_qps_xa, qp->qp_num);
-		xa_unlock_irqrestore(&tqp->owner->verbs_qps_xa, flags);
-	}
-
 	tbv_qp_flush_sends(tqp, &flush);
 	while (!list_empty(&flush)) {
 		struct tbv_send_ctx *send =
@@ -1140,6 +1138,20 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 			tbv_read_ctx_put(read);
 		tbv_read_complete(read, -ECANCELED);
 		tbv_read_ctx_put(read);
+	}
+
+	if (!wait_event_timeout(tqp->refs_wait,
+				refcount_read(&tqp->refs) == 1,
+				msecs_to_jiffies(5000))) {
+		pr_warn("QP %u destroy timed out with %u refs; leaving it closing for retry\n",
+			qp->qp_num, refcount_read(&tqp->refs));
+		return -ETIMEDOUT;
+	}
+
+	if (tqp->owner) {
+		xa_lock_irqsave(&tqp->owner->verbs_qps_xa, flags);
+		__xa_erase(&tqp->owner->verbs_qps_xa, qp->qp_num);
+		xa_unlock_irqrestore(&tqp->owner->verbs_qps_xa, flags);
 	}
 
 	tbv_qp_put(tqp);
