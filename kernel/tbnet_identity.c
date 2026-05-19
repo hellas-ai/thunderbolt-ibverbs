@@ -312,6 +312,57 @@ static __be32 tbv_netdev_first_ipv4_rtnl(struct net_device *dev)
 static rx_handler_result_t
 tbv_tbnet_identity_rx_handler(struct sk_buff **pskb);
 
+static int tbv_tbnet_identity_send_arp_reply(struct net_device *dev,
+					     const unsigned char *dst_mac,
+					     __be32 dst_ip, __be32 src_ip)
+{
+	struct tbv_arp_ipv4_payload *payload;
+	struct tbv_ethhdr *eth;
+	struct tbv_arphdr *arp;
+	struct sk_buff *reply;
+	unsigned char *buf;
+	size_t frame_len;
+	int ret;
+
+	frame_len = sizeof(*eth) + sizeof(*arp) + sizeof(*payload);
+	reply = netdev_alloc_skb(dev, LL_RESERVED_SPACE(dev) + frame_len);
+	if (!reply)
+		return -ENOMEM;
+
+	skb_reserve(reply, LL_RESERVED_SPACE(dev));
+	buf = skb_put(reply, frame_len);
+	memset(buf, 0, frame_len);
+
+	eth = (struct tbv_ethhdr *)buf;
+	memcpy(eth->h_dest, dst_mac, TBV_ETH_ALEN);
+	memcpy(eth->h_source, dev->dev_addr, TBV_ETH_ALEN);
+	eth->h_proto = htons(ETH_P_ARP);
+
+	arp = (struct tbv_arphdr *)(eth + 1);
+	arp->ar_hrd = htons(ARPHRD_ETHER);
+	arp->ar_pro = htons(ETH_P_IP);
+	arp->ar_hln = TBV_ETH_ALEN;
+	arp->ar_pln = sizeof(__be32);
+	arp->ar_op = htons(ARPOP_REPLY);
+
+	payload = (struct tbv_arp_ipv4_payload *)(arp + 1);
+	memcpy(payload->sender_mac, dev->dev_addr, TBV_ETH_ALEN);
+	payload->sender_ip = src_ip;
+	memcpy(payload->target_mac, dst_mac, TBV_ETH_ALEN);
+	payload->target_ip = dst_ip;
+
+	reply->dev = dev;
+	reply->protocol = htons(ETH_P_ARP);
+	reply->ip_summed = CHECKSUM_UNNECESSARY;
+	skb_reset_mac_header(reply);
+
+	ret = dev_queue_xmit(reply);
+	if (ret == NET_XMIT_SUCCESS || ret == NET_XMIT_CN)
+		return 0;
+
+	return -EIO;
+}
+
 static void tbv_tbnet_identity_disarm_locked(struct tbv_tbnet_identity *identity)
 {
 	if (identity->rx_handler_registered) {
@@ -475,11 +526,13 @@ static rx_handler_result_t tbv_tbnet_identity_rx_handler(struct sk_buff **pskb)
 		return RX_HANDLER_PASS;
 	}
 
-	arp_send(ARPOP_REPLY, ETH_P_ARP, sip, dev, tip, sha,
-		 dev->dev_addr, sha);
-	atomic64_inc(&identity->arp_replies);
+	if (tbv_tbnet_identity_send_arp_reply(dev, sha, sip, tip)) {
+		atomic64_inc(&identity->arp_errors);
+		return RX_HANDLER_PASS;
+	}
 
-	return RX_HANDLER_PASS;
+	atomic64_inc(&identity->arp_replies);
+	return RX_HANDLER_CONSUMED;
 }
 
 static int tbv_tbnet_identity_netdev_event(struct notifier_block *nb,
