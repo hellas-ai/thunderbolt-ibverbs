@@ -294,14 +294,17 @@ static const struct tb_service_id tbv_service_ids[] = {
 	{ TB_SERVICE("tbverb3", TBV_NATIVE_PRTCID), .driver_data = 3 },
 #ifndef TBV_LINUX_PERF_ONLY
 	{
-		.match_flags = TBSVC_MATCH_PROTOCOL_KEY |
-			       TBSVC_MATCH_PROTOCOL_ID |
+		/*
+		 * Apple's AD service key contains leading 0xff bytes. The
+		 * kernel's tbsvc modalias generator formats protocol_key with
+		 * "%s", which produces a non-printable alias that some depmod
+		 * versions cannot index safely. Match the Apple path by its
+		 * FA57 protocol tuple instead; the advertised service directory
+		 * still uses the real AD key above.
+		 */
+		.match_flags = TBSVC_MATCH_PROTOCOL_ID |
 			       TBSVC_MATCH_PROTOCOL_VERSION |
 			       TBSVC_MATCH_PROTOCOL_REVISION,
-		.protocol_key = {
-			(char)0xff, (char)0xff, (char)0xff, (char)0xff,
-			(char)0xff, (char)0xff, 'A', 'D', '\0',
-		},
 		.protocol_id = TBV_APPLE_PRTCID,
 		.protocol_version = TBV_APPLE_PRTCVERS,
 		.protocol_revision = TBV_APPLE_PRTCREVS,
