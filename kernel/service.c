@@ -147,6 +147,33 @@ static bool tbv_service_should_defer_apple_tunnel(struct tbv_state *state,
 	       !tbv_service_tbnet_neighbor_ready(state, xd);
 }
 
+static bool tbv_service_has_pending_apple_rail_locked(struct tbv_state *state)
+{
+	struct tbv_peer *peer;
+
+	list_for_each_entry(peer, &state->peers, node) {
+		struct tbv_rail *rail;
+
+		if (peer->backend != TBV_BACKEND_APPLE)
+			continue;
+
+		list_for_each_entry(rail, &peer->rails, node)
+			if (!rail->removing &&
+			    rail->path.state == TBV_PATH_RING_STARTED)
+				return true;
+	}
+
+	return false;
+}
+
+static void tbv_service_refresh_apple_tunnels_pending(struct tbv_state *state)
+{
+	mutex_lock(&state->lock);
+	state->apple_tunnels_pending =
+		tbv_service_has_pending_apple_rail_locked(state);
+	mutex_unlock(&state->lock);
+}
+
 static int tbv_service_enable_apple_tunnel(struct tbv_rail *rail)
 {
 	struct tbv_peer *peer = rail->peer;
@@ -379,6 +406,8 @@ static int tbv_service_probe(struct tb_service *svc,
 
 err_remove_rail:
 	tbv_peer_remove_rail(rail);
+	if (backend == TBV_BACKEND_APPLE)
+		tbv_service_refresh_apple_tunnels_pending(tbv_service_state);
 err_put_peer:
 	tbv_peer_put(tbv_service_state, peer);
 err_free_binding:
@@ -391,7 +420,11 @@ static void tbv_service_remove(struct tb_service *svc)
 	struct tbv_service_binding *binding = tb_service_get_drvdata(svc);
 
 	if (tbv_service_state && binding) {
+		enum tbv_backend_type backend = binding->peer->backend;
+
 		tbv_peer_remove_rail(binding->rail);
+		if (backend == TBV_BACKEND_APPLE)
+			tbv_service_refresh_apple_tunnels_pending(tbv_service_state);
 		tbv_peer_put(tbv_service_state, binding->peer);
 	}
 	tb_service_set_drvdata(svc, NULL);
