@@ -93,6 +93,8 @@ struct tbv_tbnet_minimal_session {
 	bool removing;
 	atomic64_t login_rx;
 	atomic64_t login_tx;
+	atomic64_t logout_rx;
+	atomic64_t status_tx;
 	atomic64_t packet_rx;
 	atomic64_t packet_tx_posted;
 	atomic64_t packet_tx;
@@ -170,6 +172,21 @@ static void tbv_tbnet_minimal_generate_mac(struct tbv_tbnet_minimal_session *s)
 }
 
 static void
+tbv_tbnet_minimal_mark_neighbor_seen(struct tbv_tbnet_minimal_session *session)
+{
+	bool ready;
+
+	mutex_lock(&session->identity->lock);
+	session->neighbor_seen = true;
+	tbv_tbnet_minimal_recompute_state_locked(session->identity);
+	ready = session->identity->state & TBV_TBNET_ID_STATE_NEIGHBOR_READY;
+	mutex_unlock(&session->identity->lock);
+
+	if (ready)
+		tbv_services_tbnet_identity_ready(session->identity);
+}
+
+static void
 tbv_tbnet_minimal_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 			      bool canceled)
 {
@@ -195,13 +212,8 @@ tbv_tbnet_minimal_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	if (!canceled) {
 		atomic64_inc(&session->identity->minimal_packet_tx);
 		atomic64_inc(&session->packet_tx);
-		if (arp_reply) {
-			mutex_lock(&session->identity->lock);
-			session->neighbor_seen = true;
-			tbv_tbnet_minimal_recompute_state_locked(session->identity);
-			mutex_unlock(&session->identity->lock);
-			tbv_services_tbnet_identity_ready(session->identity);
-		}
+		if (arp_reply)
+			tbv_tbnet_minimal_mark_neighbor_seen(session);
 	}
 }
 
@@ -509,6 +521,10 @@ void tbv_tbnet_minimal_debugfs_show(struct seq_file *s,
 			   atomic64_read(&session->login_tx),
 			   READ_ONCE(session->login_retries));
 		seq_printf(s,
+			   "tbnet_minimal_session%u_control: logout_rx=%lld status_tx=%lld\n",
+			   idx, atomic64_read(&session->logout_rx),
+			   atomic64_read(&session->status_tx));
+		seq_printf(s,
 			   "tbnet_minimal_session%u_packets: rx=%lld tx_posted=%lld tx_completed=%lld tx_errors=%lld path_errors=%lld\n",
 			   idx, atomic64_read(&session->packet_rx),
 			   atomic64_read(&session->packet_tx_posted),
@@ -710,6 +726,7 @@ tbv_tbnet_minimal_handle_rx_frame(struct tbv_tbnet_minimal_session *session,
 	atomic64_inc(&session->identity->minimal_packet_rx);
 	atomic64_inc(&session->packet_rx);
 	tbv_tbnet_minimal_count_rx_payload(session, hdr + 1, payload_len);
+	tbv_tbnet_minimal_mark_neighbor_seen(session);
 	ret = tbv_tbnet_minimal_send_arp_reply(session, hdr + 1, payload_len);
 	if (ret == -ENOENT) {
 		atomic64_inc(&session->identity->arp_ignored);
@@ -1039,7 +1056,12 @@ static int tbv_tbnet_minimal_handle_packet(const void *buf, size_t size,
 		return 1;
 
 	case TBV_TBIP_LOGOUT:
-		tbv_tbnet_minimal_send_status(session, &ctrl);
+		atomic64_inc(&session->logout_rx);
+		ret = tbv_tbnet_minimal_send_status(session, &ctrl);
+		if (!ret)
+			atomic64_inc(&session->status_tx);
+		pr_info("minimal TBnet logout received route=0x%llx status_ret=%d\n",
+			session->xd->route, ret);
 		queue_work(system_long_wq, &session->disconnect_work);
 		return 1;
 
