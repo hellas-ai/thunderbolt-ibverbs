@@ -869,6 +869,8 @@ static void tbv_tbnet_minimal_connected_work(struct work_struct *work)
 	if (ret != remote_transmit_path) {
 		atomic64_inc(&session->identity->minimal_path_errors);
 		atomic64_inc(&session->path_errors);
+		if (ret > 0)
+			tb_xdomain_release_in_hopid(session->xd, ret);
 		pr_warn("minimal TBnet failed to allocate Rx HopID %d: %d\n",
 			remote_transmit_path, ret);
 		return;
