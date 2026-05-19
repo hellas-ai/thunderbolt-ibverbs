@@ -192,6 +192,7 @@ struct tbv_apple_pending_rx {
 struct tbv_qp {
 	struct ib_qp base;
 	struct tbv_state *owner;
+	enum tbv_backend_type backend;
 	spinlock_t lock;
 	struct mutex rx_lock;
 	wait_queue_head_t credit_wait;
@@ -248,6 +249,7 @@ struct tbv_mr {
 struct tbv_ibdev {
 	struct ib_device base;
 	struct tbv_state *state;
+	enum tbv_backend_type backend;
 };
 
 struct tbv_send_ctx {
@@ -355,14 +357,14 @@ static s32 tbv_psn_delta(u32 a, u32 b)
 	return (s32)delta;
 }
 
-static bool tbv_state_apple_only(const struct tbv_state *state)
+static bool tbv_backend_is_apple(enum tbv_backend_type backend)
 {
-	return state && state->cfg.apple_enabled && !state->cfg.native_enabled;
+	return backend == TBV_BACKEND_APPLE;
 }
 
 static bool tbv_qp_uses_apple_transport(const struct tbv_qp *tqp)
 {
-	return tqp && tbv_state_apple_only(tqp->owner);
+	return tqp && tbv_backend_is_apple(tqp->backend);
 }
 
 static u32 tbv_qp_max_msg_size(const struct tbv_qp *tqp)
@@ -379,21 +381,35 @@ static u32 tbv_apple_qpn_from_path(const struct tbv_path *path)
 	return (u32)path->cfg.receive_path << TBV_APPLE_QPN_SHIFT;
 }
 
-static int tbv_alloc_qpn(const struct tbv_state *state)
+static int tbv_alloc_qpn(const struct tbv_state *state,
+			 enum tbv_backend_type backend)
 {
-	if (tbv_state_apple_only(state))
+	if (tbv_backend_is_apple(backend))
 		return ida_alloc_range(&tbv_qpn_ida, TBV_APPLE_PRIMARY_QPN,
 				       TBV_APPLE_PRIMARY_QPN, GFP_KERNEL);
 
-	return ida_alloc_range(&tbv_qpn_ida, TBV_IBDEV_QPN_MIN,
+	return ida_alloc_range(&tbv_qpn_ida,
+			       state && state->cfg.apple_enabled ?
+			       TBV_IBDEV_QPN_MIN + 0x1000 :
+			       TBV_IBDEV_QPN_MIN,
 			       TBV_IBDEV_QPN_MAX, GFP_KERNEL);
+}
+
+static struct tbv_ibdev *tbv_to_ibdev(struct ib_device *ibdev)
+{
+	return container_of(ibdev, struct tbv_ibdev, base);
 }
 
 static struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev)
 {
-	struct tbv_ibdev *dev = container_of(ibdev, struct tbv_ibdev, base);
+	struct tbv_ibdev *dev = tbv_to_ibdev(ibdev);
 
 	return dev->state;
+}
+
+static enum tbv_backend_type tbv_ibdev_backend(struct ib_device *ibdev)
+{
+	return tbv_to_ibdev(ibdev)->backend;
 }
 
 static struct tbv_mr *tbv_mr_get(struct tbv_state *state, u32 key)
@@ -759,7 +775,8 @@ static void tbv_release_path_reservations(struct tbv_path **paths,
 	}
 }
 
-static bool tbv_ibdev_port_active(struct tbv_state *state)
+static bool tbv_ibdev_port_active(struct tbv_state *state,
+				  enum tbv_backend_type backend)
 {
 	struct tbv_peer *peer;
 	bool active = false;
@@ -767,6 +784,9 @@ static bool tbv_ibdev_port_active(struct tbv_state *state)
 	mutex_lock(&state->lock);
 	list_for_each_entry(peer, &state->peers, node) {
 		struct tbv_rail *rail;
+
+		if (peer->backend != backend)
+			continue;
 
 		list_for_each_entry(rail, &peer->rails, node) {
 			if ((peer->backend == TBV_BACKEND_APPLE ?
@@ -787,7 +807,7 @@ static int tbv_query_device(struct ib_device *ibdev,
 			    struct ib_device_attr *attr,
 			    struct ib_udata *udata)
 {
-	bool apple = tbv_state_apple_only(tbv_ibdev_state(ibdev));
+	bool apple = tbv_backend_is_apple(tbv_ibdev_backend(ibdev));
 
 	memset(attr, 0, sizeof(*attr));
 	attr->vendor_id = 0x1d6b;
@@ -822,20 +842,20 @@ static int tbv_query_port(struct ib_device *ibdev, u32 port_num,
 			  struct ib_port_attr *attr)
 {
 	struct tbv_ibdev *dev = container_of(ibdev, struct tbv_ibdev, base);
+	bool apple = tbv_backend_is_apple(dev->backend);
 	bool active;
 
 	if (port_num != 1)
 		return -EINVAL;
 
 	memset(attr, 0, sizeof(*attr));
-	active = tbv_ibdev_port_active(dev->state);
+	active = tbv_ibdev_port_active(dev->state, dev->backend);
 	attr->state = active ? IB_PORT_ACTIVE : IB_PORT_DOWN;
 	attr->phys_state = active ? IB_PORT_PHYS_STATE_LINK_UP :
 				    IB_PORT_PHYS_STATE_DISABLED;
 	attr->max_mtu = IB_MTU_4096;
 	attr->active_mtu = IB_MTU_4096;
-	attr->max_msg_sz = tbv_state_apple_only(dev->state) ?
-				   TBV_APPLE_MAX_MSG_SIZE :
+	attr->max_msg_sz = apple ? TBV_APPLE_MAX_MSG_SIZE :
 				   TBV_NATIVE_DATA_MAX_MSG_SIZE;
 	attr->gid_tbl_len = TBV_IBDEV_GID_TBL_LEN;
 	attr->pkey_tbl_len = 1;
@@ -883,10 +903,20 @@ static int tbv_query_gid(struct ib_device *ibdev, u32 port_num, int index,
 static struct net_device *tbv_get_netdev(struct ib_device *ibdev,
 					 u32 port_num)
 {
-	if (port_num != 1 || !roce_netdev || !*roce_netdev)
+	struct tbv_ibdev *dev = tbv_to_ibdev(ibdev);
+	const char *name = roce_netdev;
+
+	if (port_num != 1)
 		return NULL;
 
-	return dev_get_by_name(&init_net, roce_netdev);
+	if (tbv_backend_is_apple(dev->backend) &&
+	    dev->state->tbnet_identity.gid_netdev_name[0])
+		name = dev->state->tbnet_identity.gid_netdev_name;
+
+	if (!name || !*name)
+		return NULL;
+
+	return dev_get_by_name(&init_net, name);
 }
 
 static int tbv_add_gid(const struct ib_gid_attr *attr, void **context)
@@ -990,7 +1020,9 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 		return -EOPNOTSUPP;
 	if (init_attr->qp_type != IB_QPT_RC && init_attr->qp_type != IB_QPT_UC)
 		return -EOPNOTSUPP;
-	if (tbv_state_apple_only(state) && init_attr->qp_type != IB_QPT_UC)
+	tqp->backend = tbv_ibdev_backend(qp->device);
+	if (tbv_backend_is_apple(tqp->backend) &&
+	    init_attr->qp_type != IB_QPT_UC)
 		return -EOPNOTSUPP;
 	if (init_attr->cap.max_send_wr > TBV_IBDEV_MAX_QP_WR ||
 	    init_attr->cap.max_recv_wr > TBV_IBDEV_MAX_QP_WR ||
@@ -998,7 +1030,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	    init_attr->cap.max_recv_sge > TBV_IBDEV_MAX_SGE)
 		return -EINVAL;
 
-	qpn = tbv_alloc_qpn(state);
+	qpn = tbv_alloc_qpn(state, tqp->backend);
 	if (qpn < 0)
 		return qpn;
 
@@ -1012,7 +1044,8 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 		tqp->recvq_size = init_attr->cap.max_recv_wr;
 	}
 
-	if (tbv_state_apple_only(state) && READ_ONCE(apple_rx_pending_bytes) &&
+	if (tbv_backend_is_apple(tqp->backend) &&
+	    READ_ONCE(apple_rx_pending_bytes) &&
 	    READ_ONCE(apple_rx_pending_total_bytes)) {
 		u32 slots = min_t(u32, READ_ONCE(apple_rx_pending_slots),
 				  TBV_APPLE_PENDING_RX_MAX_SLOTS);
@@ -4390,26 +4423,25 @@ static const struct ib_device_ops tbv_ibdev_ops = {
 	INIT_RDMA_OBJ_SIZE(ib_qp, tbv_qp, base),
 };
 
-int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
+static int tbv_ibdev_register_one(struct tbv_state *state,
+				  enum tbv_backend_type backend,
+				  const char *name)
 {
 	struct tbv_ibdev *dev;
 	struct device *dma_device;
 	int ret;
-
-	state->register_verbs = register_verbs;
-	if (!register_verbs)
-		return 0;
 
 	dev = ib_alloc_device(tbv_ibdev, base);
 	if (!dev)
 		return -ENOMEM;
 
 	dev->state = state;
+	dev->backend = backend;
 	dev->base.phys_port_cnt = TBV_IBDEV_PORTS;
 	dev->base.num_comp_vectors = num_possible_cpus();
 	dev->base.local_dma_lkey = 0;
 	dev->base.node_type = RDMA_NODE_IB_CA;
-	dev->base.node_guid = cpu_to_be64(0x0200544256524253ULL);
+	dev->base.node_guid = cpu_to_be64(0x0200544256524253ULL + backend);
 	dev->base.uverbs_cmd_mask |=
 		BIT_ULL(IB_USER_VERBS_CMD_POST_SEND) |
 		BIT_ULL(IB_USER_VERBS_CMD_POST_RECV) |
@@ -4420,7 +4452,7 @@ int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
 
 	dma_device = tbv_state_get_verbs_parent(state);
 	dev->base.dev.parent = dma_device;
-	ret = ib_register_device(&dev->base, "usb4_rdma%d", dma_device);
+	ret = ib_register_device(&dev->base, name, dma_device);
 	if (ret) {
 		if (dma_device)
 			put_device(dma_device);
@@ -4428,28 +4460,66 @@ int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
 		return ret;
 	}
 
-	state->ibdev = dev;
-	state->verbs_registered = true;
-	pr_info("registered ib_device %s dma_device=%s\n",
-		dev_name(&dev->base.dev),
+	state->ibdevs[backend] = dev;
+	pr_info("registered %s ib_device %s dma_device=%s\n",
+		tbv_backend_name(backend), dev_name(&dev->base.dev),
 		dma_device ? dev_name(dma_device) : "<none>");
 	if (dma_device)
 		put_device(dma_device);
 	return 0;
 }
 
+int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
+{
+	int ret;
+
+	state->register_verbs = register_verbs;
+	if (!register_verbs)
+		return 0;
+
+	if (state->cfg.native_enabled) {
+		ret = tbv_ibdev_register_one(state, TBV_BACKEND_NATIVE,
+					     "usb4_rdma%d");
+		if (ret)
+			goto err_stop;
+	}
+
+	if (state->cfg.apple_enabled) {
+		ret = tbv_ibdev_register_one(state, TBV_BACKEND_APPLE,
+					     state->cfg.native_enabled ?
+					     "usb4_apple%d" : "usb4_rdma%d");
+		if (ret)
+			goto err_stop;
+	}
+
+	state->verbs_registered = true;
+	return 0;
+
+err_stop:
+	tbv_ibdev_stop(state);
+	return ret;
+}
+
 void tbv_ibdev_stop(struct tbv_state *state)
 {
-	struct tbv_ibdev *dev = state->ibdev;
-
-	if (!dev)
-		return;
+	enum tbv_backend_type backend;
 
 	state->verbs_registered = false;
 	flush_workqueue(system_unbound_wq);
-	state->ibdev = NULL;
-	ib_unregister_device(&dev->base);
-	ib_dealloc_device(&dev->base);
+
+	for (backend = TBV_BACKEND_NATIVE; backend <= TBV_BACKEND_APPLE;
+	     backend++) {
+		struct tbv_ibdev *dev = state->ibdevs[backend];
+
+		if (!dev)
+			continue;
+
+		state->ibdevs[backend] = NULL;
+		ib_unregister_device(&dev->base);
+		ib_dealloc_device(&dev->base);
+		pr_info("unregistered %s ib_device\n",
+			tbv_backend_name(backend));
+	}
+
 	ida_destroy(&tbv_qpn_ida);
-	pr_info("unregistered ib_device\n");
 }

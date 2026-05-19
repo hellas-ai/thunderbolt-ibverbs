@@ -347,7 +347,7 @@ struct tbv_state {
 	struct xarray verbs_mrs_xa;
 	struct xarray verbs_qps_xa;
 	struct device *verbs_parent;
-	struct tbv_ibdev *ibdev;
+	struct tbv_ibdev *ibdevs[2];
 };
 
 struct dentry;
