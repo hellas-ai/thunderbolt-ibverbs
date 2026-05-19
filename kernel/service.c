@@ -606,7 +606,7 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 
 	ret = tbv_register_native_dirs(state, service_cfg->native_prtcstns);
 	if (ret)
-		goto err_clear;
+		goto err_stop_minimal;
 
 	if (state->cfg.apple_enabled && state->apple_data) {
 		ret = tbv_register_apple_dir(state,

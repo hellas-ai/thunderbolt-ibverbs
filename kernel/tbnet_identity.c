@@ -872,7 +872,6 @@ int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,
 			mutex_destroy(&identity->lock);
 			return ret;
 		}
-		identity->inetaddr_nb_registered = true;
 
 		rtnl_lock();
 		mutex_lock(&identity->lock);

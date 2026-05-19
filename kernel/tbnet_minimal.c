@@ -19,6 +19,7 @@
 #include <linux/if_ether.h>
 #include <linux/jhash.h>
 #include <linux/kernel.h>
+#include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -1045,6 +1046,9 @@ static int tbv_tbnet_minimal_handle_packet_common(
 		ret = tbv_tbip_parse_login(buf, size, &login);
 		if (ret)
 			return 1;
+		if (!login.transmit_path ||
+		    login.transmit_path > (u32)INT_MAX)
+			return 1;
 		ret = tbv_tbnet_minimal_send_login_response(session, &login);
 		if (ret)
 			return 1;
@@ -1054,7 +1058,8 @@ static int tbv_tbnet_minimal_handle_packet_common(
 		mutex_lock(&session->lock);
 		if (!session->removing) {
 			session->login_received = true;
-			session->remote_transmit_path = login.transmit_path;
+			session->remote_transmit_path =
+				(int)login.transmit_path;
 			if (!session->login_sent)
 				queue_delayed_work(system_long_wq,
 						   &session->login_work, 0);
