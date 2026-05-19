@@ -245,6 +245,7 @@ struct tbv_tbnet_identity {
 	struct notifier_block inetaddr_nb;
 	__be32 proxy_ipv4;
 	bool minimal_e2e;
+	bool minimal_neighbor_seen;
 	bool minimal_dir_registered;
 	bool minimal_driver_registered;
 	bool minimal_started;

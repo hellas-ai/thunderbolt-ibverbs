@@ -510,6 +510,7 @@ static void tbv_tbnet_identity_put_gid_locked(struct tbv_tbnet_identity *identit
 		identity->gid_dev = NULL;
 	}
 	identity->proxy_ipv4 = 0;
+	identity->minimal_neighbor_seen = false;
 }
 
 static int
@@ -548,6 +549,7 @@ tbv_tbnet_identity_refresh_minimal_locked(struct tbv_tbnet_identity *identity)
 	tbv_tbnet_identity_put_gid_locked(identity);
 	identity->gid_dev = gid_dev;
 	identity->proxy_ipv4 = proxy_ipv4;
+	identity->minimal_neighbor_seen = false;
 	tbv_tbnet_minimal_recompute_state_locked(identity);
 	return 0;
 }

@@ -136,7 +136,7 @@ static bool tbv_service_tbnet_packet_ready(const struct tbv_state *state)
 		return true;
 
 	return state->tbnet_identity.state &
-	       TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE;
+	       TBV_TBNET_ID_STATE_NEIGHBOR_READY;
 }
 
 static bool tbv_service_should_defer_apple_tunnel(struct tbv_state *state)

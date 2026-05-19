@@ -57,6 +57,7 @@ struct tbv_tbnet_minimal_frame {
 	void *buf;
 	dma_addr_t dma;
 	bool tx;
+	bool arp_reply;
 };
 
 struct tbv_tbnet_minimal_session {
@@ -175,6 +176,7 @@ tbv_tbnet_minimal_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 		container_of(frame, struct tbv_tbnet_minimal_frame, frame);
 	struct tbv_tbnet_minimal_session *session = f->session;
 	unsigned long flags;
+	bool arp_reply = f->arp_reply;
 
 	dma_sync_single_for_cpu(tb_ring_dma_device(ring), f->dma,
 				TBV_TBNET_MIN_FRAME_SIZE, DMA_TO_DEVICE);
@@ -182,6 +184,7 @@ tbv_tbnet_minimal_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	f->frame.flags = 0;
 	f->frame.sof = TBV_TBNET_PDF_FRAME_START;
 	f->frame.eof = TBV_TBNET_PDF_FRAME_END;
+	f->arp_reply = false;
 
 	spin_lock_irqsave(&session->tx_lock, flags);
 	list_add_tail(&f->node, &session->tx_free);
@@ -191,6 +194,13 @@ tbv_tbnet_minimal_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	if (!canceled) {
 		atomic64_inc(&session->identity->minimal_packet_tx);
 		atomic64_inc(&session->packet_tx);
+		if (arp_reply) {
+			mutex_lock(&session->identity->lock);
+			session->identity->minimal_neighbor_seen = true;
+			tbv_tbnet_minimal_recompute_state_locked(session->identity);
+			mutex_unlock(&session->identity->lock);
+			tbv_services_tbnet_identity_ready(session->identity);
+		}
 	}
 }
 
@@ -388,8 +398,11 @@ void tbv_tbnet_minimal_recompute_state_locked(struct tbv_tbnet_identity *identit
 		break;
 	}
 
+	if (!(state & TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE))
+		identity->minimal_neighbor_seen = false;
+
 	if ((state & TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE) &&
-	    identity->proxy_ipv4)
+	    identity->proxy_ipv4 && identity->minimal_neighbor_seen)
 		state |= TBV_TBNET_ID_STATE_NEIGHBOR_READY;
 
 	identity->state = state;
@@ -401,7 +414,7 @@ static void tbv_tbnet_minimal_recompute_state(struct tbv_tbnet_identity *identit
 
 	mutex_lock(&identity->lock);
 	tbv_tbnet_minimal_recompute_state_locked(identity);
-	ready = identity->state & TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE;
+	ready = identity->state & TBV_TBNET_ID_STATE_NEIGHBOR_READY;
 	mutex_unlock(&identity->lock);
 
 	if (ready)
@@ -473,7 +486,8 @@ void tbv_tbnet_minimal_debugfs_show(struct seq_file *s,
 
 static int
 tbv_tbnet_minimal_send_frame(struct tbv_tbnet_minimal_session *session,
-			     const void *payload, u32 payload_len)
+			     const void *payload, u32 payload_len,
+			     bool arp_reply)
 {
 	struct tbv_tbnet_minimal_frame *f;
 	struct tbv_tbnet_frame_header *hdr;
@@ -519,6 +533,7 @@ tbv_tbnet_minimal_send_frame(struct tbv_tbnet_minimal_session *session,
 	f->frame.flags = 0;
 	f->frame.sof = TBV_TBNET_PDF_FRAME_START;
 	f->frame.eof = TBV_TBNET_PDF_FRAME_END;
+	f->arp_reply = arp_reply;
 	dma_sync_single_for_device(tb_ring_dma_device(session->tx_ring),
 				   f->dma, TBV_TBNET_MIN_FRAME_SIZE,
 				   DMA_TO_DEVICE);
@@ -535,6 +550,7 @@ tbv_tbnet_minimal_send_frame(struct tbv_tbnet_minimal_session *session,
 
 	atomic64_inc(&session->identity->minimal_packet_tx_errors);
 	atomic64_inc(&session->packet_tx_errors);
+	f->arp_reply = false;
 	atomic_dec(&session->tx_inflight);
 	spin_lock_irqsave(&session->tx_lock, flags);
 	list_add_tail(&f->node, &session->tx_free);
@@ -569,7 +585,7 @@ tbv_tbnet_minimal_send_arp_reply(struct tbv_tbnet_minimal_session *session,
 	atomic64_inc(&session->identity->arp_requests);
 	atomic64_inc(&session->arp_requests);
 	reply_len = max_t(u32, ret, ETH_ZLEN);
-	ret = tbv_tbnet_minimal_send_frame(session, reply, reply_len);
+	ret = tbv_tbnet_minimal_send_frame(session, reply, reply_len, true);
 	if (ret)
 		return ret;
 
