@@ -7,6 +7,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/thunderbolt.h>
 #include <linux/uuid.h>
 
@@ -129,6 +130,22 @@ static bool tbv_service_backend_data_enabled(const struct tbv_state *state,
 	return state->native_data;
 }
 
+static bool tbv_service_apple_xdomain_allowed(const struct tbv_state *state,
+					      const struct tb_xdomain *xd)
+{
+	const char *vendor = xd && xd->vendor_name ? xd->vendor_name : NULL;
+
+	if (state->cfg.profile != TBV_PROFILE_MIXED)
+		return true;
+
+	if (vendor && !strcmp(vendor, "Apple Inc."))
+		return true;
+
+	pr_info("skipping Apple AD/FA57 service from non-Apple peer vendor='%s' in mixed profile\n",
+		vendor ?: "<unknown>");
+	return false;
+}
+
 static u32 tbv_service_native_lane(const struct tb_service_id *id)
 {
 	return (u32)id->driver_data;
@@ -169,6 +186,10 @@ static int tbv_service_probe(struct tb_service *svc,
 	if (!tbv_service_backend_enabled(tbv_service_state, backend))
 		return -ENODEV;
 
+	if (backend == TBV_BACKEND_APPLE &&
+	    !tbv_service_apple_xdomain_allowed(tbv_service_state, xd))
+		return -ENODEV;
+
 	binding = kzalloc(sizeof(*binding), GFP_KERNEL);
 	if (!binding)
 		return -ENOMEM;
@@ -196,7 +217,7 @@ static int tbv_service_probe(struct tb_service *svc,
 		if (ret) {
 			goto err_remove_rail;
 		}
-		tbv_state_set_verbs_parent(tbv_service_state,
+		tbv_state_set_verbs_parent(tbv_service_state, backend,
 					   tb_ring_dma_device(rail->path.tx_ring));
 		pr_info("allocated rings service id=%d native_lane=%u tx_hop=%d rx_hop=%d out_hop=%d\n",
 			svc->id, backend == TBV_BACKEND_NATIVE ? native_lane : 0,

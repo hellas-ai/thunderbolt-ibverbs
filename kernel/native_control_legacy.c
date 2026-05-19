@@ -14,6 +14,9 @@ static bool tbv_native_legacy_handler_registered;
 static int tbv_native_control_legacy_handle(const void *buf, size_t size,
 					    void *data)
 {
+	if (!data)
+		return 0;
+
 	return tbv_native_control_handle_packet(data, NULL, buf, size);
 }
 

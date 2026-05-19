@@ -255,6 +255,9 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 	struct tb_xdomain *xd = NULL;
 	int ret;
 
+	if (!state)
+		return 0;
+
 	ret = tbv_native_wire_parse_hello(buf, size, &remote, &info);
 	if (ret)
 		return 0;

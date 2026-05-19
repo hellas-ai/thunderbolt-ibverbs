@@ -346,7 +346,7 @@ struct tbv_state {
 	atomic64_t native_legacy_ambiguous_limited;
 	struct xarray verbs_mrs_xa;
 	struct xarray verbs_qps_xa;
-	struct device *verbs_parent;
+	struct device *verbs_parent[2];
 	struct tbv_ibdev *ibdevs[2];
 };
 
@@ -495,7 +495,10 @@ int tbv_core_init(struct tbv_state *state,
 		  const struct tbv_resolved_config *cfg,
 		  const struct tbv_tbnet_identity_config *identity_cfg);
 void tbv_core_exit(struct tbv_state *state);
-void tbv_state_set_verbs_parent(struct tbv_state *state, struct device *dev);
-struct device *tbv_state_get_verbs_parent(struct tbv_state *state);
+void tbv_state_set_verbs_parent(struct tbv_state *state,
+				enum tbv_backend_type backend,
+				struct device *dev);
+struct device *tbv_state_get_verbs_parent(struct tbv_state *state,
+					  enum tbv_backend_type backend);
 
 #endif

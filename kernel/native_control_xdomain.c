@@ -17,7 +17,7 @@ static int tbv_native_control_xdomain_handle(struct tb_xdomain *source_xd,
 					     const void *buf, size_t size,
 					     void *data)
 {
-	if (!source_xd)
+	if (!source_xd || !data)
 		return 0;
 
 	return tbv_native_control_handle_packet(data, source_xd, buf, size);

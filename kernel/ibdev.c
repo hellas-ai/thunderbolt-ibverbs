@@ -4450,7 +4450,7 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
 
 	ib_set_device_ops(&dev->base, &tbv_ibdev_ops);
 
-	dma_device = tbv_state_get_verbs_parent(state);
+	dma_device = tbv_state_get_verbs_parent(state, backend);
 	dev->base.dev.parent = dma_device;
 	ret = ib_register_device(&dev->base, name, dma_device);
 	if (ret) {
