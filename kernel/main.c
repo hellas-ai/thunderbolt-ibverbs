@@ -119,6 +119,12 @@ MODULE_PARM_DESC(register_verbs,
 
 static struct tbv_state tbv_driver_state;
 
+static bool tbv_tbnet_identity_uses_stock(enum tbv_tbnet_identity_mode mode)
+{
+	return mode == TBV_TBNET_ID_STOCK ||
+	       mode == TBV_TBNET_ID_STOCK_PROXY;
+}
+
 static int __init tbv_init(void)
 {
 	char lanes_desc[32];
@@ -140,6 +146,13 @@ static int __init tbv_init(void)
 	ret = tbv_tbnet_identity_check_config(&resolved);
 	if (ret)
 		return ret;
+
+	if (apple_data && allocate_rings &&
+	    tbv_tbnet_identity_uses_stock(resolved.tbnet_identity)) {
+		pr_err("tbnet_identity=%s cannot be combined with apple_data=1 and allocate_rings=1: stock thunderbolt_net owns the Mac-facing DMA rings; use tbnet_identity=minimal_packet for Apple RDMA data or disable apple_data\n",
+		       tbv_tbnet_identity_name(resolved.tbnet_identity));
+		return -EINVAL;
+	}
 
 	if (start_rings && !allocate_rings) {
 		pr_err("start_rings=1 requires allocate_rings=1\n");
