@@ -76,6 +76,10 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "start_rings: %u\n", state->start_rings);
 	seq_printf(s, "negotiate_native: %u\n", state->negotiate_native);
 	seq_printf(s, "enable_tunnels: %u\n", state->enable_tunnels);
+	seq_printf(s, "apple_tunnels_wait_tbnet: %u\n",
+		   state->apple_tunnels_wait_tbnet);
+	seq_printf(s, "apple_tunnels_pending: %u\n",
+		   state->apple_tunnels_pending);
 	seq_printf(s, "native_data: %u\n", state->native_data);
 	seq_printf(s, "apple_data: %u\n", state->apple_data);
 	seq_printf(s, "native_wr_striping: %u\n", state->native_wr_striping);

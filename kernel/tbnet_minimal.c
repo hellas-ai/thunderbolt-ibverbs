@@ -396,9 +396,15 @@ void tbv_tbnet_minimal_recompute_state_locked(struct tbv_tbnet_identity *identit
 
 static void tbv_tbnet_minimal_recompute_state(struct tbv_tbnet_identity *identity)
 {
+	bool ready;
+
 	mutex_lock(&identity->lock);
 	tbv_tbnet_minimal_recompute_state_locked(identity);
+	ready = identity->state & TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE;
 	mutex_unlock(&identity->lock);
+
+	if (ready)
+		tbv_services_tbnet_identity_ready(identity);
 }
 
 void tbv_tbnet_minimal_debugfs_show(struct seq_file *s,

@@ -335,6 +335,9 @@ struct tbv_state {
 	bool native_control_registered;
 	bool native_control_source_aware;
 	bool native_legacy_multicable_warned;
+	bool apple_tunnels_wait_tbnet;
+	bool apple_tunnels_pending;
+	struct work_struct apple_tunnel_work;
 	atomic_t verbs_ucontexts;
 	atomic_t verbs_pds;
 	atomic_t verbs_cqs;
@@ -464,6 +467,7 @@ void tbv_tbnet_minimal_stop(struct tbv_tbnet_identity *identity);
 void tbv_tbnet_minimal_recompute_state_locked(struct tbv_tbnet_identity *identity);
 void tbv_tbnet_minimal_debugfs_show(struct seq_file *s,
 				    struct tbv_tbnet_identity *identity);
+void tbv_services_tbnet_identity_ready(struct tbv_tbnet_identity *identity);
 struct tb_property_dir *tbv_service_create_native_dir(void);
 struct tb_property_dir *tbv_service_create_apple_dir(u32 prtcstns);
 int tbv_services_start(struct tbv_state *state, bool bind_services,
