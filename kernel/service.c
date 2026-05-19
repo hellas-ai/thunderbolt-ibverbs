@@ -130,19 +130,19 @@ static bool tbv_service_backend_data_enabled(const struct tbv_state *state,
 	return state->native_data;
 }
 
-static bool tbv_service_tbnet_packet_ready(const struct tbv_state *state)
+static bool tbv_service_tbnet_neighbor_ready(const struct tbv_state *state)
 {
 	if (state->cfg.tbnet_identity != TBV_TBNET_ID_MINIMAL_PACKET)
 		return true;
 
-	return state->tbnet_identity.state &
+	return READ_ONCE(state->tbnet_identity.state) &
 	       TBV_TBNET_ID_STATE_NEIGHBOR_READY;
 }
 
 static bool tbv_service_should_defer_apple_tunnel(struct tbv_state *state)
 {
 	return state->apple_tunnels_wait_tbnet &&
-	       !tbv_service_tbnet_packet_ready(state);
+	       !tbv_service_tbnet_neighbor_ready(state);
 }
 
 static int tbv_service_enable_apple_tunnel(struct tbv_rail *rail)
@@ -195,7 +195,7 @@ static void tbv_service_apple_tunnel_work(struct work_struct *work)
 
 	if (!state->services_registered || !state->enable_tunnels)
 		return;
-	if (!tbv_service_tbnet_packet_ready(state))
+	if (!tbv_service_tbnet_neighbor_ready(state))
 		return;
 
 	for (;;) {
@@ -230,7 +230,7 @@ void tbv_services_tbnet_identity_ready(struct tbv_tbnet_identity *identity)
 		return;
 	if (!state->services_registered || !state->apple_tunnels_wait_tbnet)
 		return;
-	if (!tbv_service_tbnet_packet_ready(state))
+	if (!tbv_service_tbnet_neighbor_ready(state))
 		return;
 
 	queue_work(system_long_wq, &state->apple_tunnel_work);
@@ -350,7 +350,7 @@ static int tbv_service_probe(struct tb_service *svc,
 				 tbv_service_state->enable_tunnels) {
 				if (tbv_service_should_defer_apple_tunnel(tbv_service_state)) {
 					tbv_service_state->apple_tunnels_pending = true;
-					pr_info("deferring Apple data path service id=%d route=0x%llx until TBnet packet path is active\n",
+					pr_info("deferring Apple data path service id=%d route=0x%llx until TBnet neighbor is proven\n",
 						svc->id, xd->route);
 				} else {
 					ret = tbv_service_enable_apple_tunnel(rail);
