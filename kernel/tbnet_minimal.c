@@ -338,7 +338,6 @@ tbv_tbnet_minimal_alloc_rings(struct tbv_tbnet_minimal_session *session)
 	unsigned int flags = RING_FLAG_FRAME;
 	u16 sof_mask = BIT(TBV_TBNET_PDF_FRAME_START);
 	u16 eof_mask = BIT(TBV_TBNET_PDF_FRAME_END);
-	int e2e_tx_hop = 0;
 	int hopid;
 	int ret;
 
@@ -358,12 +357,10 @@ tbv_tbnet_minimal_alloc_rings(struct tbv_tbnet_minimal_session *session)
 	}
 	session->local_transmit_path = hopid;
 
-	if (flags & RING_FLAG_E2E)
-		e2e_tx_hop = session->tx_ring->hop;
-
 	session->rx_ring = tb_ring_alloc_rx(session->xd->tb->nhi, -1,
 					    TBV_TBNET_MIN_RING_SIZE, flags,
-					    e2e_tx_hop, sof_mask, eof_mask,
+					    session->tx_ring->hop,
+					    sof_mask, eof_mask,
 					    tbv_tbnet_minimal_rx_ready,
 					    session);
 	if (!session->rx_ring) {
