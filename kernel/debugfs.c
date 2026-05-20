@@ -155,8 +155,18 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_tx_canceled));
 	seq_printf(s, "data_tx_errors: %lld\n",
 		   atomic64_read(&state->data_tx_errors));
+	seq_printf(s, "data_tx_credit_stalls: %lld\n",
+		   atomic64_read(&state->data_tx_credit_stalls));
+	seq_printf(s, "data_tx_credit_received: %lld\n",
+		   atomic64_read(&state->data_tx_credit_received));
 	seq_printf(s, "data_rx_completed: %lld\n",
 		   atomic64_read(&state->data_rx_completed));
+	seq_printf(s, "data_rx_credit_sent: %lld\n",
+		   atomic64_read(&state->data_rx_credit_sent));
+	seq_printf(s, "data_rx_credit_send_error: %lld\n",
+		   atomic64_read(&state->data_rx_credit_send_error));
+	seq_printf(s, "data_rx_repost_failed: %lld\n",
+		   atomic64_read(&state->data_rx_repost_failed));
 	seq_printf(s, "data_rx_bad_frame: %lld\n",
 		   atomic64_read(&state->data_rx_bad_frame));
 	seq_printf(s, "data_rx_bad_header: %lld\n",
@@ -265,11 +275,21 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 				   rail->remote_tx_hop,
 				   rail->remote_rx_hop);
 			seq_printf(s,
-				   "    data_tx_enqueued=%lld data_tx_posted=%lld data_tx_completed=%lld data_rx_completed=%lld\n",
+				   "    data_tx_enqueued=%lld data_tx_posted=%lld data_tx_completed=%lld data_tx_credit_stalls=%lld data_tx_credit_received=%lld tx_credits=%u/%u\n",
 				   atomic64_read(&rail->path.data_tx_enqueued),
 				   atomic64_read(&rail->path.data_tx_posted),
 				   atomic64_read(&rail->path.data_tx_completed),
-				   atomic64_read(&rail->path.data_rx_completed));
+				   atomic64_read(&rail->path.data_tx_credit_stalls),
+				   atomic64_read(&rail->path.data_tx_credit_received),
+				   rail->path.tx_remote_data_credits,
+				   rail->path.tx_remote_data_credit_max);
+			seq_printf(s,
+				   "    data_rx_completed=%lld data_rx_credit_sent=%lld data_rx_credit_send_error=%lld data_rx_repost_failed=%lld rx_credit_pending=%u\n",
+				   atomic64_read(&rail->path.data_rx_completed),
+				   atomic64_read(&rail->path.data_rx_credit_sent),
+				   atomic64_read(&rail->path.data_rx_credit_send_error),
+				   atomic64_read(&rail->path.data_rx_repost_failed),
+				   rail->path.rx_data_credit_pending);
 		}
 	}
 	mutex_unlock(&state->lock);

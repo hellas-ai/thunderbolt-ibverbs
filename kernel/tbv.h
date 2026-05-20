@@ -160,6 +160,9 @@ struct tbv_path {
 	u32 tx_data_queued;
 	u32 tx_data_reserved;
 	u32 tx_data_queue_limit;
+	u32 tx_remote_data_credits;
+	u32 tx_remote_data_credit_max;
+	u32 rx_data_credit_pending;
 	spinlock_t tx_lock;
 	struct list_head tx_free;
 	struct list_head tx_control_free;
@@ -171,7 +174,12 @@ struct tbv_path {
 	atomic64_t data_tx_enqueued;
 	atomic64_t data_tx_posted;
 	atomic64_t data_tx_completed;
+	atomic64_t data_tx_credit_stalls;
+	atomic64_t data_tx_credit_received;
 	atomic64_t data_rx_completed;
+	atomic64_t data_rx_credit_sent;
+	atomic64_t data_rx_credit_send_error;
+	atomic64_t data_rx_repost_failed;
 	u8 rx_raw_opcode;
 	u8 rx_raw_flags;
 	u32 rx_raw_dest_qp;
@@ -394,7 +402,12 @@ struct tbv_state {
 	atomic64_t data_tx_completed;
 	atomic64_t data_tx_canceled;
 	atomic64_t data_tx_errors;
+	atomic64_t data_tx_credit_stalls;
+	atomic64_t data_tx_credit_received;
 	atomic64_t data_rx_completed;
+	atomic64_t data_rx_credit_sent;
+	atomic64_t data_rx_credit_send_error;
+	atomic64_t data_rx_repost_failed;
 	atomic64_t data_rx_bad_frame;
 	atomic64_t data_rx_bad_header;
 	atomic64_t data_rx_send;
@@ -564,6 +577,8 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 int tbv_path_start_rings(struct tbv_path *path);
 int tbv_path_enable_tunnel(struct tbv_path *path, struct tb_xdomain *xd,
 			   int remote_transmit_path);
+void tbv_path_set_remote_rx_capacity(struct tbv_path *path, u32 rx_ring_size);
+void tbv_path_add_remote_rx_credits(struct tbv_path *path, u32 credits);
 int tbv_path_reserve_data(struct tbv_path *path, u32 frames);
 void tbv_path_release_data_reservation(struct tbv_path *path, u32 frames);
 int tbv_path_send(struct tbv_path *path, const void *data, u32 len,

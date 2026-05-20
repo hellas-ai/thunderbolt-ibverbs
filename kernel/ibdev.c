@@ -172,6 +172,14 @@ struct tbv_rx_message {
 	u32 imm_data;
 	u32 received;
 	u32 delivered;
+	u32 first_rail_id;
+	u32 last_rail_id;
+	u64 first_route;
+	u64 last_route;
+	u32 first_path_id;
+	u32 last_path_id;
+	u32 last_offset;
+	u32 last_len;
 	int status;
 	bool active;
 	bool with_imm;
@@ -1769,6 +1777,18 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 	if (tqp->rx_msg.active &&
 	    tbv_qp_entry_expired(tqp->rx_msg.started_jiffies, now, timeout)) {
 		atomic64_inc(&state->data_rx_active_timeout);
+		pr_warn_ratelimited("native SEND active timeout qpn=0x%x src_qp=0x%x psn=%u received=%u total=%u last_offset=%u last_len=%u first_rail=0x%x first_route=0x%llx first_path=%u last_rail=0x%x last_route=0x%llx last_path=%u\n",
+				    tqp->base.qp_num, tqp->rx_msg.src_qp,
+				    tqp->rx_msg.psn, tqp->rx_msg.received,
+				    tqp->rx_msg.total_len,
+				    tqp->rx_msg.last_offset,
+				    tqp->rx_msg.last_len,
+				    tqp->rx_msg.first_rail_id,
+				    tqp->rx_msg.first_route,
+				    tqp->rx_msg.first_path_id,
+				    tqp->rx_msg.last_rail_id,
+				    tqp->rx_msg.last_route,
+				    tqp->rx_msg.last_path_id);
 		tbv_rx_fail_active_send(state, tqp, NULL, IB_WC_GENERAL_ERR);
 		timed_out = true;
 	}
@@ -4091,6 +4111,33 @@ static void tbv_rx_finish_send(struct tbv_state *state, struct tbv_qp *tqp,
 			     ack_status);
 }
 
+static void tbv_rx_note_active_path(struct tbv_rx_message *msg,
+				    struct tbv_path *rx_path, u32 offset,
+				    u32 len)
+{
+	u32 rail_id = 0;
+	u64 route = 0;
+	u32 path_id = 0;
+
+	if (rx_path && rx_path->rail) {
+		rail_id = rx_path->rail->rail_id;
+		route = rx_path->rail->key.route;
+		path_id = rx_path->rail->key.path_id;
+	}
+
+	if (!msg->received) {
+		msg->first_rail_id = rail_id;
+		msg->first_route = route;
+		msg->first_path_id = path_id;
+	}
+
+	msg->last_rail_id = rail_id;
+	msg->last_route = route;
+	msg->last_path_id = path_id;
+	msg->last_offset = offset;
+	msg->last_len = len;
+}
+
 static void tbv_rx_fail_active_send(struct tbv_state *state, struct tbv_qp *tqp,
 				    struct tbv_path *rx_path,
 				    enum ib_wc_status status)
@@ -4375,6 +4422,7 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 		tbv_qp_schedule_timeout(tqp);
 	}
 
+	tbv_rx_note_active_path(msg, rx_path, offset, hdr->length);
 	if (tbv_rx_copy_to_wqe(state, &msg->wqe, offset, payload, hdr->length,
 			       &msg->delivered))
 		msg->status = IB_WC_LOC_PROT_ERR;

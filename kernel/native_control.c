@@ -192,6 +192,8 @@ static int tbv_native_control_apply_remote(struct tbv_state *state,
 			rail->remote_transmit_path = remote->transmit_path;
 			rail->remote_tx_hop = remote->tx_hop;
 			rail->remote_rx_hop = remote->rx_hop;
+			tbv_path_set_remote_rx_capacity(&rail->path,
+							remote->rx_ring_size);
 			ret = 0;
 			goto out;
 		}
