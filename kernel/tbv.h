@@ -5,6 +5,7 @@
 #include <linux/atomic.h>
 #include <linux/bitops.h>
 #include <linux/completion.h>
+#include <linux/idr.h>
 #include <linux/if.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
@@ -22,6 +23,8 @@
 #define TBV_ETH_ALEN 6
 #define TBV_NATIVE_PROTOCOL_KEY "tbverbs"
 #define TBV_NATIVE_MAX_LANES 4
+#define TBV_DATA_PDF_FRAME_START 1
+#define TBV_DATA_PDF_FRAME_END 3
 #define TBV_NATIVE_PRTCID 1
 #define TBV_NATIVE_PRTCVERS 1
 #define TBV_NATIVE_PRTCREVS 0
@@ -131,6 +134,14 @@ struct tbv_path_config {
 	bool e2e;
 };
 
+struct tbv_path_owned_frame {
+	struct list_head node;
+	void *data;
+	u32 len;
+	u8 sof;
+	u8 eof;
+};
+
 struct tbv_path {
 	enum tbv_path_state state;
 	struct tbv_path_config cfg;
@@ -156,7 +167,6 @@ struct tbv_path {
 	struct list_head tx_control_queue;
 	struct list_head tx_data_queue;
 	struct list_head tx_zcopy_inflight;
-	struct delayed_work tx_poll_work;
 	atomic_t tx_inflight;
 	atomic64_t data_tx_enqueued;
 	atomic64_t data_tx_posted;
@@ -217,6 +227,7 @@ struct tbv_peer {
 	enum tbv_backend_type backend;
 	struct tb_xdomain *xd;
 	struct list_head rails;
+	struct ida rail_ids;
 	u32 nr_rails;
 };
 
@@ -353,6 +364,7 @@ struct tbv_state {
 	bool apple_tunnels_wait_tbnet;
 	bool apple_tunnels_pending;
 	struct work_struct apple_tunnel_work;
+	struct workqueue_struct *workqueue;
 	atomic_t verbs_ucontexts;
 	atomic_t verbs_pds;
 	atomic_t verbs_cqs;
@@ -370,9 +382,12 @@ struct tbv_state {
 	atomic64_t data_wr_copied;
 	atomic64_t data_wr_zcopy;
 	atomic64_t data_wr_zcopy_fallback;
+	atomic64_t data_wr_zcopy_fallback_striping;
+	atomic64_t data_wr_zcopy_fallback_unsafe_sge;
 	atomic64_t data_wr_copy_error;
 	atomic64_t data_wr_path_send;
 	atomic64_t data_wr_path_send_error;
+	atomic64_t data_wr_timeout;
 	atomic64_t data_tx_accepted;
 	atomic64_t data_tx_posted;
 	atomic64_t data_tx_completed;
@@ -388,11 +403,16 @@ struct tbv_state {
 	atomic64_t data_rx_op_write_imm;
 	atomic64_t data_rx_ack;
 	atomic64_t data_rx_no_qp;
+	atomic64_t data_rx_bad_peer;
+	atomic64_t data_rx_unconnected_qp;
+	atomic64_t data_rx_qp_error;
 	atomic64_t data_rx_no_recv;
 	atomic64_t data_rx_copy_error;
+	atomic64_t data_rx_active_timeout;
 	atomic64_t data_rx_reorder_buffered;
 	atomic64_t data_rx_reorder_delivered;
 	atomic64_t data_rx_reorder_dropped;
+	atomic64_t data_rx_reorder_timeout;
 	atomic64_t data_rx_reorder_window;
 	atomic64_t data_rx_pending_discarded;
 	atomic64_t apple_rx_sof;
@@ -552,6 +572,11 @@ int tbv_path_send_owned(struct tbv_path *path, void *data, u32 len,
 int tbv_path_send_marked_owned(struct tbv_path *path, void *data, u32 len,
 			       u8 sof, u8 eof, unsigned int flags,
 			       tbv_path_tx_done_fn done, void *done_ctx);
+int tbv_path_send_owned_list_reserved(struct tbv_path *path,
+				      struct list_head *frames,
+				      unsigned int flags,
+				      tbv_path_tx_done_fn done,
+				      void *done_ctx);
 int tbv_path_send_marked_fill(struct tbv_path *path, u32 len,
 			      u8 sof, u8 eof, unsigned int flags,
 			      tbv_path_tx_fill_fn fill, void *fill_ctx,

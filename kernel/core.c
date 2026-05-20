@@ -6,6 +6,7 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
+#include <linux/workqueue.h>
 
 #include "tbv.h"
 
@@ -36,22 +37,28 @@ int tbv_core_init(struct tbv_state *state,
 	xa_init(&state->verbs_mrs_xa);
 	xa_init(&state->verbs_qps_xa);
 	state->next_peer_id = 1;
+	state->workqueue = alloc_workqueue("tbv_ibdev",
+					   WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+	if (!state->workqueue) {
+		mutex_destroy(&state->lock);
+		return -ENOMEM;
+	}
 
-	if (!cfg->native_enabled && !cfg->apple_enabled)
-		return -EINVAL;
+	if (!cfg->native_enabled && !cfg->apple_enabled) {
+		ret = -EINVAL;
+		goto err_destroy_wq;
+	}
 
 	ret = tbv_tbnet_identity_prepare(&state->tbnet_identity, cfg,
 					 identity_cfg);
 	if (ret) {
-		mutex_destroy(&state->lock);
-		return ret;
+		goto err_destroy_wq;
 	}
 
 	ret = tbv_debugfs_init(state);
 	if (ret) {
 		tbv_tbnet_identity_stop(&state->tbnet_identity);
-		mutex_destroy(&state->lock);
-		return ret;
+		goto err_destroy_wq;
 	}
 
 	if (cfg->native_enabled)
@@ -64,6 +71,12 @@ int tbv_core_init(struct tbv_state *state,
 		tbv_profile_name(cfg->profile), cfg->rc_supported,
 		cfg->uc_supported);
 	return 0;
+
+err_destroy_wq:
+	destroy_workqueue(state->workqueue);
+	state->workqueue = NULL;
+	mutex_destroy(&state->lock);
+	return ret;
 }
 
 void tbv_core_exit(struct tbv_state *state)
@@ -79,6 +92,12 @@ void tbv_core_exit(struct tbv_state *state)
 			put_device(state->verbs_parent[backend]);
 			state->verbs_parent[backend] = NULL;
 		}
+	}
+
+	if (state->workqueue) {
+		flush_workqueue(state->workqueue);
+		destroy_workqueue(state->workqueue);
+		state->workqueue = NULL;
 	}
 
 	tbv_debugfs_exit(state);

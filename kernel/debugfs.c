@@ -131,12 +131,18 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_zcopy));
 	seq_printf(s, "data_wr_zcopy_fallback: %lld\n",
 		   atomic64_read(&state->data_wr_zcopy_fallback));
+	seq_printf(s, "data_wr_zcopy_fallback_striping: %lld\n",
+		   atomic64_read(&state->data_wr_zcopy_fallback_striping));
+	seq_printf(s, "data_wr_zcopy_fallback_unsafe_sge: %lld\n",
+		   atomic64_read(&state->data_wr_zcopy_fallback_unsafe_sge));
 	seq_printf(s, "data_wr_copy_error: %lld\n",
 		   atomic64_read(&state->data_wr_copy_error));
 	seq_printf(s, "data_wr_path_send: %lld\n",
 		   atomic64_read(&state->data_wr_path_send));
 	seq_printf(s, "data_wr_path_send_error: %lld\n",
 		   atomic64_read(&state->data_wr_path_send_error));
+	seq_printf(s, "data_wr_timeout: %lld\n",
+		   atomic64_read(&state->data_wr_timeout));
 	seq_printf(s, "data_tx_accepted: %lld\n",
 		   atomic64_read(&state->data_tx_accepted));
 	seq_printf(s, "data_tx_posted: %lld\n",
@@ -167,16 +173,26 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_ack));
 	seq_printf(s, "data_rx_no_qp: %lld\n",
 		   atomic64_read(&state->data_rx_no_qp));
+	seq_printf(s, "data_rx_bad_peer: %lld\n",
+		   atomic64_read(&state->data_rx_bad_peer));
+	seq_printf(s, "data_rx_unconnected_qp: %lld\n",
+		   atomic64_read(&state->data_rx_unconnected_qp));
+	seq_printf(s, "data_rx_qp_error: %lld\n",
+		   atomic64_read(&state->data_rx_qp_error));
 	seq_printf(s, "data_rx_no_recv: %lld\n",
 		   atomic64_read(&state->data_rx_no_recv));
 	seq_printf(s, "data_rx_copy_error: %lld\n",
 		   atomic64_read(&state->data_rx_copy_error));
+	seq_printf(s, "data_rx_active_timeout: %lld\n",
+		   atomic64_read(&state->data_rx_active_timeout));
 	seq_printf(s, "data_rx_reorder_buffered: %lld\n",
 		   atomic64_read(&state->data_rx_reorder_buffered));
 	seq_printf(s, "data_rx_reorder_delivered: %lld\n",
 		   atomic64_read(&state->data_rx_reorder_delivered));
 	seq_printf(s, "data_rx_reorder_dropped: %lld\n",
 		   atomic64_read(&state->data_rx_reorder_dropped));
+	seq_printf(s, "data_rx_reorder_timeout: %lld\n",
+		   atomic64_read(&state->data_rx_reorder_timeout));
 	seq_printf(s, "data_rx_reorder_window: %lld\n",
 		   atomic64_read(&state->data_rx_reorder_window));
 	seq_printf(s, "data_rx_pending_discarded: %lld\n",

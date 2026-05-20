@@ -131,6 +131,7 @@ struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
 		return ERR_PTR(-EBUSY);
 	}
 
+	ida_init(&peer->rail_ids);
 	peer->peer_id = state->next_peer_id++;
 	list_add_tail(&peer->node, &state->peers);
 	mutex_unlock(&state->lock);
@@ -162,6 +163,7 @@ void tbv_peer_put(struct tbv_state *state, struct tbv_peer *peer)
 
 	pr_info("peer %u destroyed backend=%s\n", peer->peer_id,
 		tbv_backend_name(peer->backend));
+	ida_destroy(&peer->rail_ids);
 	tb_xdomain_put(peer->xd);
 	kfree(peer);
 }
@@ -173,13 +175,20 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 	struct tbv_rail *rail;
 	struct tbv_rail *pos;
 	u32 existing_peer_id = 0;
+	int rail_id;
 
 	rail = kzalloc(sizeof(*rail), GFP_KERNEL);
 	if (!rail)
 		return ERR_PTR(-ENOMEM);
 
+	rail_id = ida_alloc(&peer->rail_ids, GFP_KERNEL);
+	if (rail_id < 0) {
+		kfree(rail);
+		return ERR_PTR(rail_id);
+	}
+
 	rail->key = *key;
-	rail->rail_id = tbv_rail_key_hash(key);
+	rail->rail_id = rail_id;
 	refcount_set(&rail->refcnt, 1);
 	init_completion(&rail->refs_zero);
 	rail->active = true;
@@ -212,6 +221,7 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 				existing_peer_id);
 		}
 		mutex_unlock(&peer->state->lock);
+		ida_free(&peer->rail_ids, rail->rail_id);
 		kfree(rail);
 		return ERR_PTR(-EBUSY);
 	}
@@ -221,6 +231,7 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 
 		if (!cmp) {
 			mutex_unlock(&peer->state->lock);
+			ida_free(&peer->rail_ids, rail->rail_id);
 			kfree(rail);
 			return ERR_PTR(-EEXIST);
 		}
@@ -259,6 +270,7 @@ void tbv_peer_remove_rail(struct tbv_rail *rail)
 	tbv_rail_put(rail);
 	wait_for_completion(&rail->refs_zero);
 	tbv_path_destroy(&rail->path, peer->xd);
+	ida_free(&peer->rail_ids, rail->rail_id);
 	kfree(rail);
 }
 
