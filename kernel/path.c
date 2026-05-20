@@ -20,7 +20,13 @@
 #define TBV_DATA_PDF_FRAME_END 3
 #define TBV_CONTROL_FRAME_SIZE 256
 #define TBV_CONTROL_QUEUE_MULTIPLIER 4
-#define TBV_DATA_QUEUE_MULTIPLIER 4
+/*
+ * Raw-stream zcopy serializes each DMA path, so several QPs sharing a rail can
+ * briefly queue a full TX-depth worth of packetized WRs behind one active
+ * stream. Keep enough metadata headroom for qps=4/TX-depth=128/64 KiB without
+ * reporting a false SQ-full error on a healthy two-rail link.
+ */
+#define TBV_DATA_QUEUE_MULTIPLIER 8
 #define TBV_DATA_PACKET_POOL_LIMIT 1024
 #define TBV_TX_POLL_DELAY msecs_to_jiffies(1)
 
@@ -132,6 +138,19 @@ static void tbv_path_tx_packet_release(struct tbv_tx_packet *packet, int status)
 
 static void tbv_path_schedule_tx(struct tbv_path *path);
 static void tbv_path_tx_poll_work(struct work_struct *work);
+
+static void tbv_path_finish_raw_stream_if_needed(struct tbv_path *path,
+						 const struct tbv_tx_packet *packet)
+{
+	unsigned long flags;
+
+	if (!packet || !packet->raw_stream_end)
+		return;
+
+	spin_lock_irqsave(&path->tx_lock, flags);
+	path->tx_raw_stream_active = false;
+	spin_unlock_irqrestore(&path->tx_lock, flags);
+}
 
 static void tbv_path_schedule_tx_poll(struct tbv_path *path)
 {
@@ -253,9 +272,11 @@ static void tbv_path_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	}
 	if (packet && !packet->control && !canceled)
 		atomic64_inc(&path->data_tx_completed);
-	if (packet)
+	if (packet) {
+		tbv_path_finish_raw_stream_if_needed(path, packet);
 		tbv_path_tx_packet_release(packet,
 					   canceled ? -ECANCELED : 0);
+	}
 
 	atomic_dec(&path->tx_inflight);
 	tbv_path_schedule_tx(path);
@@ -340,6 +361,7 @@ static void tbv_path_zcopy_tx_complete(struct tb_ring *ring,
 	if (!canceled)
 		atomic64_inc(&path->data_tx_completed);
 
+	tbv_path_finish_raw_stream_if_needed(path, packet);
 	tbv_path_tx_packet_release(packet, canceled ? -ECANCELED : 0);
 	atomic_dec(&path->tx_inflight);
 	tbv_path_schedule_tx(path);
@@ -1052,8 +1074,21 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 			return;
 		}
 
-		if (!path->tx_raw_stream_active &&
-		    !list_empty(&path->tx_control_queue)) {
+		if (path->tx_raw_stream_active) {
+			if (list_empty(&path->tx_data_queue)) {
+				path->tx_scheduling = false;
+				spin_unlock_irqrestore(&path->tx_lock, flags);
+				return;
+			}
+			packet = list_first_entry(&path->tx_data_queue,
+						  struct tbv_tx_packet, node);
+			if (!packet->zcopy || packet->raw_stream_start) {
+				path->tx_scheduling = false;
+				spin_unlock_irqrestore(&path->tx_lock, flags);
+				return;
+			}
+			needs_staging = false;
+		} else if (!list_empty(&path->tx_control_queue)) {
 			packet = list_first_entry(&path->tx_control_queue,
 						  struct tbv_tx_packet, node);
 			needs_staging = true;
@@ -1089,8 +1124,6 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		old_raw_stream_active = path->tx_raw_stream_active;
 		if (packet->raw_stream_start)
 			path->tx_raw_stream_active = true;
-		if (packet->raw_stream_end)
-			path->tx_raw_stream_active = false;
 
 		if (needs_staging) {
 			f = list_first_entry(&path->tx_free,
@@ -1505,7 +1538,6 @@ static u32 tbv_path_cancel_data_match(struct tbv_path *path,
 	struct tbv_tx_packet *tmp;
 	LIST_HEAD(cancel);
 	unsigned long flags;
-	u32 suppressed = 0;
 	u32 i;
 
 	if ((!done || !done_ctx) && !owner_ctx)
@@ -1532,12 +1564,7 @@ static u32 tbv_path_cancel_data_match(struct tbv_path *path,
 		    !tbv_path_packet_matches(packet, done, done_ctx,
 					     owner_ctx))
 			continue;
-		packet->done = NULL;
-		packet->done_ctx = NULL;
 		packet->owner_ctx = NULL;
-		f->done = NULL;
-		f->done_ctx = NULL;
-		suppressed++;
 	}
 
 	list_for_each_entry_safe(packet, tmp, &path->tx_zcopy_inflight, node) {
@@ -1546,10 +1573,7 @@ static u32 tbv_path_cancel_data_match(struct tbv_path *path,
 			continue;
 		list_del_init(&packet->node);
 		packet->inflight = false;
-		packet->done = NULL;
-		packet->done_ctx = NULL;
 		packet->owner_ctx = NULL;
-		suppressed++;
 	}
 	spin_unlock_irqrestore(&path->tx_lock, flags);
 
@@ -1559,7 +1583,7 @@ static u32 tbv_path_cancel_data_match(struct tbv_path *path,
 		tbv_path_tx_packet_release(packet, -ECANCELED);
 	}
 
-	return suppressed;
+	return 0;
 }
 
 u32 tbv_path_cancel_data_done_ctx(struct tbv_path *path,

@@ -233,7 +233,7 @@ struct tbv_mr {
 	struct tbv_state *owner;
 	struct ib_umem *umem;
 	refcount_t refs;
-	struct completion refs_zero;
+	struct work_struct free_work;
 	u64 start;
 	u64 length;
 	u64 virt_addr;
@@ -427,10 +427,29 @@ out:
 	return mr;
 }
 
+static void tbv_mr_free(struct tbv_mr *mr)
+{
+	if (mr->umem)
+		ib_umem_release(mr->umem);
+	if (mr->owner)
+		atomic_dec(&mr->owner->verbs_mrs);
+	kfree(mr);
+}
+
+static void tbv_mr_free_work(struct work_struct *work)
+{
+	struct tbv_mr *mr = container_of(work, struct tbv_mr, free_work);
+
+	tbv_mr_free(mr);
+}
+
 static void tbv_mr_put(struct tbv_mr *mr)
 {
-	if (mr && refcount_dec_and_test(&mr->refs))
-		complete(&mr->refs_zero);
+	if (!mr)
+		return;
+
+	if (refcount_dec_and_test(&mr->refs))
+		queue_work(system_unbound_wq, &mr->free_work);
 }
 
 static struct tbv_qp *tbv_qp_get_by_num(struct tbv_state *state, u32 qpn)
@@ -4388,7 +4407,7 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	mr->base.rkey = key;
 	mr->owner = tbv_ibdev_state(pd->device);
 	refcount_set(&mr->refs, 1);
-	init_completion(&mr->refs_zero);
+	INIT_WORK(&mr->free_work, tbv_mr_free_work);
 	mr->start = start;
 	mr->length = length;
 	mr->virt_addr = virt_addr;
@@ -4416,12 +4435,8 @@ static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 		__xa_erase(&mr->owner->verbs_mrs_xa, ibmr->lkey);
 		xa_unlock_irqrestore(&mr->owner->verbs_mrs_xa, flags);
 	}
+
 	tbv_mr_put(mr);
-	wait_for_completion(&mr->refs_zero);
-	if (mr->owner)
-		atomic_dec(&mr->owner->verbs_mrs);
-	ib_umem_release(mr->umem);
-	kfree(mr);
 	return 0;
 }
 
@@ -4562,5 +4577,6 @@ void tbv_ibdev_stop(struct tbv_state *state)
 			tbv_backend_name(backend));
 	}
 
+	flush_workqueue(system_unbound_wq);
 	ida_destroy(&tbv_qpn_ida);
 }
