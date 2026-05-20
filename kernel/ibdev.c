@@ -4582,7 +4582,7 @@ static void tbv_read_req_workfn(struct work_struct *work)
 		goto out_put_mr;
 	}
 
-	if (zcopy_min_bytes && req->imm_data < zcopy_min_bytes)
+	if (!zcopy_min_bytes || req->imm_data < zcopy_min_bytes)
 		ret = tbv_send_read_response_copy(state, req, mr);
 	else
 		ret = tbv_send_read_response_zcopy(state, req, mr);
