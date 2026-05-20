@@ -331,10 +331,8 @@ static void tbv_path_rx_raw_payload(struct tbv_path *path,
 
 	hdr.opcode = path->rx_raw_opcode;
 	hdr.flags = path->rx_raw_flags;
-	if (len == path->rx_raw_remaining) {
-		hdr.flags |= TBV_NATIVE_DATA_F_LAST;
+	if (len == path->rx_raw_remaining)
 		path->rx_raw_pending = false;
-	}
 	hdr.dest_qp = path->rx_raw_dest_qp;
 	hdr.src_qp = path->rx_raw_src_qp;
 	hdr.psn = path->rx_raw_psn;
@@ -1514,13 +1512,12 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 			      void *meta_done_ctx,
 			      tbv_path_next_page_fn next, void *next_ctx)
 {
-	struct tbv_native_data_header stream_hdr;
 	struct device *dma_dev;
 	LIST_HEAD(packets);
 	u32 prepared = 0;
 	u32 packet_count = 0;
 	struct tbv_tx_packet *packet;
-	u8 *hdr_buf;
+	bool meta_done_attached = false;
 	int ret;
 
 	if (!path || !hdr || !next || !total_length) {
@@ -1540,41 +1537,16 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 		goto err_meta_done;
 	}
 
-	hdr_buf = kzalloc(TBV_NATIVE_DATA_HDR_SIZE, GFP_KERNEL);
-	if (!hdr_buf) {
-		ret = -ENOMEM;
-		goto err_meta_done;
-	}
-
-	stream_hdr = *hdr;
-	stream_hdr.length = total_length;
-	stream_hdr.remote_addr = hdr->remote_addr;
-	stream_hdr.flags |= TBV_NATIVE_DATA_F_RAW_STREAM;
-	ret = tbv_native_data_build_header(hdr_buf, TBV_NATIVE_DATA_HDR_SIZE,
-					   &stream_hdr);
-	if (ret < 0) {
-		kfree(hdr_buf);
-		goto err_meta_done;
-	}
-
-	packet = tbv_path_alloc_data_packet_owned(path, hdr_buf,
-						  TBV_NATIVE_DATA_HDR_SIZE,
-						  meta_done, meta_done_ctx);
-	if (!packet) {
-		kfree(hdr_buf);
-		ret = -ENOMEM;
-		goto err_meta_done;
-	}
-	packet->raw_stream_start = true;
-	list_add_tail(&packet->node, &packets);
-	packet_count++;
 	dma_dev = tb_ring_dma_device(path->tx_ring);
 
 	while (prepared < total_length) {
 		tbv_path_tx_done_fn done = NULL;
+		struct tbv_native_data_header stream_hdr;
 		struct page *page = NULL;
 		void *done_ctx = NULL;
+		bool last;
 		dma_addr_t dma;
+		u8 *hdr_buf;
 		u32 page_off = 0;
 		u32 len = 0;
 
@@ -1582,6 +1554,7 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 		if (ret)
 			goto err_release;
 		if (!page || !len || len > TBV_DATA_FRAME_SIZE ||
+		    len > TBV_NATIVE_DATA_MAX_PAYLOAD ||
 		    len > total_length - prepared ||
 		    page_off > PAGE_SIZE || len > PAGE_SIZE - page_off) {
 			if (done)
@@ -1589,6 +1562,55 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 			ret = -EINVAL;
 			goto err_release;
 		}
+
+		/*
+		 * Keep the raw-stream scope to one native data fragment.  A
+		 * whole-WR headerless stream is smaller on the wire but leaves
+		 * the receiver with path-global state for too long, which is not
+		 * robust under full-duplex multi-QP traffic.
+		 */
+		last = prepared + len == total_length;
+		hdr_buf = kzalloc(TBV_NATIVE_DATA_HDR_SIZE, GFP_KERNEL);
+		if (!hdr_buf) {
+			if (done)
+				done(done_ctx, -ENOMEM);
+			ret = -ENOMEM;
+			goto err_release;
+		}
+
+		stream_hdr = *hdr;
+		stream_hdr.length = len;
+		stream_hdr.remote_addr = hdr->remote_addr + prepared;
+		stream_hdr.flags &= ~TBV_NATIVE_DATA_F_LAST;
+		if (!last)
+			stream_hdr.flags &= ~TBV_NATIVE_DATA_F_SOLICITED;
+		else
+			stream_hdr.flags |= TBV_NATIVE_DATA_F_LAST;
+		stream_hdr.flags |= TBV_NATIVE_DATA_F_RAW_STREAM;
+		ret = tbv_native_data_build_header(hdr_buf,
+						   TBV_NATIVE_DATA_HDR_SIZE,
+						   &stream_hdr);
+		if (ret < 0) {
+			kfree(hdr_buf);
+			if (done)
+				done(done_ctx, ret);
+			goto err_release;
+		}
+
+		packet = tbv_path_alloc_data_packet_owned(
+			path, hdr_buf, TBV_NATIVE_DATA_HDR_SIZE,
+			meta_done_attached ? NULL : meta_done, meta_done_ctx);
+		if (!packet) {
+			kfree(hdr_buf);
+			if (done)
+				done(done_ctx, -ENOMEM);
+			ret = -ENOMEM;
+			goto err_release;
+		}
+		packet->raw_stream_start = true;
+		list_add_tail(&packet->node, &packets);
+		packet_count++;
+		meta_done_attached = true;
 
 		dma = dma_map_page(dma_dev, page, page_off, len,
 				   DMA_TO_DEVICE);
@@ -1609,8 +1631,7 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 			goto err_release;
 		}
 		packet->owner_ctx = meta_done_ctx ? meta_done_ctx : done_ctx;
-		if (prepared + len == total_length)
-			packet->raw_stream_end = true;
+		packet->raw_stream_end = true;
 		list_add_tail(&packet->node, &packets);
 		packet_count++;
 		prepared += len;

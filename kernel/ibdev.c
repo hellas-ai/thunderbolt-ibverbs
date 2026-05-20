@@ -2199,6 +2199,8 @@ static int tbv_send_page_stream_next(void *ctx, struct page **page,
 
 		remaining = min_t(u32, seg->length - seg_off,
 				  stream->total_len - stream->offset);
+		remaining = min_t(u32, remaining,
+				  TBV_NATIVE_DATA_MAX_PAYLOAD);
 		ret = tbv_umem_page_from_addr(seg->mr, seg->addr + seg_off,
 					      remaining, page, page_off,
 					      length);
@@ -4393,6 +4395,7 @@ static int tbv_read_resp_next_page(void *ctx, struct page **page,
 	u32 remaining = stream->total_len - stream->offset;
 	int ret;
 
+	remaining = min_t(u32, remaining, TBV_NATIVE_DATA_MAX_PAYLOAD);
 	ret = tbv_umem_page_from_iova(stream->mr, stream->iova + stream->offset,
 				      remaining, page, page_off, length);
 	if (ret)
