@@ -197,6 +197,26 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_op_write_imm));
 	seq_printf(s, "data_rx_ack: %lld\n",
 		   atomic64_read(&state->data_rx_ack));
+	seq_printf(s, "data_tx_read_ack_ok: %lld\n",
+		   atomic64_read(&state->data_tx_read_ack_ok));
+	seq_printf(s, "data_tx_read_ack_retry: %lld\n",
+		   atomic64_read(&state->data_tx_read_ack_retry));
+	seq_printf(s, "data_tx_read_ack_error: %lld\n",
+		   atomic64_read(&state->data_tx_read_ack_error));
+	seq_printf(s, "data_rx_read_ack_ok: %lld\n",
+		   atomic64_read(&state->data_rx_read_ack_ok));
+	seq_printf(s, "data_rx_read_ack_retry: %lld\n",
+		   atomic64_read(&state->data_rx_read_ack_retry));
+	seq_printf(s, "data_rx_read_ack_error: %lld\n",
+		   atomic64_read(&state->data_rx_read_ack_error));
+	seq_printf(s, "data_read_resp_retransmit: %lld\n",
+		   atomic64_read(&state->data_read_resp_retransmit));
+	seq_printf(s, "data_read_resp_drop: %lld\n",
+		   atomic64_read(&state->data_read_resp_drop));
+	seq_printf(s, "data_rx_read_resp_duplicate: %lld\n",
+		   atomic64_read(&state->data_rx_read_resp_duplicate));
+	seq_printf(s, "data_rx_read_resp_gap: %lld\n",
+		   atomic64_read(&state->data_rx_read_resp_gap));
 	seq_printf(s, "data_rx_no_qp: %lld\n",
 		   atomic64_read(&state->data_rx_no_qp));
 	seq_printf(s, "data_rx_bad_peer: %lld\n",

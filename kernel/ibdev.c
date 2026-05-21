@@ -2076,8 +2076,10 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 		int ret = 0;
 
 		list_del_init(&ctx->retry_node);
-		if (!READ_ONCE(ctx->closing))
+		if (!READ_ONCE(ctx->closing)) {
+			atomic64_inc(&tqp->owner->data_read_resp_retransmit);
 			ret = tbv_send_read_response_ctx(ctx);
+		}
 		if (ret)
 			atomic64_inc(&tqp->owner->data_wr_path_send_error);
 
@@ -2098,6 +2100,7 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 
 		list_del_init(&ctx->retry_node);
 		read_resp_dropped = true;
+		atomic64_inc(&tqp->owner->data_read_resp_drop);
 		tbv_read_resp_ctx_put(ctx);
 	}
 	if (read_resp_dropped)
@@ -3743,6 +3746,36 @@ static void tbv_send_ack(struct tbv_state *state, u32 dest_qp, u32 src_qp,
 	tbv_send_ack_on_path(state, NULL, dest_qp, src_qp, psn, status);
 }
 
+static void tbv_count_tx_read_ack(struct tbv_state *state, int status)
+{
+	switch (status) {
+	case TBV_NATIVE_READ_ACK_OK:
+		atomic64_inc(&state->data_tx_read_ack_ok);
+		break;
+	case TBV_NATIVE_READ_ACK_RETRY:
+		atomic64_inc(&state->data_tx_read_ack_retry);
+		break;
+	default:
+		atomic64_inc(&state->data_tx_read_ack_error);
+		break;
+	}
+}
+
+static void tbv_count_rx_read_ack(struct tbv_state *state, u32 status)
+{
+	switch (status) {
+	case TBV_NATIVE_READ_ACK_OK:
+		atomic64_inc(&state->data_rx_read_ack_ok);
+		break;
+	case TBV_NATIVE_READ_ACK_RETRY:
+		atomic64_inc(&state->data_rx_read_ack_retry);
+		break;
+	default:
+		atomic64_inc(&state->data_rx_read_ack_error);
+		break;
+	}
+}
+
 static void tbv_send_read_ack_on_path(struct tbv_state *state,
 				      struct tbv_path *rx_path, u32 dest_qp,
 				      u32 src_qp, u32 psn, int status)
@@ -3750,6 +3783,7 @@ static void tbv_send_read_ack_on_path(struct tbv_state *state,
 	struct tbv_native_data_header hdr = {};
 	u8 frame[TBV_NATIVE_DATA_HDR_SIZE];
 	int len;
+	int ret;
 
 	hdr.opcode = TBV_NATIVE_DATA_OP_RDMA_READ_ACK;
 	hdr.dest_qp = dest_qp;
@@ -3761,7 +3795,9 @@ static void tbv_send_read_ack_on_path(struct tbv_state *state,
 	if (len < 0)
 		return;
 
-	tbv_send_control_frame_on_path(state, rx_path, frame, len);
+	ret = tbv_send_control_frame_on_path(state, rx_path, frame, len);
+	if (!ret)
+		tbv_count_tx_read_ack(state, status);
 }
 
 static void tbv_send_read_status_on_path(struct tbv_state *state,
@@ -4996,8 +5032,10 @@ static void tbv_rx_handle_rdma_read_resp(struct tbv_state *state,
 
 	read = tbv_qp_find_read_get(tqp, hdr->psn);
 	if (!read) {
+		atomic64_inc(&state->data_rx_read_resp_duplicate);
 		tbv_send_read_ack_on_path(state, rx_path, hdr->src_qp,
-					  hdr->dest_qp, hdr->psn, 0);
+					  hdr->dest_qp, hdr->psn,
+					  TBV_NATIVE_READ_ACK_OK);
 		return;
 	}
 
@@ -5016,11 +5054,13 @@ static void tbv_rx_handle_rdma_read_resp(struct tbv_state *state,
 		goto complete_ack;
 	}
 	if (hdr->remote_addr < read->received) {
+		atomic64_inc(&state->data_rx_read_resp_duplicate);
 		mutex_unlock(&read->data_lock);
 		tbv_read_ctx_put(read);
 		return;
 	}
 	if (hdr->remote_addr != read->received) {
+		atomic64_inc(&state->data_rx_read_resp_gap);
 		tbv_send_read_ack_on_path(state, rx_path, hdr->src_qp,
 					  hdr->dest_qp, hdr->psn,
 					  TBV_NATIVE_READ_ACK_RETRY);
@@ -5169,6 +5209,7 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 		struct tbv_read_resp_ctx *ctx;
 
 		atomic64_inc(&state->data_rx_ack);
+		tbv_count_rx_read_ack(state, hdr->imm_data);
 		if (hdr->imm_data == TBV_NATIVE_READ_ACK_RETRY) {
 			tbv_qp_retry_read_resp(tqp, hdr->psn);
 		} else {

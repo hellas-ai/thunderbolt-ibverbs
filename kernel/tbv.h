@@ -420,6 +420,16 @@ struct tbv_state {
 	atomic64_t data_rx_op_write;
 	atomic64_t data_rx_op_write_imm;
 	atomic64_t data_rx_ack;
+	atomic64_t data_tx_read_ack_ok;
+	atomic64_t data_tx_read_ack_retry;
+	atomic64_t data_tx_read_ack_error;
+	atomic64_t data_rx_read_ack_ok;
+	atomic64_t data_rx_read_ack_retry;
+	atomic64_t data_rx_read_ack_error;
+	atomic64_t data_read_resp_retransmit;
+	atomic64_t data_read_resp_drop;
+	atomic64_t data_rx_read_resp_duplicate;
+	atomic64_t data_rx_read_resp_gap;
 	atomic64_t data_rx_no_qp;
 	atomic64_t data_rx_bad_peer;
 	atomic64_t data_rx_unconnected_qp;
