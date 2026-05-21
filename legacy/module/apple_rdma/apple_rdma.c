@@ -254,6 +254,11 @@ module_param(rx_e2e, bool, 0444);
 MODULE_PARM_DESC(rx_e2e,
 		 "Enable E2E flow control on the RX ring (default: true)");
 
+static int rx_e2e_tx_hop_override = -1;
+module_param(rx_e2e_tx_hop_override, int, 0444);
+MODULE_PARM_DESC(rx_e2e_tx_hop_override,
+		 "Diagnostic: force the RX ring E2E credit-return TX hop (-1 = own TX ring, default)");
+
 static bool tx_honor_path_mtu;
 module_param(tx_honor_path_mtu, bool, 0444);
 MODULE_PARM_DESC(tx_honor_path_mtu,
@@ -388,7 +393,7 @@ MODULE_PARM_DESC(apple_max_uc_qps,
 static unsigned int apple_tx_max_inflight_wr = 1;
 module_param(apple_tx_max_inflight_wr, uint, 0644);
 MODULE_PARM_DESC(apple_tx_max_inflight_wr,
-		 "Maximum in-flight SEND WRs per Apple QP before post_send waits; 0 disables (default: 1)");
+		 "Maximum Apple SEND WRs submitted to the NHI per QP; extra accepted WRs wait in a software SQ, 0 disables (default: 1)");
 
 static bool tbnet_arp_proxy;
 module_param(tbnet_arp_proxy, bool, 0444);
@@ -460,6 +465,17 @@ struct ardma_recv_wr {
 	struct ardma_mr *mr[ARDMA_MAX_SGE];
 };
 
+struct ardma_send_wr {
+	struct list_head list;
+	u64 wr_id;
+	struct ib_cqe *wr_cqe;
+	unsigned int send_flags;
+	u32 total_len;
+	int num_sge;
+	struct ib_sge sge[ARDMA_MAX_SGE];
+	struct ardma_mr *mr[ARDMA_MAX_SGE];
+};
+
 struct ardma_pending_rx {
 	u8 *buf;
 	u32 len;
@@ -501,9 +517,11 @@ struct ardma_qp {
 	struct delayed_work rx_timeout_work;
 
 	spinlock_t send_lock;
-	wait_queue_head_t send_wait;
 	u64 last_post_send_ns;
 	atomic_t apple_tx_inflight_wrs;
+	struct list_head apple_send_q;
+	u32 apple_send_q_depth;
+	struct work_struct apple_send_work;
 	spinlock_t tx_pool_lock;
 	struct list_head tx_pool_free;
 	struct ardma_tx_frame *tx_pool;
@@ -741,6 +759,10 @@ struct ardma_peer {
 	atomic64_t tx_zcopy_frames;
 	atomic64_t tx_pool_frames;
 	atomic64_t tx_dynamic_frames;
+	atomic64_t apple_sq_queued;
+	atomic64_t apple_sq_dequeued;
+	atomic64_t apple_sq_full;
+	atomic64_t apple_sq_flushed;
 	atomic64_t tbnet_arp_requests;
 	atomic64_t tbnet_arp_replies;
 	atomic_t raw_rx_credits_reserved;
@@ -1033,6 +1055,18 @@ static void ardma_recv_wr_free(struct ardma_recv_wr *r)
 	kfree(r);
 }
 
+static void ardma_send_wr_free(struct ardma_send_wr *swr)
+{
+	int i;
+
+	if (!swr)
+		return;
+	for (i = 0; i < swr->num_sge; i++)
+		if (swr->mr[i])
+			ardma_mr_put(swr->mr[i]);
+	kfree(swr);
+}
+
 static u32 ardma_apple_raw_rx_credits(u32 len)
 {
 	u32 chunks;
@@ -1309,16 +1343,15 @@ static int ardma_copy_frame_to_buf(void *dst, u32 dst_size, u32 dst_off,
 	return 0;
 }
 
-static int ardma_copy_sges_to_buf(struct ardma_pd *pd,
-				  const struct ib_sge *sg_list, int num_sge,
-				  u32 src_off, void *dst, u32 len)
+static int ardma_copy_send_wr_to_buf(const struct ardma_send_wr *swr,
+				     u32 src_off, void *dst, u32 len)
 {
 	u32 cur = 0, copied = 0;
 	int i;
 
-	for (i = 0; i < num_sge && copied < len; i++) {
-		const struct ib_sge *sge = &sg_list[i];
-		struct ardma_mr *mr;
+	for (i = 0; i < swr->num_sge && copied < len; i++) {
+		const struct ib_sge *sge = &swr->sge[i];
+		struct ardma_mr *mr = swr->mr[i];
 		u32 in_sge_off, chunk;
 
 		if (cur + sge->length <= src_off) {
@@ -1328,33 +1361,28 @@ static int ardma_copy_sges_to_buf(struct ardma_pd *pd,
 
 		in_sge_off = (src_off + copied) - cur;
 		chunk = min_t(u32, sge->length - in_sge_off, len - copied);
-		mr = ardma_pd_get_mr(pd, sge->lkey);
 		if (!mr)
 			return -EINVAL;
 		if (ardma_mr_xfer(mr, sge->addr + in_sge_off,
-				  (u8 *)dst + copied, chunk, true)) {
-			ardma_mr_put(mr);
+				  (u8 *)dst + copied, chunk, true))
 			return -EFAULT;
-		}
-		ardma_mr_put(mr);
 		copied += chunk;
 	}
 
 	return copied < len ? -ERANGE : 0;
 }
 
-static int ardma_dma_slice_from_sges(struct ardma_pd *pd,
-				     const struct ib_sge *sg_list,
-				     int num_sge, u32 src_off, u32 len,
-				     struct ardma_mr **mr_out,
-				     dma_addr_t *dma_base, u32 *dma_off)
+static int ardma_dma_slice_from_send_wr(const struct ardma_send_wr *swr,
+					u32 src_off, u32 len,
+					struct ardma_mr **mr_out,
+					dma_addr_t *dma_base, u32 *dma_off)
 {
 	u32 cur = 0;
 	int i;
 
-	for (i = 0; i < num_sge; i++) {
-		const struct ib_sge *sge = &sg_list[i];
-		struct ardma_mr *mr;
+	for (i = 0; i < swr->num_sge; i++) {
+		const struct ib_sge *sge = &swr->sge[i];
+		struct ardma_mr *mr = swr->mr[i];
 		u32 in_sge_off;
 		int ret;
 
@@ -1367,9 +1395,9 @@ static int ardma_dma_slice_from_sges(struct ardma_pd *pd,
 		if (len > sge->length - in_sge_off)
 			return -EOPNOTSUPP;
 
-		mr = ardma_pd_get_mr(pd, sge->lkey);
 		if (!mr)
 			return -EINVAL;
+		refcount_inc(&mr->refs);
 		ret = ardma_mr_dma_page_slice(mr, sge->addr + in_sge_off,
 					      len, dma_base, dma_off);
 		if (ret) {
@@ -2608,7 +2636,7 @@ static void ardma_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
 
 /* ----- Apple-shaped TX ------------------------------------------- */
 
-static int ardma_apple_tx_window_acquire(struct ardma_qp *qp)
+static int ardma_apple_tx_window_try_acquire(struct ardma_qp *qp)
 {
 	struct ardma_peer *peer = qp->peer;
 
@@ -2629,13 +2657,8 @@ static int ardma_apple_tx_window_acquire(struct ardma_qp *qp)
 		    atomic_cmpxchg(&qp->apple_tx_inflight_wrs, cur,
 				   cur + 1) == cur)
 			return 1;
-
-		if (wait_event_interruptible(qp->send_wait,
-				READ_ONCE(qp->closing) ||
-				!READ_ONCE(apple_tx_max_inflight_wr) ||
-				atomic_read(&qp->apple_tx_inflight_wrs) <
-				READ_ONCE(apple_tx_max_inflight_wr)))
-			return -ERESTARTSYS;
+		if (cur >= max)
+			return -EAGAIN;
 	}
 }
 
@@ -2643,7 +2666,8 @@ static void ardma_apple_tx_window_release(struct ardma_qp *qp)
 {
 	if (WARN_ON_ONCE(atomic_dec_return(&qp->apple_tx_inflight_wrs) < 0))
 		atomic_set(&qp->apple_tx_inflight_wrs, 0);
-	wake_up_all(&qp->send_wait);
+	if (!READ_ONCE(qp->closing))
+		queue_work(system_wq, &qp->apple_send_work);
 }
 
 static void ardma_tx_ctx_put(struct ardma_send_ctx *ctx, bool failed)
@@ -2856,8 +2880,7 @@ static void ardma_tx_callback(struct tb_ring *ring, struct ring_frame *frame,
 
 static int ardma_submit_tx_zcopy(struct ardma_peer *peer,
 				 struct ardma_send_ctx *ctx,
-				 struct ardma_pd *pd,
-				 const struct ib_sge *sg_list, int num_sge,
+				 const struct ardma_send_wr *swr,
 				 u32 block, u32 piece,
 				 u32 app_off, u32 payload_len,
 				 u32 wire_len, u8 sof, u8 eof)
@@ -2872,8 +2895,8 @@ static int ardma_submit_tx_zcopy(struct ardma_peer *peer,
 	if (!READ_ONCE(tx_zcopy) || payload_len != wire_len)
 		return -EOPNOTSUPP;
 
-	ret = ardma_dma_slice_from_sges(pd, sg_list, num_sge, app_off,
-					payload_len, &mr, &dma_base, &dma_off);
+	ret = ardma_dma_slice_from_send_wr(swr, app_off, payload_len, &mr,
+					   &dma_base, &dma_off);
 	if (ret)
 		return ret;
 
@@ -3042,8 +3065,7 @@ static void ardma_tx_markers(unsigned int mode, enum ardma_tx_piece_kind kind,
 
 static int ardma_submit_tx_piece(struct ardma_peer *peer,
 				 struct ardma_send_ctx *ctx,
-				 struct ardma_pd *pd,
-				 const struct ib_sge *sg_list, int num_sge,
+				 const struct ardma_send_wr *swr,
 				 u32 block, u32 piece,
 				 u32 app_off, u32 payload_len,
 				 u32 wire_len, u8 sof, u8 eof,
@@ -3062,9 +3084,9 @@ static int ardma_submit_tx_piece(struct ardma_peer *peer,
 		return -EINVAL;
 
 	if (!append_crc && payload_len == wire_len) {
-		ret = ardma_submit_tx_zcopy(peer, ctx, pd, sg_list, num_sge,
-					    block, piece, app_off, payload_len,
-					    wire_len, sof, eof);
+		ret = ardma_submit_tx_zcopy(peer, ctx, swr, block, piece,
+					    app_off, payload_len, wire_len,
+					    sof, eof);
 		if (!ret)
 			return 0;
 		if (ret != -EOPNOTSUPP)
@@ -3075,8 +3097,7 @@ static int ardma_submit_tx_piece(struct ardma_peer *peer,
 	if (!tf)
 		return -ENOMEM;
 
-	ret = ardma_copy_sges_to_buf(pd, sg_list, num_sge, app_off,
-				     tf->data, payload_len);
+	ret = ardma_copy_send_wr_to_buf(swr, app_off, tf->data, payload_len);
 	if (ret) {
 		ardma_tx_frame_free_unsubmitted(qp, tf);
 		return ret;
@@ -3158,9 +3179,8 @@ static int ardma_submit_tx_piece(struct ardma_peer *peer,
 	return 0;
 }
 
-static int ardma_crc32c_sges(struct ardma_pd *pd,
-			     const struct ib_sge *sg_list, int num_sge,
-			     u32 src_off, u32 len, u32 *crc_out)
+static int ardma_crc32c_send_wr(const struct ardma_send_wr *swr, u32 src_off,
+				u32 len, u32 *crc_out)
 {
 	void *buf;
 	int ret;
@@ -3169,22 +3189,22 @@ static int ardma_crc32c_sges(struct ardma_pd *pd,
 	if (!buf)
 		return -ENOMEM;
 
-	ret = ardma_copy_sges_to_buf(pd, sg_list, num_sge, src_off, buf, len);
+	ret = ardma_copy_send_wr_to_buf(swr, src_off, buf, len);
 	if (!ret)
 		*crc_out = crc32c(~0u, buf, len) ^ ~0u;
 	kfree(buf);
 	return ret;
 }
 
-static int ardma_wr_total_len(const struct ib_send_wr *wr, u32 *total)
+static int ardma_send_wr_total_len(const struct ardma_send_wr *swr, u32 *total)
 {
 	u32 n = 0;
 	int i;
 
-	for (i = 0; i < wr->num_sge; i++) {
-		if (wr->sg_list[i].length > U32_MAX - n)
+	for (i = 0; i < swr->num_sge; i++) {
+		if (swr->sge[i].length > U32_MAX - n)
 			return -EMSGSIZE;
-		n += wr->sg_list[i].length;
+		n += swr->sge[i].length;
 	}
 	*total = n;
 	return 0;
@@ -3218,8 +3238,7 @@ static u8 ardma_tx_terminal_eof(void)
 
 static int ardma_send_apple_chunk(struct ardma_peer *peer,
 				  struct ardma_send_ctx *ctx,
-				  struct ardma_pd *pd,
-				  const struct ib_sge *sg_list, int num_sge,
+				  const struct ardma_send_wr *swr,
 				  u32 chunk, u32 base,
 				  u32 chunk_len, unsigned int marker_mode,
 				  bool raw_mode, bool group_first,
@@ -3244,8 +3263,7 @@ static int ardma_send_apple_chunk(struct ardma_peer *peer,
 				 group_first && !piece ? ARDMA_TX_PIECE_FIRST :
 							 ARDMA_TX_PIECE_MID,
 				 0, &sof, &eof);
-		ret = ardma_submit_tx_piece(peer, ctx, pd, sg_list, num_sge,
-					    chunk, piece,
+		ret = ardma_submit_tx_piece(peer, ctx, swr, chunk, piece,
 					    base + piece * slot_user,
 					    slot_user, slot_user, sof, eof,
 					    false, 0);
@@ -3258,7 +3276,7 @@ static int ardma_send_apple_chunk(struct ardma_peer *peer,
 			 full_pieces ? ARDMA_TX_PIECE_SPLIT :
 				       ARDMA_TX_PIECE_FIRST,
 			 0, &sof, &eof);
-	ret = ardma_submit_tx_piece(peer, ctx, pd, sg_list, num_sge, chunk,
+	ret = ardma_submit_tx_piece(peer, ctx, swr, chunk,
 				    full_pieces, base + full_pieces * slot_user,
 				    split_user, split_user, sof, eof, false, 0);
 	if (ret)
@@ -3266,7 +3284,7 @@ static int ardma_send_apple_chunk(struct ardma_peer *peer,
 
 	ardma_tx_markers(marker_mode, ARDMA_TX_PIECE_TAIL, tail_eof,
 			 &sof, &eof);
-	ret = ardma_submit_tx_piece(peer, ctx, pd, sg_list, num_sge, chunk,
+	ret = ardma_submit_tx_piece(peer, ctx, swr, chunk,
 				    full_pieces + 1,
 				    base + full_pieces * slot_user + split_user,
 				    ARDMA_TAIL_USER_SIZE,
@@ -3278,9 +3296,8 @@ static int ardma_send_apple_chunk(struct ardma_peer *peer,
 
 static int ardma_send_apple_frame_chunk(struct ardma_peer *peer,
 					struct ardma_send_ctx *ctx,
-					struct ardma_pd *pd,
-					const struct ib_sge *sg_list,
-					int num_sge, u32 chunk, u32 base,
+					const struct ardma_send_wr *swr,
+					u32 chunk, u32 base,
 					u32 user_len,
 					unsigned int marker_mode,
 					bool group_first, u8 tail_eof)
@@ -3306,7 +3323,7 @@ static int ardma_send_apple_frame_chunk(struct ardma_peer *peer,
 		 * non-EOF wire payload with its per-TLP CRC, so set
 		 * wire_len = payload_len + 4 to keep our user data intact.
 		 */
-		ret = ardma_submit_tx_piece(peer, ctx, pd, sg_list, num_sge,
+		ret = ardma_submit_tx_piece(peer, ctx, swr,
 					    chunk, piece, base + pos,
 					    ARDMA_FRAME_SLOT_USER_SIZE,
 					    ARDMA_FRAME_SLOT_USER_SIZE + 4,
@@ -3327,7 +3344,7 @@ static int ardma_send_apple_frame_chunk(struct ardma_peer *peer,
 				 ARDMA_TX_PIECE_FIRST : ARDMA_TX_PIECE_SPLIT,
 				 0, &sof, &eof);
 		/* Same per-TLP CRC overwrite for the split (eof=0) piece. */
-		ret = ardma_submit_tx_piece(peer, ctx, pd, sg_list, num_sge,
+		ret = ardma_submit_tx_piece(peer, ctx, swr,
 					    chunk, piece, base + pos,
 					    split_len, split_len + 4, sof, eof,
 					    false, 0);
@@ -3343,16 +3360,15 @@ static int ardma_send_apple_frame_chunk(struct ardma_peer *peer,
 			 group_first && first_piece ? ARDMA_TX_PIECE_ONLY :
 						      ARDMA_TX_PIECE_TAIL,
 			 tail_eof, &sof, &eof);
-	return ardma_submit_tx_piece(peer, ctx, pd, sg_list, num_sge, chunk,
+	return ardma_submit_tx_piece(peer, ctx, swr, chunk,
 				     piece, base + pos, remaining, remaining,
 				     sof, eof, false, 0);
 }
 
 static int ardma_send_apple_frame_single_desc(struct ardma_peer *peer,
 					      struct ardma_send_ctx *ctx,
-					      struct ardma_pd *pd,
-					      const struct ib_sge *sg_list,
-					      int num_sge, u32 chunk, u32 base,
+					      const struct ardma_send_wr *swr,
+					      u32 chunk, u32 base,
 					      u32 user_len,
 					      unsigned int marker_mode,
 					      u8 tail_eof)
@@ -3364,14 +3380,17 @@ static int ardma_send_apple_frame_single_desc(struct ardma_peer *peer,
 
 	ardma_tx_markers(marker_mode, ARDMA_TX_PIECE_ONLY, tail_eof,
 			 &sof, &eof);
-	return ardma_submit_tx_piece(peer, ctx, pd, sg_list, num_sge,
-				     chunk, 0, base, user_len, user_len,
-				     sof, eof, false, 0);
+	return ardma_submit_tx_piece(peer, ctx, swr, chunk, 0, base,
+				     user_len, user_len, sof, eof, false, 0);
 }
 
-static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
+static void ardma_tx_apply_inter_wr_gap(struct ardma_qp *qp);
+
+static int ardma_submit_apple_send(struct ardma_qp *qp,
+				   const struct ardma_send_wr *swr,
+				   int tx_window_reserved,
+				   bool *ctx_started)
 {
-	struct ardma_pd *pd = container_of(qp->base.pd, struct ardma_pd, base);
 	struct ardma_peer *peer = qp->peer;
 	struct ardma_send_ctx *ctx;
 	u32 total, chunk = 0, chunks;
@@ -3381,54 +3400,50 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 	unsigned int marker_mode;
 	bool raw_mode;
 	bool use_single_desc;
-	int tx_window_reserved;
 	int ret;
+
+	if (ctx_started)
+		*ctx_started = false;
 
 	if (!READ_ONCE(tx_enabled)) {
 		pr_warn_ratelimited("send_apple[qp=0x%x]: tx_enabled=0 -> EOPNOTSUPP\n",
 			qp->base.qp_num);
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		goto pre_ctx_fail;
 	}
 	if (!peer || !peer->tx_ring) {
 		pr_warn_ratelimited("send_apple[qp=0x%x]: peer=%p tx_ring=%p paths=%d -> ENOTCONN\n",
 			qp->base.qp_num, peer, peer ? peer->tx_ring : NULL,
 			peer ? peer->paths_enabled : -1);
-		return -ENOTCONN;
+		ret = -ENOTCONN;
+		goto pre_ctx_fail;
 	}
 	if (!READ_ONCE(peer->paths_enabled)) {
 		ret = ardma_enable_peer_paths(peer);
 		if (ret) {
 			pr_warn_ratelimited("send_apple[qp=0x%x]: lazy paths enable failed=%d -> ENOTCONN\n",
 				qp->base.qp_num, ret);
-			return ret;
+			goto pre_ctx_fail;
 		}
 	}
 	if (!READ_ONCE(peer->tx_ring_running)) {
 		pr_warn_ratelimited("send_apple[qp=0x%x]: tx_ring_running=0 -> ESHUTDOWN\n",
 			qp->base.qp_num);
-		return -ESHUTDOWN;
-	}
-	if (wr->num_sge > ARDMA_MAX_SGE || (wr->num_sge && !wr->sg_list)) {
-		pr_warn_ratelimited("send_apple[qp=0x%x]: num_sge=%d sg_list=%p -> EINVAL\n",
-			qp->base.qp_num, wr->num_sge, wr->sg_list);
-		return -EINVAL;
-	}
-	if (wr->send_flags & IB_SEND_INLINE) {
-		pr_warn_ratelimited("send_apple[qp=0x%x]: IB_SEND_INLINE not supported\n",
-			qp->base.qp_num);
-		return -EOPNOTSUPP;
+		ret = -ESHUTDOWN;
+		goto pre_ctx_fail;
 	}
 
-	ret = ardma_wr_total_len(wr, &total);
+	ret = ardma_send_wr_total_len(swr, &total);
 	if (ret) {
 		pr_warn_ratelimited("send_apple[qp=0x%x]: total_len failed=%d\n",
 			qp->base.qp_num, ret);
-		return ret;
+		goto pre_ctx_fail;
 	}
 	if (!total || total > ARDMA_MAX_MSG_SIZE) {
 		pr_warn_ratelimited("send_apple[qp=0x%x]: total=%u (must be nonzero, <= %u) -> EMSGSIZE\n",
 			qp->base.qp_num, total, ARDMA_MAX_MSG_SIZE);
-		return -EMSGSIZE;
+		ret = -EMSGSIZE;
+		goto pre_ctx_fail;
 	}
 	if (peer->remote_is_apple) {
 		u32 max_send = READ_ONCE(apple_tx_max_send_bytes);
@@ -3436,7 +3451,8 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 		if (max_send && total > max_send) {
 			pr_warn_ratelimited("send_apple[qp=0x%x]: rejecting Apple SEND len=%u max=%u\n",
 					    qp->base.qp_num, total, max_send);
-			return -EMSGSIZE;
+			ret = -EMSGSIZE;
+			goto pre_ctx_fail;
 		}
 	}
 
@@ -3445,7 +3461,8 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 	    path_mtu > ardma_active_mtu_bytes()) {
 		pr_warn_ratelimited("send_apple[qp=0x%x]: invalid path_mtu=%u active_mtu=%u -> EMSGSIZE\n",
 			qp->base.qp_num, path_mtu, ardma_active_mtu_bytes());
-		return -EMSGSIZE;
+		ret = -EMSGSIZE;
+		goto pre_ctx_fail;
 	}
 
 	raw_mode = READ_ONCE(tx_raw_mode);
@@ -3458,7 +3475,8 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 		if (!path_mtu || path_mtu > ARDMA_FRAME_SIZE) {
 			pr_warn_ratelimited("send_apple[qp=0x%x]: unsupported single-desc path_mtu=%u -> EMSGSIZE\n",
 				qp->base.qp_num, path_mtu);
-			return -EMSGSIZE;
+			ret = -EMSGSIZE;
+			goto pre_ctx_fail;
 		}
 		chunk_len = path_mtu;
 		slots = 1;
@@ -3468,38 +3486,38 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 		if (ret) {
 			pr_warn_ratelimited("send_apple[qp=0x%x]: unsupported path_mtu=%u raw=%u -> EMSGSIZE\n",
 				qp->base.qp_num, path_mtu, raw_mode);
-			return -EMSGSIZE;
+			goto pre_ctx_fail;
 		}
 	}
 	if (raw_mode && total % chunk_len) {
 		pr_warn_ratelimited("send_apple[qp=0x%x]: raw total=%u is not a multiple of tx_chunk=%u (path_mtu=%u slots=%u) -> EMSGSIZE\n",
 			qp->base.qp_num, total, chunk_len, path_mtu, slots);
-		return -EMSGSIZE;
+		ret = -EMSGSIZE;
+		goto pre_ctx_fail;
 	}
 
 	chunks = raw_mode ? total / chunk_len : DIV_ROUND_UP(total, chunk_len);
-	tx_window_reserved = ardma_apple_tx_window_acquire(qp);
-	if (tx_window_reserved < 0)
-		return tx_window_reserved;
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx) {
-		if (tx_window_reserved)
-			ardma_apple_tx_window_release(qp);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto pre_ctx_fail;
 	}
 	ctx->qp = qp;
-	ctx->wr_id = wr->wr_id;
-	ctx->wr_cqe = wr->wr_cqe;
+	ctx->wr_id = swr->wr_id;
+	ctx->wr_cqe = swr->wr_cqe;
 	ctx->qpn = qp->base.qp_num;
 	ctx->dest_qpn = qp->attr.dest_qp_num;
 	ctx->total_len = total;
 	ctx->blocks = chunks;
-	ctx->signaled = qp->sq_sig_all || (wr->send_flags & IB_SEND_SIGNALED);
+	ctx->signaled = qp->sq_sig_all || (swr->send_flags & IB_SEND_SIGNALED);
 	ctx->tx_window_reserved = tx_window_reserved;
 	atomic_set(&ctx->pending, 1);
 	atomic_set(&ctx->failed, 0);
 	ardma_qp_get(qp);
+	if (ctx_started)
+		*ctx_started = true;
 	marker_mode = READ_ONCE(tx_marker_mode);
+	ardma_tx_apply_inter_wr_gap(qp);
 	ardma_log_tx_event(peer, ARDMA_TX_EVT_WR_BEGIN, ctx->qpn,
 			   ctx->dest_qpn, ctx->wr_id, total, 0, chunks, 0,
 			   0, chunk_len, path_mtu, 0, 0,
@@ -3521,14 +3539,12 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 
 			if (use_single_desc) {
 				ret = ardma_send_apple_frame_single_desc(peer,
-					ctx, pd, wr->sg_list, wr->num_sge,
-					chunk, base, this_len, marker_mode,
-					tail_eof);
+					ctx, swr, chunk, base, this_len,
+					marker_mode, tail_eof);
 			} else {
 				ret = ardma_send_apple_frame_chunk(peer, ctx,
-					pd, wr->sg_list, wr->num_sge, chunk,
-					base, this_len, marker_mode, chunk == 0,
-					tail_eof);
+					swr, chunk, base, this_len, marker_mode,
+					chunk == 0, tail_eof);
 			}
 			if (ret)
 				goto fail;
@@ -3552,9 +3568,8 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 		}
 
 		if (raw_mode) {
-			ret = ardma_crc32c_sges(pd, wr->sg_list, wr->num_sge,
-						group_base, group_len,
-						&group_crc);
+			ret = ardma_crc32c_send_wr(swr, group_base, group_len,
+						   &group_crc);
 			if (ret)
 				goto fail;
 		}
@@ -3578,8 +3593,7 @@ static int ardma_send_apple(struct ardma_qp *qp, const struct ib_send_wr *wr)
 			if (chunk && pace_us)
 				usleep_range(pace_us, pace_us + 10);
 
-			ret = ardma_send_apple_chunk(peer, ctx, pd, wr->sg_list,
-						     wr->num_sge, chunk, base,
+			ret = ardma_send_apple_chunk(peer, ctx, swr, chunk, base,
 						     chunk_len, marker_mode,
 						     raw_mode, i == 0,
 						     tail_eof, append_crc,
@@ -3605,6 +3619,11 @@ fail:
 			   0, 0, 0, 0, 0, atomic_read(&ctx->pending), ret,
 			   ctx->signaled, true);
 	ardma_tx_ctx_put(ctx, true);
+	return ret;
+
+pre_ctx_fail:
+	if (tx_window_reserved)
+		ardma_apple_tx_window_release(qp);
 	return ret;
 }
 
@@ -3637,6 +3656,230 @@ static void ardma_tx_apply_inter_wr_gap(struct ardma_qp *qp)
 		usleep_range((unsigned int)delay_us,
 			     (unsigned int)delay_us + 10);
 	}
+}
+
+static int ardma_send_wr_from_ib(struct ardma_qp *qp,
+				 const struct ib_send_wr *wr,
+				 struct ardma_send_wr **out)
+{
+	struct ardma_pd *pd = container_of(qp->base.pd, struct ardma_pd, base);
+	struct ardma_peer *peer = qp->peer;
+	struct ardma_send_wr *swr;
+	u32 total;
+	int i, ret;
+
+	if (wr->num_sge > ARDMA_MAX_SGE || (wr->num_sge && !wr->sg_list)) {
+		pr_warn_ratelimited("post_send[qp=0x%x]: num_sge=%d sg_list=%p -> EINVAL\n",
+			qp->base.qp_num, wr->num_sge, wr->sg_list);
+		return -EINVAL;
+	}
+	if (wr->send_flags & IB_SEND_INLINE) {
+		pr_warn_ratelimited("post_send[qp=0x%x]: IB_SEND_INLINE not supported\n",
+			qp->base.qp_num);
+		return -EOPNOTSUPP;
+	}
+
+	swr = kzalloc(sizeof(*swr), GFP_KERNEL);
+	if (!swr)
+		return -ENOMEM;
+	INIT_LIST_HEAD(&swr->list);
+	swr->wr_id = wr->wr_id;
+	swr->wr_cqe = wr->wr_cqe;
+	swr->send_flags = wr->send_flags;
+	swr->num_sge = wr->num_sge;
+
+	for (i = 0; i < wr->num_sge; i++) {
+		swr->sge[i] = wr->sg_list[i];
+		if (!swr->sge[i].length)
+			continue;
+		swr->mr[i] = ardma_pd_get_mr(pd, swr->sge[i].lkey);
+		if (!swr->mr[i]) {
+			ret = -EINVAL;
+			goto err;
+		}
+		ret = ardma_mr_check_range(swr->mr[i], swr->sge[i].addr,
+					   swr->sge[i].length);
+		if (ret)
+			goto err;
+	}
+
+	ret = ardma_send_wr_total_len(swr, &total);
+	if (ret)
+		goto err;
+	if (!total || total > ARDMA_MAX_MSG_SIZE) {
+		ret = -EMSGSIZE;
+		goto err;
+	}
+	if (peer && peer->remote_is_apple) {
+		u32 max_send = READ_ONCE(apple_tx_max_send_bytes);
+
+		if (max_send && total > max_send) {
+			pr_warn_ratelimited("post_send[qp=0x%x]: rejecting Apple SEND len=%u max=%u\n",
+					    qp->base.qp_num, total, max_send);
+			ret = -EMSGSIZE;
+			goto err;
+		}
+	}
+	swr->total_len = total;
+	*out = swr;
+	return 0;
+
+err:
+	ardma_send_wr_free(swr);
+	return ret;
+}
+
+static void ardma_push_send_status(struct ardma_qp *qp,
+				   const struct ardma_send_wr *swr,
+				   enum ib_wc_status status)
+{
+	struct ardma_cq *send_cq =
+		container_of(qp->base.send_cq, struct ardma_cq, base);
+	struct ib_wc wc = {};
+
+	if (!qp->sq_sig_all && !(swr->send_flags & IB_SEND_SIGNALED))
+		return;
+
+	wc.wr_id = swr->wr_id;
+	wc.wr_cqe = swr->wr_cqe;
+	wc.status = status;
+	wc.opcode = IB_WC_SEND;
+	wc.qp = &qp->base;
+	ardma_cq_push_wc(send_cq, &wc);
+}
+
+static bool ardma_apple_sq_full_locked(struct ardma_qp *qp)
+{
+	u32 cap = qp->init_attr.cap.max_send_wr;
+
+	if (!cap)
+		return true;
+	return atomic_read(&qp->apple_tx_inflight_wrs) +
+		qp->apple_send_q_depth >= cap;
+}
+
+static int ardma_apple_sq_enqueue_locked(struct ardma_qp *qp,
+					 struct ardma_send_wr *swr)
+{
+	if (READ_ONCE(qp->closing))
+		return -ESHUTDOWN;
+	if (ardma_apple_sq_full_locked(qp)) {
+		if (qp->peer)
+			atomic64_inc(&qp->peer->apple_sq_full);
+		return -ENOMEM;
+	}
+	list_add_tail(&swr->list, &qp->apple_send_q);
+	qp->apple_send_q_depth++;
+	if (qp->peer)
+		atomic64_inc(&qp->peer->apple_sq_queued);
+	return 0;
+}
+
+static void ardma_apple_sq_flush(struct ardma_qp *qp, enum ib_wc_status status)
+{
+	LIST_HEAD(flush);
+	struct ardma_send_wr *swr, *tmp;
+	unsigned long flags;
+
+	spin_lock_irqsave(&qp->send_lock, flags);
+	list_splice_init(&qp->apple_send_q, &flush);
+	qp->apple_send_q_depth = 0;
+	spin_unlock_irqrestore(&qp->send_lock, flags);
+
+	list_for_each_entry_safe(swr, tmp, &flush, list) {
+		list_del_init(&swr->list);
+		if (qp->peer)
+			atomic64_inc(&qp->peer->apple_sq_flushed);
+		ardma_push_send_status(qp, swr, status);
+		ardma_send_wr_free(swr);
+	}
+}
+
+static void ardma_apple_send_work(struct work_struct *work)
+{
+	struct ardma_qp *qp =
+		container_of(work, struct ardma_qp, apple_send_work);
+
+	for (;;) {
+		struct ardma_send_wr *swr;
+		bool ctx_started = false;
+		unsigned long flags;
+		int reserved;
+		int ret;
+
+		spin_lock_irqsave(&qp->send_lock, flags);
+		if (READ_ONCE(qp->closing) || list_empty(&qp->apple_send_q)) {
+			spin_unlock_irqrestore(&qp->send_lock, flags);
+			return;
+		}
+
+		reserved = ardma_apple_tx_window_try_acquire(qp);
+		if (reserved == -EAGAIN) {
+			spin_unlock_irqrestore(&qp->send_lock, flags);
+			return;
+		}
+		if (reserved < 0) {
+			spin_unlock_irqrestore(&qp->send_lock, flags);
+			ardma_apple_sq_flush(qp, IB_WC_WR_FLUSH_ERR);
+			return;
+		}
+
+		swr = list_first_entry(&qp->apple_send_q,
+				       struct ardma_send_wr, list);
+		list_del_init(&swr->list);
+		qp->apple_send_q_depth--;
+		if (qp->peer)
+			atomic64_inc(&qp->peer->apple_sq_dequeued);
+		spin_unlock_irqrestore(&qp->send_lock, flags);
+
+		ret = ardma_submit_apple_send(qp, swr, reserved, &ctx_started);
+		if (ret && !ctx_started)
+			ardma_push_send_status(qp, swr, IB_WC_GENERAL_ERR);
+		ardma_send_wr_free(swr);
+	}
+}
+
+static int ardma_post_send_apple(struct ardma_qp *qp,
+				 const struct ib_send_wr *wr)
+{
+	struct ardma_send_wr *swr;
+	bool ctx_started = false;
+	unsigned long flags;
+	int reserved;
+	int ret;
+
+	ret = ardma_send_wr_from_ib(qp, wr, &swr);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&qp->send_lock, flags);
+	if (!list_empty(&qp->apple_send_q))
+		goto queue_locked;
+
+	reserved = ardma_apple_tx_window_try_acquire(qp);
+	if (reserved >= 0) {
+		spin_unlock_irqrestore(&qp->send_lock, flags);
+		ret = ardma_submit_apple_send(qp, swr, reserved, &ctx_started);
+		ardma_send_wr_free(swr);
+		if (ret && ctx_started)
+			return 0;
+		return ret;
+	}
+	if (reserved != -EAGAIN) {
+		spin_unlock_irqrestore(&qp->send_lock, flags);
+		ardma_send_wr_free(swr);
+		return reserved;
+	}
+
+queue_locked:
+	ret = ardma_apple_sq_enqueue_locked(qp, swr);
+	spin_unlock_irqrestore(&qp->send_lock, flags);
+	if (ret) {
+		ardma_send_wr_free(swr);
+		return ret;
+	}
+	queue_work(system_wq, &qp->apple_send_work);
+	return 0;
 }
 
 /* ----- verbs object ops ------------------------------------------ */
@@ -3935,11 +4178,6 @@ static int ardma_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	qp->qp_type = attr->qp_type;
 	qp->init_attr = *attr;
 	qp->init_attr.cap.max_send_wr = min_t(u32, attr->cap.max_send_wr, 4095);
-	if (attr->qp_type == IB_QPT_UC && peer && peer->remote_is_apple &&
-	    READ_ONCE(apple_tx_max_inflight_wr))
-		qp->init_attr.cap.max_send_wr =
-			min_t(u32, qp->init_attr.cap.max_send_wr,
-			      READ_ONCE(apple_tx_max_inflight_wr));
 	qp->init_attr.cap.max_recv_wr = min_t(u32, attr->cap.max_recv_wr, 4095);
 	qp->init_attr.cap.max_send_sge = min_t(u32, attr->cap.max_send_sge,
 					       ARDMA_MAX_SGE);
@@ -3952,8 +4190,9 @@ static int ardma_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	init_waitqueue_head(&qp->ref_wait);
 	spin_lock_init(&qp->recv_lock);
 	spin_lock_init(&qp->send_lock);
-	init_waitqueue_head(&qp->send_wait);
 	atomic_set(&qp->apple_tx_inflight_wrs, 0);
+	INIT_LIST_HEAD(&qp->apple_send_q);
+	INIT_WORK(&qp->apple_send_work, ardma_apple_send_work);
 	spin_lock_init(&qp->tx_pool_lock);
 	INIT_LIST_HEAD(&qp->recv_q);
 	INIT_LIST_HEAD(&qp->qps_link);
@@ -4158,7 +4397,8 @@ static int ardma_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
 	if (qp->state != IB_QPS_RESET)
 		qp->state = IB_QPS_ERR;
 	spin_unlock_irqrestore(&qp->recv_lock, flags);
-	wake_up_all(&qp->send_wait);
+	cancel_work_sync(&qp->apple_send_work);
+	ardma_apple_sq_flush(qp, IB_WC_WR_FLUSH_ERR);
 
 	ardma_log_rx_event(qp->peer, ARDMA_RX_EVT_QP_DESTROY, ibqp->qp_num,
 			   qp->attr.dest_qp_num, 0, refcount_read(&qp->refs),
@@ -4440,8 +4680,7 @@ static int ardma_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
 				*bad_wr = wr;
 			return -EOPNOTSUPP;
 		}
-		ardma_tx_apply_inter_wr_gap(qp);
-		ret = ardma_send_apple(qp, wr);
+		ret = ardma_post_send_apple(qp, wr);
 		if (ret) {
 			if (bad_wr)
 				*bad_wr = wr;
@@ -5192,6 +5431,7 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 	u16 rx_sof_mask = ARDMA_RX_RAW_SOF_MASK;
 	u16 rx_eof_mask = ARDMA_RX_RAW_EOF_MASK;
 	int e2e_tx_hop;
+	int e2e_tx_hop_override;
 	u32 i;
 	int ret;
 
@@ -5240,6 +5480,25 @@ static int ardma_setup_rings(struct ardma_peer *peer)
 		goto err_in_hop;
 	}
 	e2e_tx_hop = peer->tx_ring->hop;
+	e2e_tx_hop_override = READ_ONCE(rx_e2e_tx_hop_override);
+	if ((rx_ring_flags & RING_FLAG_E2E) && e2e_tx_hop_override >= 0) {
+		if (!xd->tb || !xd->tb->nhi ||
+		    e2e_tx_hop_override >= READ_ONCE(xd->tb->nhi->hop_count)) {
+			pr_warn("rx_e2e_tx_hop_override=%d is outside NHI hop_count\n",
+				e2e_tx_hop_override);
+			ret = -EINVAL;
+			goto err_tx_ring;
+		}
+		if (!READ_ONCE(xd->tb->nhi->tx_rings[e2e_tx_hop_override])) {
+			pr_warn("rx_e2e_tx_hop_override=%d has no active TX ring\n",
+				e2e_tx_hop_override);
+			ret = -EINVAL;
+			goto err_tx_ring;
+		}
+		e2e_tx_hop = e2e_tx_hop_override;
+		pr_info("using diagnostic RX E2E credit-return TX hop override: %d\n",
+			e2e_tx_hop);
+	}
 
 	if (lanes > 1 && requested_out_hop < 0)
 		requested_out_hop = receive_path;
@@ -5456,6 +5715,10 @@ static int ardma_stats_show(struct seq_file *m, void *unused)
 		   READ_ONCE(apple_tx_max_send_bytes));
 	seq_printf(m, "local_in_hop: %d\n", peer->local_in_hop);
 	seq_printf(m, "rx_hop: %d\n", peer->rx_ring ? peer->rx_ring->hop : -1);
+	seq_printf(m, "rx_e2e_tx_hop: %d\n",
+		   peer->rx_ring ? peer->rx_ring->e2e_tx_hop : -1);
+	seq_printf(m, "rx_e2e_tx_hop_override: %d\n",
+		   READ_ONCE(rx_e2e_tx_hop_override));
 	seq_printf(m, "local_out_hop: %d\n", peer->local_out_hop);
 	seq_printf(m, "reserved_out_hop: %d\n", peer->reserved_out_hop);
 	seq_printf(m, "tx_hop: %d\n", peer->tx_ring ? peer->tx_ring->hop : -1);
@@ -5496,6 +5759,14 @@ static int ardma_stats_show(struct seq_file *m, void *unused)
 		   (long long)atomic64_read(&peer->tx_pool_frames));
 	seq_printf(m, "tx_dynamic_frames: %lld\n",
 		   (long long)atomic64_read(&peer->tx_dynamic_frames));
+	seq_printf(m, "apple_sq_queued: %lld\n",
+		   (long long)atomic64_read(&peer->apple_sq_queued));
+	seq_printf(m, "apple_sq_dequeued: %lld\n",
+		   (long long)atomic64_read(&peer->apple_sq_dequeued));
+	seq_printf(m, "apple_sq_full: %lld\n",
+		   (long long)atomic64_read(&peer->apple_sq_full));
+	seq_printf(m, "apple_sq_flushed: %lld\n",
+		   (long long)atomic64_read(&peer->apple_sq_flushed));
 	if (peer->ibdev) {
 		seq_printf(m, "tbnet_arp_proxy: %u\n",
 			   peer->ibdev->tbnet_arp_registered);
