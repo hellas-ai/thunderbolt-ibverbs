@@ -24,10 +24,10 @@
 /*
  * Raw-stream zcopy serializes each DMA path, so several QPs sharing a rail can
  * briefly queue a full TX-depth worth of packetized WRs behind one active
- * stream. Keep enough metadata headroom for qps=4/TX-depth=128/64 KiB without
- * reporting a false SQ-full error on a healthy two-rail link.
+ * stream. Keep enough metadata headroom for qps=8/TX-depth=16/1 MiB WRITE and
+ * qps=4/TX-depth=128/64 KiB without reporting a false SQ-full error.
  */
-#define TBV_DATA_QUEUE_MULTIPLIER 8
+#define TBV_DATA_QUEUE_MULTIPLIER 16
 #define TBV_DATA_PACKET_POOL_LIMIT 1024
 
 static uint nhi_interrupt_throttle_ns;
@@ -498,9 +498,14 @@ static void tbv_path_rx_raw_payload(struct tbv_path *path,
 	}
 
 	hdr.opcode = path->rx_raw_opcode;
-	hdr.flags = path->rx_raw_flags;
-	if (len == path->rx_raw_remaining)
+	hdr.flags = path->rx_raw_flags &
+		    ~(TBV_NATIVE_DATA_F_LAST | TBV_NATIVE_DATA_F_SOLICITED);
+	if (len == path->rx_raw_remaining) {
 		path->rx_raw_pending = false;
+		hdr.flags |= path->rx_raw_flags &
+			     (TBV_NATIVE_DATA_F_LAST |
+			      TBV_NATIVE_DATA_F_SOLICITED);
+	}
 	hdr.dest_qp = path->rx_raw_dest_qp;
 	hdr.src_qp = path->rx_raw_src_qp;
 	hdr.psn = path->rx_raw_psn;
@@ -1760,7 +1765,9 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 	u32 prepared = 0;
 	u32 packet_count = 0;
 	struct tbv_tx_packet *packet;
-	bool meta_done_attached = false;
+	u32 max_raw_payload;
+	struct tbv_native_data_header stream_hdr;
+	u8 *hdr_buf;
 	int ret;
 
 	if (!path || !hdr || !next || !total_length) {
@@ -1779,25 +1786,56 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 		ret = -ENOTCONN;
 		goto err_meta_done;
 	}
+	if (hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_WRITE ||
+	    hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM)
+		max_raw_payload = TBV_DATA_FRAME_SIZE;
+	else
+		max_raw_payload = TBV_NATIVE_DATA_MAX_PAYLOAD;
 
 	dma_dev = tb_ring_dma_device(path->tx_ring);
 
+	hdr_buf = kzalloc(TBV_NATIVE_DATA_HDR_SIZE, GFP_KERNEL);
+	if (!hdr_buf) {
+		ret = -ENOMEM;
+		goto err_release;
+	}
+
+	stream_hdr = *hdr;
+	stream_hdr.length = total_length;
+	stream_hdr.flags |= TBV_NATIVE_DATA_F_LAST |
+			    TBV_NATIVE_DATA_F_RAW_STREAM;
+	ret = tbv_native_data_build_header(hdr_buf, TBV_NATIVE_DATA_HDR_SIZE,
+					   &stream_hdr);
+	if (ret < 0) {
+		kfree(hdr_buf);
+		goto err_release;
+	}
+
+	packet = tbv_path_alloc_data_packet_owned(path, hdr_buf,
+						  TBV_NATIVE_DATA_HDR_SIZE,
+						  meta_done, meta_done_ctx);
+	if (!packet) {
+		kfree(hdr_buf);
+		ret = -ENOMEM;
+		goto err_release;
+	}
+	packet->raw_stream_start = true;
+	list_add_tail(&packet->node, &packets);
+	packet_count++;
+
 	while (prepared < total_length) {
 		tbv_path_tx_done_fn done = NULL;
-		struct tbv_native_data_header stream_hdr;
 		struct page *page = NULL;
 		void *done_ctx = NULL;
 		bool last;
 		dma_addr_t dma;
-		u8 *hdr_buf;
 		u32 page_off = 0;
 		u32 len = 0;
 
 		ret = next(next_ctx, &page, &page_off, &len, &done, &done_ctx);
 		if (ret)
 			goto err_release;
-		if (!page || !len || len > TBV_DATA_FRAME_SIZE ||
-		    len > TBV_NATIVE_DATA_MAX_PAYLOAD ||
+		if (!page || !len || len > max_raw_payload ||
 		    len > total_length - prepared ||
 		    page_off > PAGE_SIZE || len > PAGE_SIZE - page_off) {
 			if (done)
@@ -1806,54 +1844,7 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 			goto err_release;
 		}
 
-		/*
-		 * Keep the raw-stream scope to one native data fragment.  A
-		 * whole-WR headerless stream is smaller on the wire but leaves
-		 * the receiver with path-global state for too long, which is not
-		 * robust under full-duplex multi-QP traffic.
-		 */
 		last = prepared + len == total_length;
-		hdr_buf = kzalloc(TBV_NATIVE_DATA_HDR_SIZE, GFP_KERNEL);
-		if (!hdr_buf) {
-			if (done)
-				done(done_ctx, -ENOMEM);
-			ret = -ENOMEM;
-			goto err_release;
-		}
-
-		stream_hdr = *hdr;
-		stream_hdr.length = len;
-		stream_hdr.remote_addr = hdr->remote_addr + prepared;
-		stream_hdr.flags &= ~TBV_NATIVE_DATA_F_LAST;
-		if (!last)
-			stream_hdr.flags &= ~TBV_NATIVE_DATA_F_SOLICITED;
-		else
-			stream_hdr.flags |= TBV_NATIVE_DATA_F_LAST;
-		stream_hdr.flags |= TBV_NATIVE_DATA_F_RAW_STREAM;
-		ret = tbv_native_data_build_header(hdr_buf,
-						   TBV_NATIVE_DATA_HDR_SIZE,
-						   &stream_hdr);
-		if (ret < 0) {
-			kfree(hdr_buf);
-			if (done)
-				done(done_ctx, ret);
-			goto err_release;
-		}
-
-		packet = tbv_path_alloc_data_packet_owned(
-			path, hdr_buf, TBV_NATIVE_DATA_HDR_SIZE,
-			meta_done_attached ? NULL : meta_done, meta_done_ctx);
-		if (!packet) {
-			kfree(hdr_buf);
-			if (done)
-				done(done_ctx, -ENOMEM);
-			ret = -ENOMEM;
-			goto err_release;
-		}
-		packet->raw_stream_start = true;
-		list_add_tail(&packet->node, &packets);
-		packet_count++;
-		meta_done_attached = true;
 
 		dma = dma_map_page(dma_dev, page, page_off, len,
 				   DMA_TO_DEVICE);
@@ -1874,7 +1865,7 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 			goto err_release;
 		}
 		packet->owner_ctx = meta_done_ctx ? meta_done_ctx : done_ctx;
-		packet->raw_stream_end = true;
+		packet->raw_stream_end = last;
 		list_add_tail(&packet->node, &packets);
 		packet_count++;
 		prepared += len;

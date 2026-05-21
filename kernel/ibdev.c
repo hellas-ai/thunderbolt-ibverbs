@@ -351,6 +351,7 @@ struct tbv_send_page_stream {
 	refcount_t refs;
 	u32 offset;
 	u32 total_len;
+	u32 max_chunk;
 	int nsegs;
 };
 
@@ -2543,8 +2544,7 @@ static int tbv_send_page_stream_next(void *ctx, struct page **page,
 
 		remaining = min_t(u32, seg->length - seg_off,
 				  stream->total_len - stream->offset);
-		remaining = min_t(u32, remaining,
-				  TBV_NATIVE_DATA_MAX_PAYLOAD);
+		remaining = min_t(u32, remaining, stream->max_chunk);
 		ret = tbv_umem_page_from_addr(seg->mr, seg->addr + seg_off,
 					      remaining, page, page_off,
 					      length);
@@ -2878,12 +2878,14 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 
 	tbv_qp_queue_send(tqp, ctx);
 
-	if (tbv_should_zcopy_payload(total_len) && fragment_striping) {
+	if (is_write && tbv_should_zcopy_payload(total_len) &&
+	    fragment_striping) {
 		atomic64_inc(&tqp->owner->data_wr_zcopy_fallback);
 		atomic64_inc(&tqp->owner->data_wr_zcopy_fallback_striping);
 	}
 
-	if (!fragment_striping && tbv_should_zcopy_payload(total_len) &&
+	if (!fragment_striping && is_write &&
+	    tbv_should_zcopy_payload(total_len) &&
 	    tbv_send_segments_zcopy_safe(segs, nsegs, total_len)) {
 		struct tbv_send_page_stream *stream;
 
@@ -2934,6 +2936,7 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		refcount_set(&stream->refs, 1);
 		stream->send = ctx;
 		stream->total_len = total_len;
+		stream->max_chunk = TBV_NATIVE_DATA_FRAME_SIZE;
 		stream->nsegs = nsegs;
 		memcpy(stream->segs, segs, sizeof(stream->segs));
 		memset(segs, 0, sizeof(segs));
@@ -2961,7 +2964,8 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 		atomic64_inc(&tqp->owner->data_tx_accepted);
 		return 0;
 	}
-	if (!fragment_striping && tbv_should_zcopy_payload(total_len)) {
+	if (!fragment_striping && is_write &&
+	    tbv_should_zcopy_payload(total_len)) {
 		atomic64_inc(&tqp->owner->data_wr_zcopy_fallback);
 		atomic64_inc(&tqp->owner->data_wr_zcopy_fallback_unsafe_sge);
 	}
