@@ -6078,68 +6078,95 @@ static int tbv_ibdev_rail_name_index(const struct tbv_rail *rail)
 	return domain_idx * (TBV_NATIVE_MAX_LANES + 1) + slot;
 }
 
-void tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
-			  bool joined)
+int tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
+			 bool joined)
 {
 	struct tbv_ibdev *dev;
 	char name[16];
+	bool ready;
 	int idx;
 	int ret;
 
 	if (!state || !rail)
-		return;
-	if (!state->register_verbs)
-		return;
+		return 0;
 
-	if (joined) {
-		bool ready;
-
-		mutex_lock(&state->lock);
-		if (rail->peer->backend == TBV_BACKEND_NATIVE)
-			ready = tbv_rail_data_ready(rail);
-		else
-			ready = tbv_rail_apple_data_ready(rail);
-		ready = ready && !rail->removing;
-		mutex_unlock(&state->lock);
-		if (!ready)
-			return;
-
+	if (!joined) {
+		/*
+		 * Down edge is unconditional: even after tbv_ibdev_stop() has
+		 * disabled new joins, an already-published ib_device still has
+		 * to be unregistered when its rail goes away.
+		 */
 		mutex_lock(&state->rail_register_lock);
-		if (rail->ibdev) {
-			mutex_unlock(&state->rail_register_lock);
-			return;
-		}
-		idx = tbv_ibdev_rail_name_index(rail);
-		if (idx < 0) {
-			mutex_unlock(&state->rail_register_lock);
-			pr_warn("rail event ignored: cannot derive deterministic name (peer=%u rail=%u err=%d)\n",
-				rail->peer->peer_id, rail->rail_id, idx);
-			return;
-		}
-		snprintf(name, sizeof(name), "usb4_rdma%d", idx);
-		dev = NULL;
-		ret = tbv_ibdev_register_one(state, rail, name, &dev);
-		if (ret) {
-			mutex_unlock(&state->rail_register_lock);
-			pr_warn("failed to register per-rail ib_device %s: %d\n",
-				name, ret);
-			return;
-		}
-		rail->ibdev = dev;
+		dev = rail->ibdev;
+		rail->ibdev = NULL;
 		mutex_unlock(&state->rail_register_lock);
-		return;
+		if (!dev)
+			return 0;
+		ib_unregister_device(&dev->base);
+		ib_dealloc_device(&dev->base);
+		pr_info("unregistered per-rail ib_device peer=%u rail=%u\n",
+			rail->peer->peer_id, rail->rail_id);
+		return 0;
 	}
 
 	mutex_lock(&state->rail_register_lock);
-	dev = rail->ibdev;
-	rail->ibdev = NULL;
+	if (!state->register_enabled) {
+		mutex_unlock(&state->rail_register_lock);
+		return 0;
+	}
+	if (rail->ibdev) {
+		mutex_unlock(&state->rail_register_lock);
+		return 0;
+	}
+	if (rail->ibdev_register_failed) {
+		mutex_unlock(&state->rail_register_lock);
+		return 0;
+	}
+
+	/*
+	 * Re-check removing under the registration lock. tbv_peer_remove_rail()
+	 * sets rail->removing then calls the down event under the same lock;
+	 * by gating publication on it here we guarantee that a concurrent
+	 * remove either runs its down event before us (and we'll skip
+	 * publishing) or after us (and finds rail->ibdev set, tears it down).
+	 *
+	 * The data-ready check is best-effort: we re-evaluate it under
+	 * state->lock for stable list/state reads, but the source-of-truth for
+	 * "is this rail going away" is rail->removing, which is monotonic.
+	 */
+	mutex_lock(&state->lock);
+	if (rail->peer->backend == TBV_BACKEND_NATIVE)
+		ready = tbv_rail_data_ready(rail);
+	else
+		ready = tbv_rail_apple_data_ready(rail);
+	ready = ready && !rail->removing;
+	mutex_unlock(&state->lock);
+	if (!ready) {
+		mutex_unlock(&state->rail_register_lock);
+		return 0;
+	}
+
+	idx = tbv_ibdev_rail_name_index(rail);
+	if (idx < 0) {
+		rail->ibdev_register_failed = true;
+		mutex_unlock(&state->rail_register_lock);
+		pr_warn("rail event ignored: cannot derive deterministic name (peer=%u rail=%u err=%d)\n",
+			rail->peer->peer_id, rail->rail_id, idx);
+		return idx;
+	}
+	snprintf(name, sizeof(name), "usb4_rdma%d", idx);
+	dev = NULL;
+	ret = tbv_ibdev_register_one(state, rail, name, &dev);
+	if (ret) {
+		rail->ibdev_register_failed = true;
+		mutex_unlock(&state->rail_register_lock);
+		pr_warn("failed to register per-rail ib_device %s: %d (will not retry)\n",
+			name, ret);
+		return ret;
+	}
+	rail->ibdev = dev;
 	mutex_unlock(&state->rail_register_lock);
-	if (!dev)
-		return;
-	ib_unregister_device(&dev->base);
-	ib_dealloc_device(&dev->base);
-	pr_info("unregistered per-rail ib_device peer=%u rail=%u\n",
-		rail->peer->peer_id, rail->rail_id);
+	return 0;
 }
 
 int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
@@ -6152,15 +6179,21 @@ int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
 		return 0;
 
 	state->verbs_registered = true;
+	mutex_lock(&state->rail_register_lock);
+	state->register_enabled = true;
+	mutex_unlock(&state->rail_register_lock);
 
 	/*
 	 * Catch up any rails that became data-ready before this ran. After
-	 * register_verbs is set, native_control and service hooks publish
+	 * register_enabled is true, native_control and service hooks publish
 	 * rising-edge events directly; this loop replays the edges they
-	 * would have missed.
+	 * would have missed. Rails that previously failed to register
+	 * (ibdev_register_failed) are skipped so a single bad lane cannot
+	 * spin the loop forever.
 	 */
 	for (;;) {
 		bool ready;
+		bool skip;
 
 		catchup = NULL;
 		mutex_lock(&state->lock);
@@ -6169,11 +6202,11 @@ int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
 
 			list_for_each_entry(rail, &peer->rails, node) {
 				mutex_lock(&state->rail_register_lock);
-				if (rail->ibdev) {
-					mutex_unlock(&state->rail_register_lock);
-					continue;
-				}
+				skip = rail->ibdev ||
+				       rail->ibdev_register_failed;
 				mutex_unlock(&state->rail_register_lock);
+				if (skip)
+					continue;
 				if (peer->backend == TBV_BACKEND_NATIVE)
 					ready = tbv_rail_data_ready(rail);
 				else
@@ -6190,6 +6223,12 @@ int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
 		mutex_unlock(&state->lock);
 		if (!catchup)
 			break;
+		/*
+		 * Ignore the per-rail return: on failure the rail is marked
+		 * ibdev_register_failed inside the event, so the next loop
+		 * iteration skips it and we make forward progress instead of
+		 * pinning the same lane. Other rails should still publish.
+		 */
 		tbv_ibdev_rail_event(state, catchup, true);
 		tbv_rail_put(catchup);
 	}
@@ -6200,6 +6239,17 @@ void tbv_ibdev_stop(struct tbv_state *state)
 {
 	struct tbv_peer *peer;
 	bool any;
+
+	/*
+	 * Disable rising-edge registrations before draining. Doing this under
+	 * rail_register_lock ensures any in-flight up event either runs to
+	 * completion before us (its ib_device is then visible in the loop
+	 * below) or observes register_enabled=false and bails out without
+	 * publishing.
+	 */
+	mutex_lock(&state->rail_register_lock);
+	state->register_enabled = false;
+	mutex_unlock(&state->rail_register_lock);
 
 	state->verbs_registered = false;
 	if (state->workqueue)

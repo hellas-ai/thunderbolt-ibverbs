@@ -503,6 +503,14 @@ struct tbv_state {
 	 * take state->lock.
 	 */
 	struct mutex rail_register_lock;
+	/*
+	 * Up-event gate, owned by rail_register_lock. Set to true by
+	 * tbv_ibdev_start() before any rising-edge events may publish; cleared
+	 * by tbv_ibdev_stop() before draining so no late ready-edge event
+	 * sneaks a fresh ib_device past module exit. Down events ignore this
+	 * flag so existing devices can always be torn down.
+	 */
+	bool register_enabled;
 };
 
 struct dentry;
@@ -550,12 +558,17 @@ void tbv_ibdev_stop(struct tbv_state *state);
 const char *tbv_ibdev_roce_netdev_name(void);
 /*
  * Notify the verbs layer that rail's data path has come up (joined=true) or
- * is about to be torn down (joined=false). No-op unless state->register_verbs
- * is set. Safe to call repeatedly; only the rising/falling edge of
- * "ibdev published" causes registration changes.
+ * is about to be torn down (joined=false). Safe to call repeatedly; only the
+ * rising/falling edge of "ibdev published" causes registration changes.
+ *
+ * Up events are gated on state->register_enabled (flipped off by
+ * tbv_ibdev_stop()). Down events are unconditional so module-exit and rail
+ * remove can always undo a published device. Returns 0 on success/no-op, or a
+ * negative errno if an up event failed to publish (the rail is then
+ * permanently marked failed and will be skipped on retry).
  */
-void tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
-			  bool joined);
+int tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
+			 bool joined);
 void tbv_ibdev_rx_frame(struct tbv_state *state, struct tbv_path *rx_path,
 			const void *data, u32 len);
 void tbv_ibdev_rx_native_frame(struct tbv_state *state,
