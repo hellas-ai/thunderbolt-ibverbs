@@ -347,7 +347,7 @@ static int tbv_service_probe(struct tb_service *svc,
 
 	path_id = tbv_service_path_id(svc, id, backend);
 	tbv_rail_key_init(&key, xd->route, xd->link, xd->depth, path_id);
-	rail = tbv_peer_add_rail(peer, &key);
+	rail = tbv_peer_add_rail(peer, &key, native_lane);
 	if (IS_ERR(rail)) {
 		ret = PTR_ERR(rail);
 		goto err_put_peer;

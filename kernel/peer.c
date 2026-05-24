@@ -170,7 +170,8 @@ void tbv_peer_put(struct tbv_state *state, struct tbv_peer *peer)
 }
 
 struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
-				   const struct tbv_rail_key *key)
+				   const struct tbv_rail_key *key,
+				   u32 native_lane)
 {
 	struct tbv_path_config path_cfg;
 	struct tbv_rail *rail;
@@ -190,6 +191,7 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 
 	rail->key = *key;
 	rail->rail_id = rail_id;
+	rail->native_lane = native_lane;
 	refcount_set(&rail->refcnt, 1);
 	init_completion(&rail->refs_zero);
 	rail->active = true;

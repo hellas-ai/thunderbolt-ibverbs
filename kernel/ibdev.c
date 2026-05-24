@@ -6067,11 +6067,9 @@ static int tbv_ibdev_rail_name_index(const struct tbv_rail *rail)
 		return -ENODEV;
 
 	if (rail->peer->backend == TBV_BACKEND_NATIVE) {
-		u32 lane = rail->key.path_id & 0xff;
-
-		if (lane >= TBV_NATIVE_MAX_LANES)
+		if (rail->native_lane >= TBV_NATIVE_MAX_LANES)
 			return -ERANGE;
-		slot = lane;
+		slot = rail->native_lane;
 	} else {
 		/* One slot per (domain, backend) for Apple. */
 		slot = TBV_NATIVE_MAX_LANES;

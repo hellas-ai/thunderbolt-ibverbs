@@ -225,8 +225,26 @@ struct tbv_rail {
 	u32 native_tunnel_attempts;
 	u32 native_ready_attempts;
 	int native_last_error;
+	/*
+	 * Physical lane index for native rails (0..TBV_NATIVE_MAX_LANES-1).
+	 * Set in tbv_peer_add_rail() from the matched service id and consumed
+	 * by tbv_ibdev_rail_name_index(). Don't derive this from rail->key.path_id;
+	 * the encoded path_id uses TBV_NATIVE_PRTCID as its low byte for lane 0,
+	 * which collides with the (prtcid << 8) | lane scheme used for the
+	 * other lanes (both lane 0 and lane 1 would round-trip to "lane 1").
+	 * Undefined for non-native backends.
+	 */
+	u32 native_lane;
 	bool active;
 	bool removing;
+	/*
+	 * Registration unwinding marker. Set under state->rail_register_lock
+	 * when ib_register_device() returns nonzero for this rail. While true
+	 * tbv_ibdev_start()'s catchup loop and tbv_ibdev_rail_event() will
+	 * skip the rail, breaking the spin loop the failed lane would
+	 * otherwise cause.
+	 */
+	bool ibdev_register_failed;
 	bool native_negotiated;
 	bool native_ready_sent;
 	bool native_remote_ready;
@@ -614,7 +632,8 @@ struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
 					struct tb_xdomain *xd);
 void tbv_peer_put(struct tbv_state *state, struct tbv_peer *peer);
 struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
-				   const struct tbv_rail_key *key);
+				   const struct tbv_rail_key *key,
+				   u32 native_lane);
 void tbv_peer_remove_rail(struct tbv_rail *rail);
 void tbv_rail_put(struct tbv_rail *rail);
 void tbv_path_default_config(enum tbv_backend_type backend,
