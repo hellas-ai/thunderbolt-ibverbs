@@ -30,10 +30,36 @@
 #define TBV_DATA_QUEUE_MULTIPLIER 64
 #define TBV_DATA_PACKET_POOL_LIMIT 1024
 
+typedef int (*tbv_ring_throttling_fn)(struct tb_ring *ring,
+				      unsigned int interval_nsec);
+
+extern int tb_ring_throttling(struct tb_ring *ring,
+			      unsigned int interval_nsec);
+
 static uint nhi_interrupt_throttle_ns;
 module_param(nhi_interrupt_throttle_ns, uint, 0644);
 MODULE_PARM_DESC(nhi_interrupt_throttle_ns,
 		 "NHI interrupt throttling interval for TBV data rings in ns; 0 disables ring throttling");
+
+static tbv_ring_throttling_fn tbv_ring_throttling;
+
+void tbv_path_init_optional_symbols(void)
+{
+	tbv_ring_throttling = symbol_get(tb_ring_throttling);
+	if (tbv_ring_throttling)
+		pr_info("using optional tb_ring_throttling() helper\n");
+	else
+		pr_info("optional tb_ring_throttling() helper unavailable; using stock NHI interrupt throttling\n");
+}
+
+void tbv_path_exit_optional_symbols(void)
+{
+	if (!tbv_ring_throttling)
+		return;
+
+	symbol_put(tb_ring_throttling);
+	tbv_ring_throttling = NULL;
+}
 
 static bool apple_tx_raw_mode = true;
 module_param(apple_tx_raw_mode, bool, 0644);
@@ -112,16 +138,23 @@ static u32 tbv_path_data_packet_count(const struct tbv_path *path)
 static int tbv_path_configure_ring_throttling(struct tbv_path *path)
 {
 	u32 interval = READ_ONCE(nhi_interrupt_throttle_ns);
-	int ret = -ENOMEM;
+	int ret;
 
-	ret = tb_ring_throttling(path->tx_ring, interval);
+	if (!tbv_ring_throttling) {
+		if (interval)
+			pr_warn_once("nhi_interrupt_throttle_ns requires a kernel exporting tb_ring_throttling(); ignoring interval %u ns\n",
+				     interval);
+		return 0;
+	}
+
+	ret = tbv_ring_throttling(path->tx_ring, interval);
 	if (ret) {
 		pr_warn("TX ring throttling interval %u ns failed ret=%d\n",
 			interval, ret);
 		return ret;
 	}
 
-	ret = tb_ring_throttling(path->rx_ring, interval);
+	ret = tbv_ring_throttling(path->rx_ring, interval);
 	if (ret) {
 		pr_warn("RX ring throttling interval %u ns failed ret=%d\n",
 			interval, ret);

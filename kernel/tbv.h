@@ -653,6 +653,8 @@ bool tbv_path_apple_tx_raw_mode(void);
 bool tbv_path_apple_rx_raw_mode(void);
 void tbv_path_default_config(enum tbv_backend_type backend,
 			     struct tbv_path_config *cfg);
+void tbv_path_init_optional_symbols(void);
+void tbv_path_exit_optional_symbols(void);
 void tbv_path_init(struct tbv_path *path,
 		   const struct tbv_path_config *cfg, struct tbv_rail *rail);
 void tbv_path_reset(struct tbv_path *path);

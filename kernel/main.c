@@ -136,24 +136,30 @@ static int __init tbv_init(void)
 	if (ret)
 		return ret;
 
+	tbv_path_init_optional_symbols();
+
 	if (start_rings && !allocate_rings) {
 		pr_err("start_rings=1 requires allocate_rings=1\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_path_symbols;
 	}
 
 	if (negotiate_native && !start_rings) {
 		pr_err("negotiate_native=1 requires start_rings=1\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_path_symbols;
 	}
 
 	if (enable_tunnels && !start_rings) {
 		pr_err("enable_tunnels=1 requires start_rings=1\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_path_symbols;
 	}
 
 	if (enable_tunnels && resolved.native_enabled && !negotiate_native) {
 		pr_err("enable_tunnels=1 requires negotiate_native=1 when native Linux transport is enabled\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_path_symbols;
 	}
 
 	identity_cfg.tbnet_netdev = tbnet_identity_tbnet;
@@ -163,7 +169,7 @@ static int __init tbv_init(void)
 
 	ret = tbv_core_init(&tbv_driver_state, &resolved, &identity_cfg);
 	if (ret)
-		return ret;
+		goto err_path_symbols;
 	tbv_driver_state.native_fragment_striping = native_fragment_striping;
 	tbv_driver_state.native_data = native_data;
 	tbv_driver_state.apple_data = apple_data;
@@ -179,14 +185,14 @@ static int __init tbv_init(void)
 				 &service_cfg);
 	if (ret) {
 		tbv_core_exit(&tbv_driver_state);
-		return ret;
+		goto err_path_symbols;
 	}
 
 	ret = tbv_ibdev_start(&tbv_driver_state, register_verbs);
 	if (ret) {
 		tbv_services_stop(&tbv_driver_state);
 		tbv_core_exit(&tbv_driver_state);
-		return ret;
+		goto err_path_symbols;
 	}
 
 	if (cfg.lanes_auto)
@@ -213,6 +219,10 @@ static int __init tbv_init(void)
 		native_fragment_striping);
 
 	return 0;
+
+err_path_symbols:
+	tbv_path_exit_optional_symbols();
+	return ret;
 }
 
 static void __exit tbv_exit(void)
@@ -220,6 +230,7 @@ static void __exit tbv_exit(void)
 	tbv_ibdev_stop(&tbv_driver_state);
 	tbv_services_stop(&tbv_driver_state);
 	tbv_core_exit(&tbv_driver_state);
+	tbv_path_exit_optional_symbols();
 	pr_info("unloaded\n");
 }
 
