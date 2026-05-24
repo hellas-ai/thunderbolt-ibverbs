@@ -159,6 +159,14 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_path_send_error));
 	seq_printf(s, "data_wr_timeout: %lld\n",
 		   atomic64_read(&state->data_wr_timeout));
+	seq_printf(s, "apple_sq_queued: %lld\n",
+		   atomic64_read(&state->apple_sq_queued));
+	seq_printf(s, "apple_sq_dequeued: %lld\n",
+		   atomic64_read(&state->apple_sq_dequeued));
+	seq_printf(s, "apple_sq_full: %lld\n",
+		   atomic64_read(&state->apple_sq_full));
+	seq_printf(s, "apple_sq_flushed: %lld\n",
+		   atomic64_read(&state->apple_sq_flushed));
 	seq_printf(s, "data_tx_accepted: %lld\n",
 		   atomic64_read(&state->data_tx_accepted));
 	seq_printf(s, "data_tx_posted: %lld\n",

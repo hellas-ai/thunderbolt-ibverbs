@@ -401,6 +401,10 @@ struct tbv_state {
 	atomic64_t data_wr_path_send;
 	atomic64_t data_wr_path_send_error;
 	atomic64_t data_wr_timeout;
+	atomic64_t apple_sq_queued;
+	atomic64_t apple_sq_dequeued;
+	atomic64_t apple_sq_full;
+	atomic64_t apple_sq_flushed;
 	atomic64_t data_tx_accepted;
 	atomic64_t data_tx_posted;
 	atomic64_t data_tx_completed;
