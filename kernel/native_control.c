@@ -755,6 +755,26 @@ static void tbv_native_control_work(struct work_struct *work)
 			goto out;
 		}
 		rail->native_ready_sent = true;
+
+		/*
+		 * We initiated the READY exchange: ready_once already marked the
+		 * remote ready (its READY_ACK carried their state), but that hook
+		 * fired before we set native_ready_sent above, so it saw
+		 * data_ready=false. Re-check now that all three edges
+		 * (tunnel_enabled, ready_sent, remote_ready) are in place and
+		 * publish if appropriate. The wire-handler path goes through
+		 * mark_local_ready_sent which has the publish baked in; this is
+		 * the work-function equivalent.
+		 */
+		mutex_lock(&state->lock);
+		if (tbv_rail_data_ready(rail) && !rail->removing) {
+			refcount_inc(&rail->refcnt);
+			mutex_unlock(&state->lock);
+			tbv_ibdev_rail_event(state, rail, true);
+			tbv_rail_put(rail);
+		} else {
+			mutex_unlock(&state->lock);
+		}
 	}
 
 out:
