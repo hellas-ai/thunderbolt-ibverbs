@@ -42,8 +42,17 @@ install_deps() {
 	fedora)
 		dnf install -y -q --setopt=install_weak_deps=False \
 			ca-certificates gcc git iproute kernel-headers kmod \
-			libibverbs-utils make openssl rdma-core rdma-core-devel \
-			"kernel-devel-uname-r == $kver"
+			libibverbs-utils make openssl rdma-core rdma-core-devel
+		if [[ -d "/lib/modules/$kver/build" ]]; then
+			return 0
+		fi
+		if ! dnf install -y -q --setopt=install_weak_deps=False \
+				"kernel-devel-uname-r == $kver"; then
+			printf 'Fedora kernel-devel for %s is unavailable; installing latest kernel packages for one reboot\n' "$kver"
+			dnf install -y -q --setopt=install_weak_deps=False \
+				kernel kernel-core kernel-devel kernel-modules \
+				kernel-modules-core
+		fi
 		;;
 	arch)
 		pacman -Syu --noconfirm --needed \
@@ -56,18 +65,22 @@ install_deps() {
 	esac
 }
 
-maybe_reboot_for_arch_headers() {
+maybe_reboot_for_matching_headers() {
 	local kver="$1"
 
-	if [[ "$distro" != "arch" || -d "/lib/modules/$kver/build" ]]; then
+	if [[ -d "/lib/modules/$kver/build" ]]; then
+		return 0
+	fi
+
+	if [[ "$distro" != "arch" && "$distro" != "fedora" ]]; then
 		return 0
 	fi
 
 	if [[ "${TBV_GUEST_REBOOTED:-0}" == "1" ]]; then
-		die "headers for running Arch kernel are still missing after reboot: $kver"
+		die "headers for running $distro kernel are still missing after reboot: $kver"
 	fi
 
-	printf 'Arch kernel headers do not match the running kernel; rebooting once\n'
+	printf '%s kernel headers do not match the running kernel; rebooting once\n' "$distro"
 	(sleep 1; systemctl reboot) >/dev/null 2>&1 &
 	exit 75
 }
@@ -135,7 +148,7 @@ printf '==> Kernel: %s\n' "$(uname -r)"
 kver="$(uname -r)"
 printf '==> Installing guest dependencies\n'
 install_deps "$kver"
-maybe_reboot_for_arch_headers "$kver"
+maybe_reboot_for_matching_headers "$kver"
 
 printf '==> Building module for %s\n' "$kver"
 build_module "$kver"
