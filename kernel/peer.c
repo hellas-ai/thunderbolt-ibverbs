@@ -265,13 +265,24 @@ void tbv_peer_remove_rail(struct tbv_rail *rail)
 		return;
 
 	peer = rail->peer;
+
+	/*
+	 * Mark the rail as removing but leave it on peer->rails. The
+	 * tbv_destroy_qp() cancel walks (tbv_cancel_send_ctx_packets,
+	 * tbv_cancel_read_ctx_packets) traverse state->peers->rails to find
+	 * pinned QP packets that need cancellation; removing the rail before
+	 * ib_unregister_device() drains those callbacks would hide the path
+	 * from the cancel walks, leaving in-flight WRs queued. Their packet
+	 * refs would keep tqp->refs alive, and the QP's hold on rail->refcnt
+	 * would stop wait_for_completion(&rail->refs_zero) from returning ->
+	 * indefinite teardown hang.
+	 *
+	 * "removing" is honored by every selector that picks a path for new
+	 * traffic, so even while the rail is still on the list no fresh
+	 * sends/reads can pick it.
+	 */
 	mutex_lock(&peer->state->lock);
 	rail->removing = true;
-	if (!list_empty(&rail->node)) {
-		list_del_init(&rail->node);
-		if (peer->nr_rails)
-			peer->nr_rails--;
-	}
 	mutex_unlock(&peer->state->lock);
 
 	/*
@@ -287,6 +298,20 @@ void tbv_peer_remove_rail(struct tbv_rail *rail)
 	tbv_native_control_cancel_rail(rail);
 	tbv_rail_put(rail);
 	wait_for_completion(&rail->refs_zero);
+
+	/*
+	 * All QPs that held a ref on this rail have now been destroyed
+	 * (their refs were dropped in tbv_destroy_qp); it is safe to
+	 * unlink the rail from peer->rails and free its path.
+	 */
+	mutex_lock(&peer->state->lock);
+	if (!list_empty(&rail->node)) {
+		list_del_init(&rail->node);
+		if (peer->nr_rails)
+			peer->nr_rails--;
+	}
+	mutex_unlock(&peer->state->lock);
+
 	tbv_path_destroy(&rail->path, peer->xd);
 	ida_free(&peer->rail_ids, rail->rail_id);
 	kfree(rail);
