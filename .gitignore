@@ -1,0 +1,20 @@
+# kbuild outputs
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.o
+.*.cmd
+.Module.symvers.cmd
+.modules.order.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+
+# DKMS/local packaging outputs
+*.deb
+*.rpm
+*.tar
+*.tar.*
+result
+result-*
