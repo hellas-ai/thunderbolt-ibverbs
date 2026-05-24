@@ -42,3 +42,36 @@ jobs:
 
       - name: Build in ${{ matrix.image }}
         run: tools/ci/distro-build.sh ${{ matrix.image }}
+
+  vm-smoke:
+    name: vm smoke (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - debian
+          - fedora
+          - arch
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cloud-image-utils \
+            curl \
+            netcat-openbsd \
+            openssh-client \
+            qemu-system-x86 \
+            qemu-utils
+
+      - name: Enable KVM access
+        run: |
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+
+      - name: Boot VM and smoke-test module
+        run: tools/ci/vm-smoke.sh ${{ matrix.distro }}

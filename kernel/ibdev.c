@@ -20,6 +20,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/thunderbolt.h>
+#include <linux/version.h>
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -5860,7 +5861,9 @@ void tbv_ibdev_rx_frame(struct tbv_state *state, struct tbv_path *rx_path,
 
 static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 				     u64 virt_addr, int access,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 				     struct ib_dmah *dmah,
+#endif
 				     struct ib_udata *udata)
 {
 	struct tbv_mr *mr;
