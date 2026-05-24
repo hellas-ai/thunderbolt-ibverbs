@@ -83,18 +83,8 @@ err_destroy_wq:
 
 void tbv_core_exit(struct tbv_state *state)
 {
-	enum tbv_backend_type backend;
-
 	if (!list_empty(&state->peers))
 		pr_warn("unloading with live peers after service teardown\n");
-
-	for (backend = TBV_BACKEND_NATIVE; backend <= TBV_BACKEND_APPLE;
-	     backend++) {
-		if (state->verbs_parent[backend]) {
-			put_device(state->verbs_parent[backend]);
-			state->verbs_parent[backend] = NULL;
-		}
-	}
 
 	if (state->workqueue) {
 		flush_workqueue(state->workqueue);
@@ -112,35 +102,4 @@ void tbv_core_exit(struct tbv_state *state)
 	tbv_tbnet_identity_stop(&state->tbnet_identity);
 	mutex_destroy(&state->rail_register_lock);
 	mutex_destroy(&state->lock);
-}
-
-void tbv_state_set_verbs_parent(struct tbv_state *state,
-				enum tbv_backend_type backend,
-				struct device *dev)
-{
-	if (!dev)
-		return;
-	if (!tbv_backend_get(backend))
-		return;
-
-	mutex_lock(&state->lock);
-	if (!state->verbs_parent[backend])
-		state->verbs_parent[backend] = get_device(dev);
-	mutex_unlock(&state->lock);
-}
-
-struct device *tbv_state_get_verbs_parent(struct tbv_state *state,
-					  enum tbv_backend_type backend)
-{
-	struct device *dev;
-
-	if (!tbv_backend_get(backend))
-		return NULL;
-
-	mutex_lock(&state->lock);
-	dev = state->verbs_parent[backend] ?
-	      get_device(state->verbs_parent[backend]) : NULL;
-	mutex_unlock(&state->lock);
-
-	return dev;
 }

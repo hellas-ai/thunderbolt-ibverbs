@@ -5982,14 +5982,17 @@ static const struct ib_device_ops tbv_ibdev_ops = {
 };
 
 static int tbv_ibdev_register_one(struct tbv_state *state,
-				  enum tbv_backend_type backend,
 				  struct tbv_rail *rail,
 				  const char *name,
 				  struct tbv_ibdev **out)
 {
+	enum tbv_backend_type backend = rail->peer->backend;
 	struct tbv_ibdev *dev;
-	struct device *dma_device = NULL;
+	struct device *dma_device;
 	int ret;
+
+	if (!rail->path.tx_ring)
+		return -ENODEV;
 
 	dev = ib_alloc_device(tbv_ibdev, base);
 	if (!dev)
@@ -6003,19 +6006,14 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
 	dev->base.local_dma_lkey = 0;
 	dev->base.node_type = RDMA_NODE_IB_CA;
 	/*
-	 * Per-lane mode encodes the rail in the low bits of the node GUID so
-	 * each ib_device has a distinct GID; this matches the historical
-	 * module/ca70710 behavior where each lane was a separate HCA.
+	 * Encode rail identity in the low bits so each lane's ib_device has
+	 * a distinct GID — RCCL keys discovery on this.
 	 */
-	if (rail)
-		dev->base.node_guid =
-			cpu_to_be64(0x0200544256524253ULL +
-				    ((u64)backend << 56) +
-				    ((u64)rail->peer->peer_id << 24) +
-				    rail->rail_id);
-	else
-		dev->base.node_guid =
-			cpu_to_be64(0x0200544256524253ULL + backend);
+	dev->base.node_guid =
+		cpu_to_be64(0x0200544256524253ULL +
+			    ((u64)backend << 56) +
+			    ((u64)rail->peer->peer_id << 24) +
+			    rail->rail_id);
 	dev->base.uverbs_cmd_mask |=
 		BIT_ULL(IB_USER_VERBS_CMD_POST_SEND) |
 		BIT_ULL(IB_USER_VERBS_CMD_POST_RECV) |
@@ -6024,34 +6022,24 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
 
 	ib_set_device_ops(&dev->base, &tbv_ibdev_ops);
 
-	if (rail && rail->path.tx_ring)
-		dma_device = get_device(tb_ring_dma_device(rail->path.tx_ring));
-	if (!dma_device)
-		dma_device = tbv_state_get_verbs_parent(state, backend);
+	dma_device = get_device(tb_ring_dma_device(rail->path.tx_ring));
 	dev->base.dev.parent = dma_device;
 	ret = ib_register_device(&dev->base, name, dma_device);
 	if (ret) {
-		if (dma_device)
-			put_device(dma_device);
+		put_device(dma_device);
 		ib_dealloc_device(&dev->base);
 		return ret;
 	}
 
 	if (out)
 		*out = dev;
-	if (rail)
-		pr_info("registered %s ib_device %s rail=peer%u/%u domain=%d guid=%016llx\n",
-			tbv_backend_name(backend), dev_name(&dev->base.dev),
-			rail->peer->peer_id, rail->rail_id,
-			rail->peer->xd && rail->peer->xd->tb ?
-			rail->peer->xd->tb->index : -1,
-			be64_to_cpu(dev->base.node_guid));
-	else
-		pr_info("registered %s ib_device %s dma_device=%s\n",
-			tbv_backend_name(backend), dev_name(&dev->base.dev),
-			dma_device ? dev_name(dma_device) : "<none>");
-	if (dma_device)
-		put_device(dma_device);
+	pr_info("registered %s ib_device %s rail=peer%u/%u domain=%d guid=%016llx\n",
+		tbv_backend_name(backend), dev_name(&dev->base.dev),
+		rail->peer->peer_id, rail->rail_id,
+		rail->peer->xd && rail->peer->xd->tb ?
+		rail->peer->xd->tb->index : -1,
+		be64_to_cpu(dev->base.node_guid));
+	put_device(dma_device);
 	return 0;
 }
 
@@ -6102,7 +6090,7 @@ void tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
 
 	if (!state || !rail)
 		return;
-	if (!state->register_verbs || !state->register_per_rail)
+	if (!state->register_verbs)
 		return;
 
 	if (joined) {
@@ -6132,8 +6120,7 @@ void tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
 		}
 		snprintf(name, sizeof(name), "usb4_rdma%d", idx);
 		dev = NULL;
-		ret = tbv_ibdev_register_one(state, rail->peer->backend, rail,
-					     name, &dev);
+		ret = tbv_ibdev_register_one(state, rail, name, &dev);
 		if (ret) {
 			mutex_unlock(&state->rail_register_lock);
 			pr_warn("failed to register per-rail ib_device %s: %d\n",
@@ -6159,154 +6146,100 @@ void tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
 
 int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
 {
-	int ret;
+	struct tbv_peer *peer;
+	struct tbv_rail *catchup;
 
 	state->register_verbs = register_verbs;
 	if (!register_verbs)
 		return 0;
 
-	/*
-	 * In per-lane mode the legacy aggregate ib_devices stay un-registered;
-	 * rail-up events (tbv_ibdev_rail_event) publish one ib_device per
-	 * active rail instead. The flag is checked here too, not just in the
-	 * event hook, so that ibdev_stop's teardown loop sees a consistent
-	 * empty ibdevs[] (and the rest of the kernel can still call
-	 * tbv_ibdev_rail_event after start returns).
-	 */
-	if (state->register_per_rail) {
-		struct tbv_peer *peer;
-		struct tbv_rail *catchup = NULL;
-
-		pr_info("register_per_rail=1: deferring ib_device registration to rail-up events\n");
-		state->verbs_registered = true;
-
-		/*
-		 * Catch up any rails that finished bringing data paths up
-		 * before tbv_ibdev_start ran. The hooks in native_control and
-		 * service.c are gated on register_verbs which we just set, so
-		 * future rail-up events go through the normal path.
-		 */
-		for (;;) {
-			catchup = NULL;
-			mutex_lock(&state->lock);
-			list_for_each_entry(peer, &state->peers, node) {
-				struct tbv_rail *rail;
-				bool ready;
-
-				list_for_each_entry(rail, &peer->rails, node) {
-					mutex_lock(&state->rail_register_lock);
-					if (rail->ibdev) {
-						mutex_unlock(&state->rail_register_lock);
-						continue;
-					}
-					mutex_unlock(&state->rail_register_lock);
-					if (peer->backend == TBV_BACKEND_NATIVE)
-						ready = tbv_rail_data_ready(rail);
-					else
-						ready = tbv_rail_apple_data_ready(rail);
-					if (!ready || rail->removing)
-						continue;
-					refcount_inc(&rail->refcnt);
-					catchup = rail;
-					break;
-				}
-				if (catchup)
-					break;
-			}
-			mutex_unlock(&state->lock);
-			if (!catchup)
-				break;
-			tbv_ibdev_rail_event(state, catchup, true);
-			tbv_rail_put(catchup);
-		}
-		return 0;
-	}
-
-	if (state->cfg.native_enabled) {
-		ret = tbv_ibdev_register_one(state, TBV_BACKEND_NATIVE, NULL,
-					     "usb4_rdma%d",
-					     &state->ibdevs[TBV_BACKEND_NATIVE]);
-		if (ret)
-			goto err_stop;
-	}
-
-	if (state->cfg.apple_enabled) {
-		ret = tbv_ibdev_register_one(state, TBV_BACKEND_APPLE, NULL,
-					     state->cfg.native_enabled ?
-					     "usb4_apple%d" : "usb4_rdma%d",
-					     &state->ibdevs[TBV_BACKEND_APPLE]);
-		if (ret)
-			goto err_stop;
-	}
-
 	state->verbs_registered = true;
-	return 0;
 
-err_stop:
-	tbv_ibdev_stop(state);
-	return ret;
+	/*
+	 * Catch up any rails that became data-ready before this ran. After
+	 * register_verbs is set, native_control and service hooks publish
+	 * rising-edge events directly; this loop replays the edges they
+	 * would have missed.
+	 */
+	for (;;) {
+		bool ready;
+
+		catchup = NULL;
+		mutex_lock(&state->lock);
+		list_for_each_entry(peer, &state->peers, node) {
+			struct tbv_rail *rail;
+
+			list_for_each_entry(rail, &peer->rails, node) {
+				mutex_lock(&state->rail_register_lock);
+				if (rail->ibdev) {
+					mutex_unlock(&state->rail_register_lock);
+					continue;
+				}
+				mutex_unlock(&state->rail_register_lock);
+				if (peer->backend == TBV_BACKEND_NATIVE)
+					ready = tbv_rail_data_ready(rail);
+				else
+					ready = tbv_rail_apple_data_ready(rail);
+				if (!ready || rail->removing)
+					continue;
+				refcount_inc(&rail->refcnt);
+				catchup = rail;
+				break;
+			}
+			if (catchup)
+				break;
+		}
+		mutex_unlock(&state->lock);
+		if (!catchup)
+			break;
+		tbv_ibdev_rail_event(state, catchup, true);
+		tbv_rail_put(catchup);
+	}
+	return 0;
 }
 
 void tbv_ibdev_stop(struct tbv_state *state)
 {
-	enum tbv_backend_type backend;
 	struct tbv_peer *peer;
+	bool any;
 
 	state->verbs_registered = false;
 	if (state->workqueue)
 		flush_workqueue(state->workqueue);
 
 	/*
-	 * Per-lane mode: walk every peer/rail and unregister anything still
-	 * published. Done under no state->lock because ib_unregister_device
-	 * can block waiting for ops to drain.
+	 * Walk every peer/rail and unregister anything still published.
+	 * ib_unregister_device may block waiting for verbs ops to drain, so
+	 * we drop state->lock around each event.
 	 */
-	if (state->register_per_rail) {
-		bool any;
+	do {
+		struct tbv_rail *target = NULL;
 
-		do {
-			struct tbv_rail *target = NULL;
+		any = false;
+		mutex_lock(&state->lock);
+		list_for_each_entry(peer, &state->peers, node) {
+			struct tbv_rail *rail;
 
-			any = false;
-			mutex_lock(&state->lock);
-			list_for_each_entry(peer, &state->peers, node) {
-				struct tbv_rail *rail;
-
-				list_for_each_entry(rail, &peer->rails, node) {
-					mutex_lock(&state->rail_register_lock);
-					if (rail->ibdev) {
-						target = rail;
-						refcount_inc(&rail->refcnt);
-					}
-					mutex_unlock(&state->rail_register_lock);
-					if (target)
-						break;
+			list_for_each_entry(rail, &peer->rails, node) {
+				mutex_lock(&state->rail_register_lock);
+				if (rail->ibdev) {
+					target = rail;
+					refcount_inc(&rail->refcnt);
 				}
+				mutex_unlock(&state->rail_register_lock);
 				if (target)
 					break;
 			}
-			mutex_unlock(&state->lock);
-			if (target) {
-				tbv_ibdev_rail_event(state, target, false);
-				tbv_rail_put(target);
-				any = true;
-			}
-		} while (any);
-	}
-
-	for (backend = TBV_BACKEND_NATIVE; backend <= TBV_BACKEND_APPLE;
-	     backend++) {
-		struct tbv_ibdev *dev = state->ibdevs[backend];
-
-		if (!dev)
-			continue;
-
-		state->ibdevs[backend] = NULL;
-		ib_unregister_device(&dev->base);
-		ib_dealloc_device(&dev->base);
-		pr_info("unregistered %s ib_device\n",
-			tbv_backend_name(backend));
-	}
+			if (target)
+				break;
+		}
+		mutex_unlock(&state->lock);
+		if (target) {
+			tbv_ibdev_rail_event(state, target, false);
+			tbv_rail_put(target);
+			any = true;
+		}
+	} while (any);
 
 	if (state->workqueue)
 		flush_workqueue(state->workqueue);

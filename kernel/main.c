@@ -117,20 +117,6 @@ module_param(register_verbs, bool, 0444);
 MODULE_PARM_DESC(register_verbs,
 		 "Register a guarded libibverbs device skeleton");
 
-/*
- * Per-lane (per-rail) IB device exposure. Default (0) keeps the legacy
- * behavior: one aggregate usb4_rdma%d device per backend, with rail
- * selection handled internally. When set to 1, the driver publishes one
- * ib_device per active Thunderbolt rail (named deterministically as
- * usb4_rdma<index> where index encodes (tb_domain << log2(MAX_LANES)) +
- * lane), giving applications direct visibility of every lane. Required to
- * let RCCL aggregate the four NHI lanes on a strix node.
- */
-static bool register_per_rail;
-module_param(register_per_rail, bool, 0444);
-MODULE_PARM_DESC(register_per_rail,
-		 "Register one ib_device per active Thunderbolt rail (default off)");
-
 static struct tbv_state tbv_driver_state;
 
 static int __init tbv_init(void)
@@ -187,7 +173,6 @@ static int __init tbv_init(void)
 	tbv_driver_state.native_fragment_striping = native_fragment_striping;
 	tbv_driver_state.native_data = native_data;
 	tbv_driver_state.apple_data = apple_data;
-	tbv_driver_state.register_per_rail = register_per_rail;
 
 	service_cfg.native_prtcstns = native_prtcstns;
 	service_cfg.apple_prtcstns = apple_prtcstns;
@@ -219,7 +204,7 @@ static int __init tbv_init(void)
 		snprintf(lanes_desc, sizeof(lanes_desc), "%u-%u",
 			 cfg.lanes_min, cfg.lanes_max);
 
-	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s tbnet_identity_minimal_e2e=%u tbnet_identity_minimal_apple_only=%u lanes=%s native_control=%s native_data=%u apple_data=%u native_wr_striping=%u native_fragment_striping=%u register_per_rail=%u\n",
+	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s tbnet_identity_minimal_e2e=%u tbnet_identity_minimal_apple_only=%u lanes=%s native_control=%s native_data=%u apple_data=%u native_wr_striping=%u native_fragment_striping=%u\n",
 		tbv_compat_name(cfg.compat),
 		tbv_profile_name(cfg.profile),
 		tbv_profile_name(resolved.profile),
@@ -232,8 +217,7 @@ static int __init tbv_init(void)
 		native_data,
 		apple_data,
 		native_wr_striping,
-		native_fragment_striping,
-		register_per_rail);
+		native_fragment_striping);
 
 	return 0;
 }

@@ -209,11 +209,9 @@ struct tbv_rail {
 	refcount_t refcnt;
 	struct completion refs_zero;
 	/*
-	 * Per-rail IB device when state->register_per_rail is set.  Lifecycle
-	 * is managed by tbv_ibdev_rail_event() (see ibdev.c); protected by
-	 * state->rail_register_lock.  NULL means no IB device is currently
-	 * published for this rail (either single-HCA mode, or this rail has
-	 * not yet reached the data-ready edge).
+	 * Per-rail IB device. Lifecycle managed by tbv_ibdev_rail_event()
+	 * (see ibdev.c) under state->rail_register_lock. NULL means this rail
+	 * has not yet reached the data-ready edge (or has been torn down).
 	 */
 	struct tbv_ibdev *ibdev;
 	u32 rail_id;
@@ -478,19 +476,15 @@ struct tbv_state {
 	atomic64_t native_legacy_ambiguous_limited;
 	struct xarray verbs_mrs_xa;
 	struct xarray verbs_qps_xa;
-	struct device *verbs_parent[2];
-	struct tbv_ibdev *ibdevs[2];
 	/*
-	 * Per-rail IB device registration support (commit grafted from the
-	 * historical module/ tree's ca70710 "usb4_rdma: expose per-lane rail
-	 * devices"). When register_per_rail is set the legacy aggregate
-	 * ib_devices in ibdevs[] are not registered; instead one ib_device is
-	 * published per rail as its data path comes up. The lock protects
-	 * registration/unregistration races between path-bringup paths (work
-	 * queues) and tbv_peer_remove_rail()/module-exit teardown.
+	 * Serializes per-rail ib_device registration against teardown.
+	 * tbv_ibdev_rail_event() publishes one ib_device per active rail as
+	 * its data path comes up; tbv_peer_remove_rail() and module-exit
+	 * tear them down. Kept separate from state->lock so the sleeping
+	 * ib_(un)register_device path doesn't invert against verbs ops that
+	 * take state->lock.
 	 */
 	struct mutex rail_register_lock;
-	bool register_per_rail;
 };
 
 struct dentry;
@@ -539,8 +533,8 @@ const char *tbv_ibdev_roce_netdev_name(void);
 /*
  * Notify the verbs layer that rail's data path has come up (joined=true) or
  * is about to be torn down (joined=false). No-op unless state->register_verbs
- * and state->register_per_rail are both set. Safe to call repeatedly; only
- * the rising/falling edge of "ibdev published" causes registration changes.
+ * is set. Safe to call repeatedly; only the rising/falling edge of
+ * "ibdev published" causes registration changes.
  */
 void tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
 			  bool joined);
@@ -676,10 +670,5 @@ int tbv_core_init(struct tbv_state *state,
 		  const struct tbv_resolved_config *cfg,
 		  const struct tbv_tbnet_identity_config *identity_cfg);
 void tbv_core_exit(struct tbv_state *state);
-void tbv_state_set_verbs_parent(struct tbv_state *state,
-				enum tbv_backend_type backend,
-				struct device *dev);
-struct device *tbv_state_get_verbs_parent(struct tbv_state *state,
-					  enum tbv_backend_type backend);
 
 #endif

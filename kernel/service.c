@@ -362,8 +362,6 @@ static int tbv_service_probe(struct tb_service *svc,
 		if (ret) {
 			goto err_remove_rail;
 		}
-		tbv_state_set_verbs_parent(tbv_service_state, backend,
-					   tb_ring_dma_device(rail->path.tx_ring));
 		pr_info("allocated rings service id=%d native_lane=%u tx_hop=%d rx_hop=%d out_hop=%d\n",
 			svc->id, backend == TBV_BACKEND_NATIVE ? native_lane : 0,
 			rail->path.tx_ring->hop,
