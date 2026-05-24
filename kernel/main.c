@@ -102,11 +102,6 @@ module_param(apple_data, bool, 0444);
 MODULE_PARM_DESC(apple_data,
 		 "Allow Apple-compatible peers to allocate rings and enable data paths");
 
-static bool native_wr_striping;
-module_param(native_wr_striping, bool, 0444);
-MODULE_PARM_DESC(native_wr_striping,
-		 "Stripe native Linux SEND work requests across active rails");
-
 static bool native_fragment_striping;
 module_param(native_fragment_striping, bool, 0444);
 MODULE_PARM_DESC(native_fragment_striping,
@@ -169,7 +164,6 @@ static int __init tbv_init(void)
 	ret = tbv_core_init(&tbv_driver_state, &resolved, &identity_cfg);
 	if (ret)
 		return ret;
-	tbv_driver_state.native_wr_striping = native_wr_striping;
 	tbv_driver_state.native_fragment_striping = native_fragment_striping;
 	tbv_driver_state.native_data = native_data;
 	tbv_driver_state.apple_data = apple_data;
@@ -204,7 +198,7 @@ static int __init tbv_init(void)
 		snprintf(lanes_desc, sizeof(lanes_desc), "%u-%u",
 			 cfg.lanes_min, cfg.lanes_max);
 
-	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s tbnet_identity_minimal_e2e=%u tbnet_identity_minimal_apple_only=%u lanes=%s native_control=%s native_data=%u apple_data=%u native_wr_striping=%u native_fragment_striping=%u\n",
+	pr_info("loaded compat=%s profile=%s resolved_profile=%s tbnet=%s tbnet_identity=%s tbnet_identity_minimal_e2e=%u tbnet_identity_minimal_apple_only=%u lanes=%s native_control=%s native_data=%u apple_data=%u native_fragment_striping=%u\n",
 		tbv_compat_name(cfg.compat),
 		tbv_profile_name(cfg.profile),
 		tbv_profile_name(resolved.profile),
@@ -216,7 +210,6 @@ static int __init tbv_init(void)
 		tbv_native_control_mode_name(&tbv_driver_state),
 		native_data,
 		apple_data,
-		native_wr_striping,
 		native_fragment_striping);
 
 	return 0;

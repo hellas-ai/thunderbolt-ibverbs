@@ -110,7 +110,6 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   state->apple_tunnels_pending);
 	seq_printf(s, "native_data: %u\n", state->native_data);
 	seq_printf(s, "apple_data: %u\n", state->apple_data);
-	seq_printf(s, "native_wr_striping: %u\n", state->native_wr_striping);
 	seq_printf(s, "native_fragment_striping: %u\n",
 		   state->native_fragment_striping);
 	seq_printf(s, "register_verbs: %u\n", state->register_verbs);

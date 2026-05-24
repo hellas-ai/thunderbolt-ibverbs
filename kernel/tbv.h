@@ -389,7 +389,6 @@ struct tbv_state {
 	bool enable_tunnels;
 	bool native_data;
 	bool apple_data;
-	bool native_wr_striping;
 	bool native_fragment_striping;
 	bool register_verbs;
 	bool services_registered;

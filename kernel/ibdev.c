@@ -3849,9 +3849,10 @@ static int tbv_send_control_frame_on_qp(struct tbv_qp *tqp, const void *frame,
 
 /*
  * Prefer to ack on the path the request arrived on (saves a selector roundtrip
- * and keeps ordering on the same wire). Fall back to the QP's pinned rail if
- * the incoming path is not safe to reuse (rare; usually means the rail is
- * being torn down).
+ * and keeps ordering on the same wire). If the inbound rail is no longer
+ * data-ready (e.g. mid-teardown), fall back to the QP's pinned rail — but only
+ * if we have a QP at all. Some callers (no-local-QP error responses) pass
+ * tqp=NULL; for those, dropping the ack is the only safe choice.
  */
 static int tbv_send_control_frame_on_path(struct tbv_qp *tqp,
 					  struct tbv_path *rx_path,
@@ -3860,6 +3861,9 @@ static int tbv_send_control_frame_on_path(struct tbv_qp *tqp,
 	if (rx_path && rx_path->rail && tbv_rail_data_ready(rx_path->rail))
 		return tbv_path_send(rx_path, frame, len,
 				     TBV_PATH_SEND_CONTROL, NULL, NULL);
+
+	if (!tqp)
+		return -ENOTCONN;
 
 	return tbv_send_control_frame_on_qp(tqp, frame, len);
 }
@@ -5948,10 +5952,12 @@ int tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
 
 	/*
 	 * Re-check removing under the registration lock. tbv_peer_remove_rail()
-	 * sets rail->removing then calls the down event under the same lock;
-	 * by gating publication on it here we guarantee that a concurrent
-	 * remove either runs its down event before us (and we'll skip
-	 * publishing) or after us (and finds rail->ibdev set, tears it down).
+	 * sets rail->removing (under state->lock) before invoking the down
+	 * event, which itself serializes on rail_register_lock. So either:
+	 *  - remove gets here first: its down event publishes nothing (ibdev
+	 *    was NULL) and removing is set, so our check below skips publish.
+	 *  - we get here first: we publish, remove's down event then tears
+	 *    rail->ibdev down under the same lock.
 	 *
 	 * The data-ready check is best-effort: we re-evaluate it under
 	 * state->lock for stable list/state reads, but the source-of-truth for
