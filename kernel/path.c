@@ -27,7 +27,7 @@
  * stream. Keep enough metadata headroom for qps=8/TX-depth=16/1 MiB WRITE and
  * qps=4/TX-depth=128/64 KiB without reporting a false SQ-full error.
  */
-#define TBV_DATA_QUEUE_MULTIPLIER 16
+#define TBV_DATA_QUEUE_MULTIPLIER 64
 #define TBV_DATA_PACKET_POOL_LIMIT 1024
 
 static uint nhi_interrupt_throttle_ns;
@@ -340,7 +340,11 @@ static void tbv_path_finish_raw_stream_if_needed(struct tbv_path *path,
 		return;
 
 	spin_lock_irqsave(&path->tx_lock, flags);
-	path->tx_raw_stream_active = false;
+	if (!path->tx_raw_stream_owner ||
+	    path->tx_raw_stream_owner == packet->owner_ctx) {
+		path->tx_raw_stream_active = false;
+		path->tx_raw_stream_owner = NULL;
+	}
 	spin_unlock_irqrestore(&path->tx_lock, flags);
 }
 
@@ -1289,6 +1293,7 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		struct tbv_data_frame *f;
 		bool needs_staging;
 		bool old_raw_stream_active;
+		void *old_raw_stream_owner;
 		bool charged_data_credit;
 		bool from_control_queue;
 		int ret;
@@ -1310,7 +1315,8 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 			}
 			packet = list_first_entry(&path->tx_data_queue,
 						  struct tbv_tx_packet, node);
-			if (!packet->zcopy || packet->raw_stream_start) {
+			if (!packet->zcopy || packet->raw_stream_start ||
+			    packet->owner_ctx != path->tx_raw_stream_owner) {
 				path->tx_scheduling = false;
 				spin_unlock_irqrestore(&path->tx_lock, flags);
 				return;
@@ -1361,8 +1367,11 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		list_del_init(&packet->node);
 		packet->queued = false;
 		old_raw_stream_active = path->tx_raw_stream_active;
-		if (packet->raw_stream_start)
+		old_raw_stream_owner = path->tx_raw_stream_owner;
+		if (packet->raw_stream_start) {
 			path->tx_raw_stream_active = true;
+			path->tx_raw_stream_owner = packet->owner_ctx;
+		}
 
 		if (needs_staging) {
 			f = list_first_entry(&path->tx_free,
@@ -1404,6 +1413,7 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 				packet->inflight = false;
 			}
 			path->tx_raw_stream_active = old_raw_stream_active;
+			path->tx_raw_stream_owner = old_raw_stream_owner;
 			if (charged_data_credit) {
 				if (path->tx_remote_data_credits <
 				    path->tx_remote_data_credit_max)
@@ -1462,6 +1472,7 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 			spin_lock_irqsave(&path->tx_lock, flags);
 			list_add_tail(&f->free_node, &path->tx_free);
 			path->tx_raw_stream_active = old_raw_stream_active;
+			path->tx_raw_stream_owner = old_raw_stream_owner;
 			if (charged_data_credit) {
 				if (path->tx_remote_data_credits <
 				    path->tx_remote_data_credit_max)
@@ -1909,6 +1920,7 @@ static void tbv_path_cancel_data_match(struct tbv_path *path,
 	u32 i;
 	u32 done_count = 0;
 	u32 done_max;
+	bool raw_stream_canceled = false;
 
 	if ((!done || !done_ctx) && !owner_ctx)
 		return;
@@ -1919,6 +1931,12 @@ static void tbv_path_cancel_data_match(struct tbv_path *path,
 		return;
 
 	spin_lock_irqsave(&path->tx_lock, flags);
+	if (owner_ctx && path->tx_raw_stream_active &&
+	    path->tx_raw_stream_owner == owner_ctx) {
+		path->tx_raw_stream_active = false;
+		path->tx_raw_stream_owner = NULL;
+		raw_stream_canceled = true;
+	}
 	list_for_each_entry_safe(packet, tmp, &path->tx_data_queue, node) {
 		if (!tbv_path_packet_matches(packet, done, done_ctx,
 					     owner_ctx))
@@ -1966,6 +1984,9 @@ static void tbv_path_cancel_data_match(struct tbv_path *path,
 		done_list[i].done(done_list[i].ctx, -ECANCELED);
 
 	kvfree(done_list);
+
+	if (raw_stream_canceled)
+		tbv_path_schedule_tx(path);
 }
 
 void tbv_path_cancel_data_done_ctx(struct tbv_path *path,

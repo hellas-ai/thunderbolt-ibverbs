@@ -193,6 +193,7 @@ struct tbv_path {
 	bool rx_raw_pending;
 	bool tx_scheduling;
 	bool tx_raw_stream_active;
+	void *tx_raw_stream_owner;
 	int local_transmit_path;
 	int local_tx_hop;
 	int local_rx_hop;
