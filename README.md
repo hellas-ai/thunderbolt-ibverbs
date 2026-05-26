@@ -154,6 +154,19 @@ On NixOS, add the flake input and import the module:
 }
 ```
 
+Downstream flakes can compose the package set through the default overlay:
+
+```nix
+{
+  nixpkgs.overlays = [
+    thunderbolt-ibverbs.overlays.default
+  ];
+}
+```
+
+The overlay provides `rdma-core-usb4`, `thunderbolt-ibverbs`,
+`thunderbolt-ibverbs-perftest`, and `thunderbolt-ibverbs-bench-tools` on Linux.
+
 ## Load And Use
 
 Connect the Thunderbolt/USB4 hosts first. On both Linux peers, load the module
