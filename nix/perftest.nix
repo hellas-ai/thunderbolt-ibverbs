@@ -56,7 +56,7 @@ if stdenv.hostPlatform.isDarwin then
     '';
 
     env.NIX_CFLAGS_COMPILE = "-I./apple-compat -I${appleRdmaSdk}/include";
-    env.NIX_LDFLAGS = "-Wl,-undefined,dynamic_lookup";
+    env.LDFLAGS = "-Wl,-undefined,dynamic_lookup";
 
     configureFlags = [
       "--disable-cuda"
