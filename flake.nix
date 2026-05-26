@@ -75,6 +75,7 @@
           pname = "rdma-core-usb4";
           patches = (old.patches or [ ]) ++ rdmaCoreUsb4Patches;
         });
+      mkAppleRdmaSdk = pkgs: pkgs.callPackage ./nix/apple-rdma-sdk.nix { };
       mkScriptSyntaxCheck =
         pkgs:
         pkgs.stdenv.mkDerivation {
@@ -193,16 +194,20 @@
         pkgs:
         let
           isLinux = pkgs.stdenv.hostPlatform.isLinux;
-          perftest = pkgs.callPackage ./nix/perftest.nix (
+          isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
+          appleRdmaSdk = mkAppleRdmaSdk pkgs;
+          packageArgs =
             lib.optionalAttrs isLinux { rdma-core-usb4 = mkRdmaCoreUsb4 pkgs; }
-          );
-          benchTools = pkgs.callPackage ./nix/bench-tools.nix (
-            lib.optionalAttrs isLinux { rdma-core-usb4 = mkRdmaCoreUsb4 pkgs; }
-          );
+            // lib.optionalAttrs isDarwin { inherit appleRdmaSdk; };
+          perftest = pkgs.callPackage ./nix/perftest.nix packageArgs;
+          benchTools = pkgs.callPackage ./nix/bench-tools.nix packageArgs;
         in
         {
           perftest = perftest;
           bench-tools = benchTools;
+        }
+        // lib.optionalAttrs isDarwin {
+          apple-rdma-sdk = appleRdmaSdk;
         }
         // lib.optionalAttrs isLinux (
           let
@@ -290,13 +295,20 @@
         final: prev:
         let
           isLinux = prev.stdenv.hostPlatform.isLinux;
-          rdmaCoreArgs = lib.optionalAttrs isLinux {
+          isDarwin = prev.stdenv.hostPlatform.isDarwin;
+          packageArgs = lib.optionalAttrs isLinux {
             rdma-core-usb4 = final.rdma-core-usb4;
+          } // lib.optionalAttrs isDarwin {
+            appleRdmaSdk = final.apple-rdma-sdk;
           };
         in
         {
-          thunderbolt-ibverbs-bench-tools = final.callPackage ./nix/bench-tools.nix rdmaCoreArgs;
-          thunderbolt-ibverbs-perftest = final.callPackage ./nix/perftest.nix rdmaCoreArgs;
+          thunderbolt-ibverbs-bench-tools = final.callPackage ./nix/bench-tools.nix packageArgs;
+          thunderbolt-ibverbs-perftest = final.callPackage ./nix/perftest.nix packageArgs;
+        }
+        // lib.optionalAttrs isDarwin {
+          apple-rdma-sdk = final.callPackage ./nix/apple-rdma-sdk.nix { };
+          thunderbolt-ibverbs-apple-rdma-sdk = final.apple-rdma-sdk;
         }
         // lib.optionalAttrs isLinux (
           let
