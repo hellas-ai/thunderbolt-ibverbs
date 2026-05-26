@@ -1,13 +1,21 @@
 name: release-artefacts
 
 on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
   workflow_dispatch:
     inputs:
       publish:
-        description: 'Attach artefacts to a GitHub Release. Run this workflow against a v* tag for this to take effect.'
+        description: 'When triggered manually against a v* tag, also create / update a GitHub Release.'
         required: false
         default: false
         type: boolean
+
+concurrency:
+  group: release-artefacts-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -57,7 +65,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.publish) }}
     needs: build
     runs-on: ubuntu-latest
     permissions:
