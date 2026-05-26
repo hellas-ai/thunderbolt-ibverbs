@@ -39,17 +39,25 @@ Pre-built DKMS source packages are attached to GitHub Releases:
 
   https://github.com/hellas-ai/thunderbolt-ibverbs/releases
 
-Pick the artefact for your distro and install with the local package manager:
+Each release ships two packages per distro: the DKMS source package for the
+kernel module, and a userspace libibverbs provider so `ibv_devices` and
+downstream RDMA tools (NCCL, perftest, vllm) enumerate the device.
 
 ```sh
 # Debian or Ubuntu (needs Linux 6.14+)
-sudo apt install ./thunderbolt-ibverbs-dkms_<ver>_all.deb
+sudo apt install \
+    ./thunderbolt-ibverbs-dkms_<ver>_all.deb \
+    ./usb4-rdma-provider_<ver>_amd64.deb
 
 # Fedora
-sudo dnf install ./thunderbolt-ibverbs-dkms-<ver>-1.noarch.rpm
+sudo dnf install \
+    ./thunderbolt-ibverbs-dkms-<ver>-1.noarch.rpm \
+    ./usb4-rdma-provider-<ver>-1.x86_64.rpm
 
 # Arch
-sudo pacman -U ./thunderbolt-ibverbs-dkms-<ver>-1-any.pkg.tar.zst
+sudo pacman -U \
+    ./thunderbolt-ibverbs-dkms-<ver>-1-any.pkg.tar.zst \
+    ./usb4-rdma-provider-<ver>-1-x86_64.pkg.tar.zst
 ```
 
 DKMS builds the kernel module against your running kernel on install and

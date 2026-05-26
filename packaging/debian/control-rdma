@@ -1,0 +1,13 @@
+Package: usb4-rdma-provider
+Version: @VERSION@
+Section: libs
+Priority: optional
+Architecture: amd64
+Depends: libibverbs1
+Maintainer: George Whewell <george@hellas.ai>
+Homepage: https://github.com/hellas-ai/thunderbolt-ibverbs
+Description: usb4_rdma libibverbs userspace provider
+ Drop-in libibverbs provider that lets libibverbs enumerate and use
+ thunderbolt_ibverbs kernel devices. Install alongside the matching
+ thunderbolt-ibverbs-dkms package for full ibv_devices visibility and
+ downstream RDMA tool support (NCCL, vllm, perftest).

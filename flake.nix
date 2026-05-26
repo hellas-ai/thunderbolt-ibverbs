@@ -87,6 +87,7 @@
               packaging/test-rdma-patches.sh \
               tools/ci/distro-build.sh \
               tools/ci/distro-install.sh \
+              tools/ci/distro-package-rdma.sh \
               tools/ci/distro-package.sh \
               tools/ci/vm-guest-smoke.sh \
               tools/ci/vm-smoke.sh

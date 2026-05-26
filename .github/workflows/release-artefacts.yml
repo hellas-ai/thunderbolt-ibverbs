@@ -27,17 +27,23 @@ jobs:
         include:
           - distro: debian
             image: debian:sid
-            artefact_glob: 'dist/thunderbolt-ibverbs-dkms_*.deb'
+            dkms_glob: 'dist/thunderbolt-ibverbs-dkms_*.deb'
+            rdma_glob: 'dist/usb4-rdma-provider_*.deb'
+            all_glob:  'dist/*.deb'
           - distro: fedora
             image: fedora:rawhide
-            artefact_glob: 'dist/thunderbolt-ibverbs-dkms-*.rpm'
+            dkms_glob: 'dist/thunderbolt-ibverbs-dkms-*.rpm'
+            rdma_glob: 'dist/usb4-rdma-provider-*.rpm'
+            all_glob:  'dist/*.rpm'
           - distro: arch
             image: archlinux:latest
-            artefact_glob: 'dist/thunderbolt-ibverbs-dkms-*.pkg.tar.zst'
+            dkms_glob: 'dist/thunderbolt-ibverbs-dkms-*.pkg.tar.zst'
+            rdma_glob: 'dist/usb4-rdma-provider-*.pkg.tar.zst'
+            all_glob:  'dist/*.pkg.tar.zst'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build artefact in ${{ matrix.image }}
+      - name: Build DKMS package in ${{ matrix.image }}
         run: |
           mkdir -p dist
           docker run --rm \
@@ -46,21 +52,37 @@ jobs:
             -e TBV_LINT=1 \
             ${{ matrix.image }} \
             bash tools/ci/distro-package.sh ${{ matrix.distro }}
-          ls -la dist/
 
-      - name: Install + DKMS build verification in ${{ matrix.image }}
+      - name: Build rdma-provider package in ${{ matrix.image }}
         run: |
           docker run --rm \
             -v "$PWD:/work" \
             -w /work \
             ${{ matrix.image }} \
-            bash tools/ci/distro-install.sh '${{ matrix.artefact_glob }}'
+            bash tools/ci/distro-package-rdma.sh ${{ matrix.distro }}
+          ls -la dist/
 
-      - name: Upload artefact
+      - name: Verify DKMS install in ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            ${{ matrix.image }} \
+            bash tools/ci/distro-install.sh '${{ matrix.dkms_glob }}'
+
+      - name: Verify rdma-provider install in ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            ${{ matrix.image }} \
+            bash tools/ci/distro-install.sh '${{ matrix.rdma_glob }}'
+
+      - name: Upload artefacts
         uses: actions/upload-artifact@v4
         with:
           name: thunderbolt-ibverbs-${{ matrix.distro }}
-          path: ${{ matrix.artefact_glob }}
+          path: ${{ matrix.all_glob }}
           if-no-files-found: error
 
   release:

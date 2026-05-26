@@ -1,0 +1,19 @@
+# Maintainer: George Whewell <george@hellas.ai>
+pkgname=usb4-rdma-provider
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="usb4_rdma libibverbs userspace provider"
+arch=('x86_64')
+url="https://github.com/hellas-ai/thunderbolt-ibverbs"
+license=('GPL-2.0-only')
+depends=('rdma-core')
+options=('!debug' '!strip')
+
+source=("@SONAME@" "usb4_rdma.driver")
+sha256sums=('SKIP' 'SKIP')
+
+package() {
+    install -Dm0644 "${srcdir}/@SONAME@" "${pkgdir}/usr/lib/libibverbs/@SONAME@"
+    install -Dm0644 "${srcdir}/usb4_rdma.driver" \
+        "${pkgdir}/etc/libibverbs.d/usb4_rdma.driver"
+}

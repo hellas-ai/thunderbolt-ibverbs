@@ -51,5 +51,5 @@ fi
 /usr/src/%{modname}-%{version}/*
 
 %changelog
-* Mon May 26 2026 George Whewell <george@hellas.ai> - 0.1.0-1
+* Tue May 26 2026 George Whewell <george@hellas.ai> - 0.1.0-1
 - Initial DKMS source package.
