@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: georgewhewell <georgerw@gmail.com>
+Date: Mon, 25 May 2026 04:32:28 +0200
+Subject: [PATCH] thunderbolt: nhi: clear pending MSI-X bit before unmasking
+ rings
+
+---
+ drivers/thunderbolt/nhi.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index 4fac166ed2ce..b1708d79d6b0 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -522,6 +522,8 @@ struct ring_frame *tb_ring_poll(struct tb_ring *ring)
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_poll);
+ 
++static void ring_clear_msix_pending(const struct tb_ring *ring);
++
+ static void __ring_interrupt_mask(struct tb_ring *ring, bool mask)
+ {
+ 	int idx = ring_interrupt_index(ring);
+@@ -530,11 +532,16 @@ static void __ring_interrupt_mask(struct tb_ring *ring, bool mask)
+ 	u32 val;
+ 
+ 	val = ioread32(ring->nhi->iobase + reg);
+-	if (mask)
++	if (mask) {
+ 		val &= ~BIT(bit);
+-	else
++	} else {
++		ring_clear_msix_pending(ring);
+ 		val |= BIT(bit);
++	}
+ 	iowrite32(val, ring->nhi->iobase + reg);
++	if (!mask)
++		/* Flush posted interrupt-enable writes before dropping locks. */
++		ioread32(ring->nhi->iobase + reg);
+ }
+ 
+ /* Both @nhi->lock and @ring->lock should be held */
+@@ -571,7 +578,7 @@ void tb_ring_poll_complete(struct tb_ring *ring)
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_poll_complete);
+ 
+-static void ring_clear_msix(const struct tb_ring *ring)
++static void ring_clear_msix_pending(const struct tb_ring *ring)
+ {
+ 	int bit;
+ 
+@@ -591,7 +598,7 @@ irqreturn_t ring_msix(int irq, void *data)
+ 	struct tb_ring *ring = data;
+ 
+ 	spin_lock(&ring->nhi->lock);
+-	ring_clear_msix(ring);
++	ring_clear_msix_pending(ring);
+ 	spin_lock(&ring->lock);
+ 	ring->debug_msix_interrupts++;
+ 	__ring_interrupt(ring);
+-- 
+2.53.0
+

@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: georgewhewell <georgerw@gmail.com>
+Date: Mon, 4 May 2026 00:00:00 +0200
+Subject: [PATCH] thunderbolt: xdomain: log unmatched protocol UUIDs
+
+When an XDomain control packet arrives whose header UUID does not match
+any registered protocol handler, the dispatcher currently drops it
+silently. That makes it impossible to discover what UUID a peer is
+using for a service whose advertised directory UUID we know but whose
+control-packet protocol UUID we do not.
+
+Log the unmatched header UUID, the cfg packet type, the size, the
+XDomain protocol type, and the first 32 bytes of payload (ratelimited).
+Informational only -- packet handling is unchanged.
+
+Used to discover Apple AD/FA57 control-packet UUIDs.
+
+Signed-off-by: georgewhewell <georgerw@gmail.com>
+---
+ drivers/thunderbolt/xdomain.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+index 781d88d06b93..322e243fa7d9 100644
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -2594,6 +2594,7 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 	const struct tb_protocol_handler *handler, *tmp;
+ 	const struct tb_xdp_header *hdr = buf;
+ 	unsigned int length;
++	bool matched = false;
+ 	int ret = 0;
+ 
+ 	/* We expect the packet is at least size of the header */
+@@ -2619,6 +2620,7 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 		if (!uuid_equal(&hdr->uuid, handler->uuid))
+ 			continue;
+ 
++		matched = true;
+ 		mutex_unlock(&xdomain_lock);
+ 		ret = handler->callback(buf, size, handler->data);
+ 		mutex_lock(&xdomain_lock);
+@@ -2628,6 +2630,18 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 	}
+ 	mutex_unlock(&xdomain_lock);
+ 
++	if (!matched) {
++		const u32 *w = buf;
++		size_t n = size / 4;
++
++		pr_info_ratelimited("tb xdomain: unmatched uuid=%pUb cfg_type=%d size=%zu xdp_type=0x%x w[0..7]=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++				    &hdr->uuid, type, size, hdr->type,
++				    n > 0 ? w[0] : 0, n > 1 ? w[1] : 0,
++				    n > 2 ? w[2] : 0, n > 3 ? w[3] : 0,
++				    n > 4 ? w[4] : 0, n > 5 ? w[5] : 0,
++				    n > 6 ? w[6] : 0, n > 7 ? w[7] : 0);
++	}
++
+ 	return ret > 0;
+ }
+ 
+-- 
+2.53.0
+

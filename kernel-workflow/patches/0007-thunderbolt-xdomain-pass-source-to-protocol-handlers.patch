@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: georgewhewell <georgerw@gmail.com>
+Date: Sat, 16 May 2026 00:00:00 +0200
+Subject: [PATCH] thunderbolt: xdomain: pass source XDomain to protocol
+ handlers
+
+Protocol handlers currently receive only the packet payload and their
+private data pointer. That is enough when a protocol has only one
+candidate XDomain per peer route, but it is ambiguous when two cables
+connect the same two hosts. In that topology both XDomains can report
+the same remote route value, and a source-blind handler can dispatch
+HELLO/READY traffic to the wrong local service state.
+
+Add an optional source-aware protocol callback that receives the
+tb_xdomain resolved from the packet route on the local domain. Existing
+handlers keep using the legacy callback and are not affected. New
+handlers can opt in by filling callback_xd instead of callback.
+
+Signed-off-by: georgewhewell <georgerw@gmail.com>
+---
+ drivers/thunderbolt/xdomain.c | 16 ++++++++++++++--
+ include/linux/thunderbolt.h   |  8 ++++++--
+ 2 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+index 322e243fa7d9..d1d11f256ee1 100644
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -613,7 +613,7 @@ static int tb_xdp_link_state_change_response(struct tb_ctl *ctl, u64 route,
+  */
+ int tb_register_protocol_handler(struct tb_protocol_handler *handler)
+ {
+-	if (!handler->uuid || !handler->callback)
++	if (!handler->uuid || (!handler->callback && !handler->callback_xd))
+ 		return -EINVAL;
+ 	if (uuid_equal(handler->uuid, &tb_xdp_uuid))
+ 		return -EINVAL;
+@@ -2593,8 +2593,10 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ {
+ 	const struct tb_protocol_handler *handler, *tmp;
+ 	const struct tb_xdp_header *hdr = buf;
++	struct tb_xdomain *source_xd = NULL;
+ 	unsigned int length;
+ 	bool matched = false;
++	u64 route;
+ 	int ret = 0;
+ 
+ 	/* We expect the packet is at least size of the header */
+@@ -2615,6 +2617,10 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 		return false;
+ 	}
+ 
++	route = ((u64)hdr->xd_hdr.route_hi << 32 | hdr->xd_hdr.route_lo) &
++		~BIT_ULL(63);
++	source_xd = tb_xdomain_find_by_route_locked(tb, route);
++
+ 	mutex_lock(&xdomain_lock);
+ 	list_for_each_entry_safe(handler, tmp, &protocol_handlers, list) {
+ 		if (!uuid_equal(&hdr->uuid, handler->uuid))
+@@ -2622,7 +2628,11 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 
+ 		matched = true;
+ 		mutex_unlock(&xdomain_lock);
+-		ret = handler->callback(buf, size, handler->data);
++		if (handler->callback_xd)
++			ret = handler->callback_xd(source_xd, buf, size,
++						   handler->data);
++		else if (handler->callback)
++			ret = handler->callback(buf, size, handler->data);
+ 		mutex_lock(&xdomain_lock);
+ 
+ 		if (ret)
+@@ -2642,6 +2652,8 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 				    n > 6 ? w[6] : 0, n > 7 ? w[7] : 0);
+ 	}
+ 
++	tb_xdomain_put(source_xd);
++
+ 	return ret > 0;
+ }
+ 
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index e074919d4d07..f98f2c337918 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -369,6 +369,7 @@ int tb_xdomain_request(struct tb_xdomain *xd, const void *request,
+  *	      here tells the XDomain core that the message was handled
+  *	      by this handler and should not be forwared to other
+  *	      handlers.
++ * @callback_xd: Like @callback, but also receives the source XDomain.
+  * @data: Data passed with the callback
+  * @list: Handlers are linked using this
+  *
+@@ -377,12 +378,15 @@ int tb_xdomain_request(struct tb_xdomain *xd, const void *request,
+  * discovery protocol UUID cannot be registered since it is handled by
+  * the core XDomain code.
+  *
+- * The @callback must check that the message is really directed to the
+- * service the driver implements.
++ * The @callback or @callback_xd must check that the message is really
++ * directed to the service the driver implements.
+  */
++#define TB_PROTOCOL_HANDLER_HAS_XDOMAIN 1
+ struct tb_protocol_handler {
+ 	const uuid_t *uuid;
+ 	int (*callback)(const void *buf, size_t size, void *data);
++	int (*callback_xd)(struct tb_xdomain *xd, const void *buf, size_t size,
++			   void *data);
+ 	void *data;
+ 	struct list_head list;
+ };
+-- 
+2.53.0
+

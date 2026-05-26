@@ -17,8 +17,10 @@ https://blog.hellas.ai/blog/thunderbolt-ibverbs/
 - Native Linux-to-Linux verbs transport is the main path.
 - Apple-compatible transport exists, but is still experimental.
 - The module builds against stock kernels.
-- The patch in `patches/linux/` is optional. It only enables the
-  `nhi_interrupt_throttle_ns` tuning parameter.
+- `nhi_interrupt_throttle_ns` is active only on kernels that export
+  `tb_ring_throttling()`.
+- The Nix flake builds a Thunderbolt testing kernel from the maintainer
+  `next` branch with the local kernel patches applied.
 - Debian, Fedora, Arch, and Nix builds are exercised in CI.
 
 ## License
@@ -177,44 +179,31 @@ nhi_interrupt_throttle_ns=<ns>
 
 Run `make -C kernel help` for the full parameter list.
 
-## Optional Kernel Patch
+## Nix Thunderbolt Kernel
 
-The module loads without any kernel patch. Without the patch, it uses the
-stock Thunderbolt NHI interrupt behavior and ignores non-zero
-`nhi_interrupt_throttle_ns` values.
-
-To enable that tuning knob, apply:
-
-```text
-patches/linux/0001-thunderbolt-nhi-add-per-ring-interrupt-throttling-helper.patch
-```
-
-For a local kernel tree:
+The module loads on stock kernels. For the maintainer-tree USB4 work, the flake
+also exposes `linux-thunderbolt`: nixpkgs' `linuxPackages_testing.kernel` with
+only the source, version, and kernel patch list overridden. It uses the nixpkgs
+testing kernel configuration, not a machine-local config.
 
 ```sh
-cd linux
-git am /path/to/thunderbolt-ibverbs/patches/linux/0001-thunderbolt-nhi-add-per-ring-interrupt-throttling-helper.patch
-make olddefconfig
-make -j"$(nproc)"
+nix build .#linux-thunderbolt
+nix build .#thunderbolt-ibverbs-linux-thunderbolt
 ```
 
-For NixOS, the flake exposes the patch as
-`inputs.thunderbolt-ibverbs.lib.kernelPatches`:
+On NixOS, use that kernel package set and enable the module:
 
 ```nix
 { pkgs, inputs, ... }:
 let
-  linuxPackagesTbv = pkgs.linuxPackages_latest.extend (_self: super: {
-    kernel = super.kernel.override {
-      kernelPatches =
-        (super.kernel.kernelPatches or [])
-        ++ inputs.thunderbolt-ibverbs.lib.kernelPatches;
-    };
-  });
+  system = pkgs.stdenv.hostPlatform.system;
+  tbv = inputs.thunderbolt-ibverbs.packages.${system};
 in {
-  boot.kernelPackages = linuxPackagesTbv;
+  boot.kernelPackages = pkgs.linuxPackagesFor tbv.linux-thunderbolt;
   hardware.thunderbolt-ibverbs.enable = true;
 }
 ```
 
-Reboot into the patched kernel, then rebuild or reload the module.
+Hydra evaluates the same path through
+`hydraJobs.x86_64-linux.linux-thunderbolt` and
+`hydraJobs.x86_64-linux.thunderbolt-ibverbs-linux-thunderbolt`.

@@ -169,9 +169,15 @@ static void tbv_path_tx_packet_release(struct tbv_tx_packet *packet, int status)
 	struct tbv_path *path = packet->path;
 	unsigned long flags;
 
-	if (packet->zcopy && packet->unmap_dma)
-		dma_unmap_page(tb_ring_dma_device(path->tx_ring), packet->dma,
-			       packet->len, DMA_TO_DEVICE);
+	if (packet->zcopy && packet->unmap_dma) {
+		struct device *dma_dev = tb_ring_dma_device(path->tx_ring);
+
+		if (tbv_dma_device_ready(dma_dev))
+			dma_unmap_page(dma_dev, packet->dma, packet->len,
+				       DMA_TO_DEVICE);
+		else
+			pr_warn_ratelimited("TX ring DMA device is not ready for zcopy unmapping\n");
+	}
 
 	if (packet->done)
 		packet->done(packet->done_ctx, status);
@@ -718,6 +724,13 @@ static int tbv_path_alloc_frames(struct tbv_path *path, bool tx)
 	struct device *dma_dev = tb_ring_dma_device(ring);
 	struct tbv_data_frame *frames;
 	int i;
+	int ret = -ENOMEM;
+
+	if (!tbv_dma_device_ready(dma_dev)) {
+		pr_warn_ratelimited("%s ring DMA device is not ready for mapping\n",
+				    tx ? "TX" : "RX");
+		return -EPROBE_DEFER;
+	}
 
 	frames = kcalloc(count, sizeof(*frames), GFP_KERNEL);
 	if (!frames)
@@ -738,6 +751,7 @@ static int tbv_path_alloc_frames(struct tbv_path *path, bool tx)
 		if (dma_mapping_error(dma_dev, f->dma)) {
 			kfree(f->buf);
 			f->buf = NULL;
+			ret = -EIO;
 			goto err;
 		}
 		f->frame.buffer_phy = f->dma;
@@ -761,7 +775,7 @@ err:
 		}
 	}
 	kfree(frames);
-	return -ENOMEM;
+	return ret;
 }
 
 static void tbv_path_free_frames(struct tbv_path *path, bool tx)
@@ -776,13 +790,19 @@ static void tbv_path_free_frames(struct tbv_path *path, bool tx)
 		return;
 
 	dma_dev = tb_ring_dma_device(ring);
+	if (!tbv_dma_device_ready(dma_dev)) {
+		pr_warn_ratelimited("%s ring DMA device is not ready for unmapping\n",
+				    tx ? "TX" : "RX");
+		dma_dev = NULL;
+	}
 	for (i = 0; i < count; i++) {
 		struct tbv_data_frame *f = &frames[i];
 
 		if (!f->buf)
 			continue;
-		dma_unmap_single(dma_dev, f->dma, TBV_DATA_FRAME_SIZE,
-				 tx ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+		if (dma_dev)
+			dma_unmap_single(dma_dev, f->dma, TBV_DATA_FRAME_SIZE,
+					 tx ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
 		kfree(f->buf);
 	}
 
@@ -978,15 +998,20 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 	}
 	path->local_rx_hop = path->rx_ring->hop;
 
-	if (tbv_path_configure_ring_throttling(path))
+	ret = tbv_path_configure_ring_throttling(path);
+	if (ret)
 		goto err_rx_ring;
-	if (tbv_path_alloc_frames(path, true))
+	ret = tbv_path_alloc_frames(path, true);
+	if (ret)
 		goto err_rx_ring;
-	if (tbv_path_alloc_frames(path, false))
+	ret = tbv_path_alloc_frames(path, false);
+	if (ret)
 		goto err_tx_frames;
-	if (tbv_path_alloc_control_packets(path))
+	ret = tbv_path_alloc_control_packets(path);
+	if (ret)
 		goto err_rx_frames;
-	if (tbv_path_alloc_data_packets(path))
+	ret = tbv_path_alloc_data_packets(path);
+	if (ret)
 		goto err_control_packets;
 
 	path->state = TBV_PATH_RING_ALLOCATED;
@@ -1901,6 +1926,10 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 		max_raw_payload = TBV_NATIVE_DATA_MAX_PAYLOAD;
 
 	dma_dev = tb_ring_dma_device(path->tx_ring);
+	if (!tbv_dma_device_ready(dma_dev)) {
+		ret = -EPROBE_DEFER;
+		goto err_meta_done;
+	}
 
 	hdr_buf = kzalloc(TBV_NATIVE_DATA_HDR_SIZE, GFP_KERNEL);
 	if (!hdr_buf) {

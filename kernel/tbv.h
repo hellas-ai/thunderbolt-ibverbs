@@ -5,6 +5,7 @@
 #include <linux/atomic.h>
 #include <linux/bitops.h>
 #include <linux/completion.h>
+#include <linux/device.h>
 #include <linux/idr.h>
 #include <linux/if.h>
 #include <linux/list.h>
@@ -34,6 +35,21 @@
 #define TBV_APPLE_QPN_SHIFT 8
 #define TBV_APPLE_FRAME_SIZE SZ_4K
 #define TBV_APPLE_MAX_MSG_SIZE SZ_16M
+
+static inline bool tbv_dma_device_ready(const struct device *dev)
+{
+	if (!dev)
+		return false;
+
+	/*
+	 * A Thunderbolt core reprobe can briefly expose ring DMA devices whose
+	 * IOMMU group is attached before dev->iommu is populated. Calling
+	 * dma_map_* in that window reaches iommu_get_dma_domain() and oopses.
+	 * Treat it as probe deferral; direct-DMA systems have no iommu_group and
+	 * still pass this check.
+	 */
+	return !dev->iommu_group || dev->iommu;
+}
 
 #define TBV_TBNET_ID_STATE_CARRIER		BIT(0)
 #define TBV_TBNET_ID_STATE_NEIGHBOR_READY	BIT(1)

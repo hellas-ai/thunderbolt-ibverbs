@@ -250,6 +250,12 @@ tbv_tbnet_minimal_alloc_frame_array(struct tbv_tbnet_minimal_session *session,
 	struct tbv_tbnet_minimal_frame *frames;
 	u32 i;
 
+	if (!tbv_dma_device_ready(dma_dev)) {
+		pr_warn_ratelimited("minimal TBnet %s ring DMA device is not ready for mapping\n",
+				    tx ? "TX" : "RX");
+		return -EPROBE_DEFER;
+	}
+
 	frames = kcalloc(TBV_TBNET_MIN_RING_SIZE, sizeof(*frames), GFP_KERNEL);
 	if (!frames)
 		return -ENOMEM;
@@ -314,13 +320,19 @@ tbv_tbnet_minimal_free_frame_array(struct tbv_tbnet_minimal_frame *frames,
 		return;
 
 	dma_dev = tb_ring_dma_device(ring);
+	if (!tbv_dma_device_ready(dma_dev)) {
+		pr_warn_ratelimited("minimal TBnet %s ring DMA device is not ready for unmapping\n",
+				    tx ? "TX" : "RX");
+		dma_dev = NULL;
+	}
 	for (i = 0; i < TBV_TBNET_MIN_RING_SIZE; i++) {
 		struct tbv_tbnet_minimal_frame *f = &frames[i];
 
 		if (!f->page)
 			continue;
-		dma_unmap_page(dma_dev, f->dma, TBV_TBNET_MIN_FRAME_SIZE,
-			       tx ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+		if (dma_dev)
+			dma_unmap_page(dma_dev, f->dma, TBV_TBNET_MIN_FRAME_SIZE,
+				       tx ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
 		__free_page(f->page);
 	}
 	kfree(frames);

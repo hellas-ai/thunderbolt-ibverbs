@@ -1,23 +1,75 @@
 {
   description = "Thunderbolt/USB4 host-to-host RDMA verbs kernel module";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    linux-src = {
+      # Thunderbolt maintainer tree carrying the USB4STREAM/XDomain base series.
+      url = "git+https://git.kernel.org/pub/scm/linux/kernel/git/westeri/thunderbolt.git?ref=refs/heads/next&shallow=1";
+      flake = false;
+    };
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, linux-src }:
     let
       lib = nixpkgs.lib;
-      optionalKernelPatches = [
-        {
-          name = "thunderbolt-nhi-ring-throttling-helper";
-          patch = ./patches/linux/0001-thunderbolt-nhi-add-per-ring-interrupt-throttling-helper.patch;
-        }
-      ];
+      thunderboltKernelPatches = import ./kernel-workflow/patches;
       systems = [
         "x86_64-linux"
       ];
       forAllSystems = f:
         lib.genAttrs systems (system:
           f (import nixpkgs { inherit system; }));
+      linuxSrcMakefile = builtins.readFile "${linux-src}/Makefile";
+      linuxSrcMakeVars =
+        let
+          lines = lib.splitString "\n" linuxSrcMakefile;
+          readVar = name:
+            let
+              matches = lib.filter (match: match != null)
+                (map (line: builtins.match "${name}[[:space:]]*=[[:space:]]*(.*)" line) lines);
+            in
+            if matches == [ ] then
+              throw "could not read ${name} from Linux Makefile"
+            else
+              lib.head (lib.head matches);
+        in
+        {
+          version = readVar "VERSION";
+          patchlevel = readVar "PATCHLEVEL";
+          sublevel = readVar "SUBLEVEL";
+          extraversion = readVar "EXTRAVERSION";
+        };
+      linuxSrcVersion =
+        "${linuxSrcMakeVars.version}.${linuxSrcMakeVars.patchlevel}.${linuxSrcMakeVars.sublevel}${linuxSrcMakeVars.extraversion}";
+      mkThunderboltKernel = pkgs:
+        let
+          testingKernel = pkgs.linuxPackages_testing.kernel;
+          kernelPatches =
+            (testingKernel.passthru.kernelPatches or [ ])
+            ++ thunderboltKernelPatches;
+        in
+        testingKernel.override {
+          argsOverride = {
+            pname = "linux-thunderbolt";
+            version = linuxSrcVersion;
+            modDirVersion = linuxSrcVersion;
+            src = linux-src;
+            inherit kernelPatches;
+          };
+        };
+      mkThunderboltLinuxPackages = pkgs:
+        pkgs.linuxPackagesFor (mkThunderboltKernel pkgs);
+      rdmaCoreUsb4Patches = [
+        ./packaging/rdma-core-patches/0001-providers-usb4_rdma-add-USB4-soft-RDMA-provider.patch
+        ./packaging/rdma-core-patches/0002-CMakeLists.txt-build-the-usb4_rdma-provider.patch
+        ./packaging/rdma-core-patches/0003-libibverbs-verbs.h-declare-verbs_provider_usb4_rdma.patch
+      ];
+      mkRdmaCoreUsb4 = pkgs:
+        pkgs.rdma-core.overrideAttrs (old: {
+          pname = "rdma-core-usb4";
+          patches = (old.patches or [ ]) ++ rdmaCoreUsb4Patches;
+        });
       mkScriptSyntaxCheck = pkgs:
         pkgs.stdenv.mkDerivation {
           pname = "thunderbolt-ibverbs-script-syntax";
@@ -31,6 +83,8 @@
           buildPhase = ''
             runHook preBuild
             bash -n \
+              packaging/regen-rdma-core-patches.sh \
+              packaging/test-rdma-patches.sh \
               tools/ci/distro-build.sh \
               tools/ci/vm-guest-smoke.sh \
               tools/ci/vm-smoke.sh
@@ -99,6 +153,7 @@
       mkNixosVmSmoke = pkgs:
         let
           module = pkgs.linuxPackages.callPackage ./nix/module.nix { };
+          rdmaCoreUsb4 = mkRdmaCoreUsb4 pkgs;
         in
         pkgs.testers.runNixOSTest {
           name = "thunderbolt-ibverbs-vm-smoke";
@@ -107,7 +162,7 @@
             boot.extraModulePackages = [ module ];
             environment.systemPackages = [
               pkgs.kmod
-              pkgs.rdma-core
+              rdmaCoreUsb4
             ];
           };
 
@@ -129,7 +184,7 @@
           src = ./.;
 
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.rdma-core ];
+          buildInputs = [ (mkRdmaCoreUsb4 pkgs) ];
 
           dontConfigure = true;
 
@@ -153,10 +208,19 @@
       packages = forAllSystems (pkgs:
         let
           module = pkgs.linuxPackages.callPackage ./nix/module.nix { };
+          thunderboltKernel = mkThunderboltKernel pkgs;
+          thunderboltLinuxPackages = mkThunderboltLinuxPackages pkgs;
+          moduleForThunderboltKernel =
+            thunderboltLinuxPackages.callPackage ./nix/module.nix { };
         in
         {
           default = module;
+          linux-thunderbolt = thunderboltKernel;
+          linux-thunderbolt-dev = thunderboltKernel.dev;
+          linux-thunderbolt-modules = thunderboltKernel.modules;
+          rdma-core-usb4 = mkRdmaCoreUsb4 pkgs;
           thunderbolt-ibverbs = module;
+          thunderbolt-ibverbs-linux-thunderbolt = moduleForThunderboltKernel;
         });
 
       checks = forAllSystems (pkgs: {
@@ -164,12 +228,24 @@
           self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs;
         script-syntax = mkScriptSyntaxCheck pkgs;
         proto-smoke = mkProtoSmoke pkgs;
+        rdma-core-usb4 =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.rdma-core-usb4;
         verbs-smoke-build = mkVerbsSmokeBuild pkgs;
       });
 
       hydraJobs = forAllSystems (pkgs: {
         thunderbolt-ibverbs =
           self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs;
+        linux-thunderbolt =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.linux-thunderbolt;
+        linux-thunderbolt-dev =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.linux-thunderbolt-dev;
+        linux-thunderbolt-modules =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.linux-thunderbolt-modules;
+        rdma-core-usb4 =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.rdma-core-usb4;
+        thunderbolt-ibverbs-linux-thunderbolt =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs-linux-thunderbolt;
         checks = self.checks.${pkgs.stdenv.hostPlatform.system};
         vm-smoke.nixos = mkNixosVmSmoke pkgs;
         distro = {
@@ -189,30 +265,17 @@
       });
 
       overlays.default = final: prev: {
+        rdma-core-usb4 = mkRdmaCoreUsb4 final;
         thunderbolt-ibverbs =
           final.linuxPackages.callPackage ./nix/module.nix { };
       };
 
-      lib.kernelPatches = optionalKernelPatches;
+      lib.kernelPatches = thunderboltKernelPatches;
 
       legacyPackages = forAllSystems (_pkgs: {
-        kernelPatches = optionalKernelPatches;
+        kernelPatches = thunderboltKernelPatches;
       });
 
-      nixosModules.default = { config, lib, ... }:
-        let
-          cfg = config.hardware.thunderbolt-ibverbs;
-          module =
-            config.boot.kernelPackages.callPackage ./nix/module.nix { };
-        in
-        {
-          options.hardware.thunderbolt-ibverbs.enable =
-            lib.mkEnableOption "the thunderbolt_ibverbs kernel module";
-
-          config = lib.mkIf cfg.enable {
-            boot.extraModulePackages = [ module ];
-            boot.kernelModules = [ "thunderbolt_ibverbs" ];
-          };
-        };
+      nixosModules.default = import ./module.nix { inherit self; };
     };
 }

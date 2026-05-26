@@ -1,0 +1,437 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: georgewhewell <georgerw@gmail.com>
+Date: Mon, 25 May 2026 04:31:55 +0200
+Subject: [PATCH] thunderbolt: nhi: add ring debugfs instrumentation
+
+---
+ drivers/thunderbolt/nhi.c   | 206 +++++++++++++++++++++++++++++++++++-
+ drivers/thunderbolt/nhi.h   |   2 +
+ drivers/thunderbolt/pci.c   |   6 +-
+ include/linux/thunderbolt.h |  25 +++++
+ 4 files changed, 236 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index 0f795ea58756..4fac166ed2ce 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -10,6 +10,8 @@
+  */
+ 
+ #include <linux/pm_runtime.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
+ #include <linux/slab.h>
+ #include <linux/errno.h>
+ #include <linux/dma-mapping.h>
+@@ -40,6 +42,8 @@ static bool host_reset = true;
+ module_param(host_reset, bool, 0444);
+ MODULE_PARM_DESC(host_reset, "reset USB4 host router (default: true)");
+ 
++static struct dentry *nhi_debugfs_root;
++
+ static int ring_interrupt_index(const struct tb_ring *ring)
+ {
+ 	int bit = ring->hop;
+@@ -184,6 +188,135 @@ static void __iomem *ring_options_base(struct tb_ring *ring)
+ 	return io;
+ }
+ 
++static unsigned int ring_distance(unsigned int from, unsigned int to,
++				  unsigned int size)
++{
++	if (!size)
++		return 0;
++	if (to >= from)
++		return to - from;
++	return size - from + to;
++}
++
++struct nhi_ring_snapshot {
++	bool is_tx;
++	bool running;
++	unsigned int hop;
++	unsigned int size;
++	unsigned int sw_head;
++	unsigned int sw_tail;
++	int irq;
++	u8 vector;
++	unsigned int flags;
++	u32 index;
++	u32 desc_cfg;
++	u32 options0;
++	u32 options4;
++	u32 tail_desc_len;
++	u32 tail_desc_flags;
++	u32 tail_desc_sof;
++	u32 tail_desc_eof;
++	u64 posted;
++	u64 prod_writes;
++	u64 cons_writes;
++	u64 poll_calls;
++	u64 poll_completed;
++	u64 poll_empty;
++	u64 poll_busy;
++	u64 work_calls;
++	u64 work_completed;
++	u64 msix_interrupts;
++	u64 legacy_interrupts;
++};
++
++static bool nhi_ring_snapshot(struct tb_nhi *nhi, bool is_tx, unsigned int hop,
++			      struct nhi_ring_snapshot *snap)
++{
++	struct tb_ring *ring;
++	unsigned long flags;
++	bool present = false;
++
++	memset(snap, 0, sizeof(*snap));
++
++	spin_lock_irqsave(&nhi->lock, flags);
++	ring = is_tx ? nhi->tx_rings[hop] : nhi->rx_rings[hop];
++	if (!ring)
++		goto unlock_nhi;
++
++	spin_lock(&ring->lock);
++	snap->is_tx = is_tx;
++	snap->running = ring->running;
++	snap->hop = ring->hop;
++	snap->size = ring->size;
++	snap->sw_head = ring->head;
++	snap->sw_tail = ring->tail;
++	snap->irq = ring->irq;
++	snap->vector = ring->vector;
++	snap->flags = ring->flags;
++	if (!nhi->going_away) {
++		snap->index = ioread32(ring_desc_base(ring) + 8);
++		snap->desc_cfg = ioread32(ring_desc_base(ring) + 12);
++		snap->options0 = ioread32(ring_options_base(ring));
++		snap->options4 = ioread32(ring_options_base(ring) + 4);
++	}
++	if (ring->descriptors && ring->size) {
++		struct ring_desc *desc;
++
++		desc = &ring->descriptors[ring->tail];
++		snap->tail_desc_len = desc->length;
++		snap->tail_desc_flags = desc->flags;
++		snap->tail_desc_sof = desc->sof;
++		snap->tail_desc_eof = desc->eof;
++	}
++	snap->posted = ring->debug_posted;
++	snap->prod_writes = ring->debug_prod_writes;
++	snap->cons_writes = ring->debug_cons_writes;
++	snap->poll_calls = ring->debug_poll_calls;
++	snap->poll_completed = ring->debug_poll_completed;
++	snap->poll_empty = ring->debug_poll_empty;
++	snap->poll_busy = ring->debug_poll_busy;
++	snap->work_calls = ring->debug_work_calls;
++	snap->work_completed = ring->debug_work_completed;
++	snap->msix_interrupts = ring->debug_msix_interrupts;
++	snap->legacy_interrupts = ring->debug_legacy_interrupts;
++	present = true;
++	spin_unlock(&ring->lock);
++
++unlock_nhi:
++	spin_unlock_irqrestore(&nhi->lock, flags);
++	return present;
++}
++
++static void nhi_ring_print_snapshot(struct seq_file *s,
++				    const struct nhi_ring_snapshot *snap)
++{
++	const char *lo_name = snap->is_tx ? "hw_tail" : "host_head";
++	const char *hi_name = snap->is_tx ? "host_head" : "hw_tail";
++	unsigned int reg_lo = snap->index & 0xffff;
++	unsigned int reg_hi = snap->index >> 16;
++	unsigned int sw_queued;
++	unsigned int reg_queued;
++
++	sw_queued = ring_distance(snap->sw_tail, snap->sw_head, snap->size);
++	reg_queued = ring_distance(reg_lo, reg_hi, snap->size);
++
++	seq_printf(s,
++		   "%s%-2u run=%u size=%u irq=%d vec=%u flags=0x%x sw_head=%u sw_tail=%u sw_queued=%u reg=0x%08x %s=%u %s=%u reg_distance=%u desc_cfg=0x%08x opt0=0x%08x opt4=0x%08x tail_desc=len:%u flags:0x%x sof:%u eof:%u\n",
++		   snap->is_tx ? "tx" : "rx", snap->hop, snap->running,
++		   snap->size, snap->irq, snap->vector, snap->flags,
++		   snap->sw_head, snap->sw_tail, sw_queued, snap->index,
++		   lo_name, reg_lo, hi_name, reg_hi, reg_queued,
++		   snap->desc_cfg, snap->options0, snap->options4,
++		   snap->tail_desc_len, snap->tail_desc_flags,
++		   snap->tail_desc_sof, snap->tail_desc_eof);
++	seq_printf(s,
++		   "    posted=%llu prod_writes=%llu cons_writes=%llu poll_calls=%llu poll_completed=%llu poll_empty=%llu poll_busy=%llu work_calls=%llu work_completed=%llu msix=%llu legacy_irq=%llu\n",
++		   snap->posted, snap->prod_writes, snap->cons_writes,
++		   snap->poll_calls, snap->poll_completed, snap->poll_empty,
++		   snap->poll_busy, snap->work_calls, snap->work_completed,
++		   snap->msix_interrupts, snap->legacy_interrupts);
++}
++
+ static void ring_iowrite_cons(struct tb_ring *ring, u16 cons)
+ {
+ 	/*
+@@ -192,12 +325,14 @@ static void ring_iowrite_cons(struct tb_ring *ring, u16 cons)
+ 	 * filling the read-only bits with zeroes.
+ 	 */
+ 	iowrite32(cons, ring_desc_base(ring) + 8);
++	ring->debug_cons_writes++;
+ }
+ 
+ static void ring_iowrite_prod(struct tb_ring *ring, u16 prod)
+ {
+ 	/* See ring_iowrite_cons() above for explanation */
+ 	iowrite32(prod << 16, ring_desc_base(ring) + 8);
++	ring->debug_prod_writes++;
+ }
+ 
+ static void ring_iowrite32desc(struct tb_ring *ring, u32 value, u32 offset)
+@@ -249,6 +384,7 @@ static void ring_write_descriptors(struct tb_ring *ring)
+ 			descriptor->sof = frame->sof;
+ 		}
+ 		ring->head = (ring->head + 1) % ring->size;
++		ring->debug_posted++;
+ 		if (ring->is_tx)
+ 			ring_iowrite_prod(ring, ring->head);
+ 		else
+@@ -274,6 +410,7 @@ static void ring_work(struct work_struct *work)
+ 	LIST_HEAD(done);
+ 
+ 	spin_lock_irqsave(&ring->lock, flags);
++	ring->debug_work_calls++;
+ 
+ 	if (!ring->running) {
+ 		/*  Move all frames to done and mark them as canceled. */
+@@ -297,6 +434,7 @@ static void ring_work(struct work_struct *work)
+ 			frame->flags = ring->descriptors[ring->tail].flags;
+ 		}
+ 		ring->tail = (ring->tail + 1) % ring->size;
++		ring->debug_work_completed++;
+ 	}
+ 	ring_write_descriptors(ring);
+ 
+@@ -351,10 +489,11 @@ struct ring_frame *tb_ring_poll(struct tb_ring *ring)
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&ring->lock, flags);
++	ring->debug_poll_calls++;
+ 	if (!ring->running)
+-		goto unlock;
++		goto empty;
+ 	if (ring_empty(ring))
+-		goto unlock;
++		goto empty;
+ 
+ 	if (ring->descriptors[ring->tail].flags & RING_DESC_COMPLETED) {
+ 		frame = list_first_entry(&ring->in_flight, typeof(*frame),
+@@ -369,8 +508,14 @@ struct ring_frame *tb_ring_poll(struct tb_ring *ring)
+ 		}
+ 
+ 		ring->tail = (ring->tail + 1) % ring->size;
++		ring->debug_poll_completed++;
++	} else {
++		ring->debug_poll_busy++;
+ 	}
+ 
++	goto unlock;
++empty:
++	ring->debug_poll_empty++;
+ unlock:
+ 	spin_unlock_irqrestore(&ring->lock, flags);
+ 	return frame;
+@@ -448,6 +593,7 @@ irqreturn_t ring_msix(int irq, void *data)
+ 	spin_lock(&ring->nhi->lock);
+ 	ring_clear_msix(ring);
+ 	spin_lock(&ring->lock);
++	ring->debug_msix_interrupts++;
+ 	__ring_interrupt(ring);
+ 	spin_unlock(&ring->lock);
+ 	spin_unlock(&ring->nhi->lock);
+@@ -837,6 +983,59 @@ void tb_ring_free(struct tb_ring *ring)
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_free);
+ 
++static int nhi_rings_show(struct seq_file *s, void *unused)
++{
++	struct tb_nhi *nhi = s->private;
++	unsigned int hop;
++
++	seq_printf(s, "nhi=%s hop_count=%u going_away=%u\n",
++		   dev_name(nhi->dev), nhi->hop_count, nhi->going_away);
++	seq_puts(s,
++		 "# TX reg: low16=controller tail, high16=host producer\n");
++	seq_puts(s,
++		 "# RX reg: low16=host consumer, high16=controller tail\n");
++
++	for (hop = 0; hop < nhi->hop_count; hop++) {
++		struct nhi_ring_snapshot snap;
++
++		if (nhi_ring_snapshot(nhi, true, hop, &snap))
++			nhi_ring_print_snapshot(s, &snap);
++		if (nhi_ring_snapshot(nhi, false, hop, &snap))
++			nhi_ring_print_snapshot(s, &snap);
++	}
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(nhi_rings);
++
++void nhi_debugfs_init(void)
++{
++	nhi_debugfs_root = debugfs_create_dir("thunderbolt_nhi", NULL);
++}
++
++void nhi_debugfs_exit(void)
++{
++	debugfs_remove_recursive(nhi_debugfs_root);
++	nhi_debugfs_root = NULL;
++}
++
++static void nhi_debugfs_add(struct tb_nhi *nhi)
++{
++	if (IS_ERR_OR_NULL(nhi_debugfs_root))
++		return;
++
++	nhi->debugfs_dir = debugfs_create_dir(dev_name(nhi->dev),
++					      nhi_debugfs_root);
++	debugfs_create_file("rings", 0400, nhi->debugfs_dir, nhi,
++			    &nhi_rings_fops);
++}
++
++static void nhi_debugfs_remove(struct tb_nhi *nhi)
++{
++	debugfs_remove_recursive(nhi->debugfs_dir);
++	nhi->debugfs_dir = NULL;
++}
++
+ /**
+  * tb_ring_throttling() - Configure throttling for ring interrupt
+  * @ring: Ring to configure
+@@ -959,6 +1158,7 @@ void nhi_interrupt_work(struct work_struct *work)
+ 		}
+ 
+ 		spin_lock(&ring->lock);
++		ring->debug_legacy_interrupts++;
+ 		__ring_interrupt(ring);
+ 		spin_unlock(&ring->lock);
+ 	}
+@@ -1114,6 +1314,7 @@ void nhi_shutdown(struct tb_nhi *nhi)
+ 	int i;
+ 
+ 	dev_dbg(nhi->dev, "shutdown\n");
++	nhi_debugfs_remove(nhi);
+ 
+ 	for (i = 0; i < nhi->hop_count; i++) {
+ 		if (nhi->tx_rings[i])
+@@ -1247,6 +1448,7 @@ int nhi_probe(struct tb_nhi *nhi)
+ 		return dev_err_probe(dev, res, "failed to add domain\n");
+ 	}
+ 	dev_set_drvdata(dev, tb);
++	nhi_debugfs_add(nhi);
+ 
+ 	device_wakeup_enable(dev);
+ 
+diff --git a/drivers/thunderbolt/nhi.h b/drivers/thunderbolt/nhi.h
+index d488eadadfce..bf429cb64876 100644
+--- a/drivers/thunderbolt/nhi.h
++++ b/drivers/thunderbolt/nhi.h
+@@ -34,6 +34,8 @@ void nhi_disable_interrupts(struct tb_nhi *nhi);
+ void nhi_interrupt_work(struct work_struct *work);
+ irqreturn_t nhi_msi(int irq, void *data);
+ irqreturn_t ring_msix(int irq, void *data);
++void nhi_debugfs_init(void);
++void nhi_debugfs_exit(void);
+ int nhi_probe(struct tb_nhi *nhi);
+ void nhi_shutdown(struct tb_nhi *nhi);
+ extern const struct dev_pm_ops nhi_pm_ops;
+diff --git a/drivers/thunderbolt/pci.c b/drivers/thunderbolt/pci.c
+index bbd186c29ef7..eb90b8aaf6c2 100644
+--- a/drivers/thunderbolt/pci.c
++++ b/drivers/thunderbolt/pci.c
+@@ -604,10 +604,13 @@ static int __init nhi_init(void)
+ 	ret = tb_domain_init();
+ 	if (ret)
+ 		return ret;
++	nhi_debugfs_init();
+ 
+ 	ret = pci_register_driver(&nhi_driver);
+-	if (ret)
++	if (ret) {
++		nhi_debugfs_exit();
+ 		tb_domain_exit();
++	}
+ 
+ 	return ret;
+ }
+@@ -615,6 +618,7 @@ static int __init nhi_init(void)
+ static void __exit nhi_unload(void)
+ {
+ 	pci_unregister_driver(&nhi_driver);
++	nhi_debugfs_exit();
+ 	tb_domain_exit();
+ }
+ 
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index b5659f883517..e074919d4d07 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -16,6 +16,7 @@
+ struct config_group;
+ struct fwnode_handle;
+ struct device;
++struct dentry;
+ 
+ #if IS_REACHABLE(CONFIG_USB4)
+ 
+@@ -503,6 +504,7 @@ void tb_service_properties_changed(struct tb_service *svc);
+  * @iobase: MMIO space of the NHI
+  * @tx_rings: All Tx rings available on this host controller
+  * @rx_rings: All Rx rings available on this host controller
++ * @debugfs_dir: Debugfs directory for local NHI ring instrumentation
+  * @going_away: The host controller device is about to disappear so when
+  *		this flag is set, avoid touching the hardware anymore.
+  * @iommu_dma_protection: An IOMMU will isolate external-facing ports.
+@@ -519,6 +521,7 @@ struct tb_nhi {
+ 	void __iomem *iobase;
+ 	struct tb_ring **tx_rings;
+ 	struct tb_ring **rx_rings;
++	struct dentry *debugfs_dir;
+ 	bool going_away;
+ 	bool iommu_dma_protection;
+ 	struct work_struct interrupt_work;
+@@ -556,6 +559,17 @@ struct tb_nhi {
+  * @interval_nsec: Interval counter if interrupt throttling is to be
+  *		   used with this ring (in ns)
+  * @wait: Used to signal that the ring may be empty now
++ * @debug_posted: Number of descriptors posted through the stock ring path
++ * @debug_prod_writes: Number of TX producer index MMIO writes
++ * @debug_cons_writes: Number of RX consumer index MMIO writes
++ * @debug_poll_calls: Number of tb_ring_poll() calls
++ * @debug_poll_completed: Number of completed descriptors returned by polling
++ * @debug_poll_empty: Number of poll calls with no posted descriptor available
++ * @debug_poll_busy: Number of poll calls where the next descriptor was not done
++ * @debug_work_calls: Number of stock interrupt workqueue calls
++ * @debug_work_completed: Number of descriptors completed by stock workqueue path
++ * @debug_msix_interrupts: Number of per-ring MSI-X interrupts
++ * @debug_legacy_interrupts: Number of legacy NHI interrupt dispatches
+  */
+ struct tb_ring {
+ 	spinlock_t lock;
+@@ -581,6 +595,17 @@ struct tb_ring {
+ 	void *poll_data;
+ 	unsigned int interval_nsec;
+ 	wait_queue_head_t wait;
++	u64 debug_posted;
++	u64 debug_prod_writes;
++	u64 debug_cons_writes;
++	u64 debug_poll_calls;
++	u64 debug_poll_completed;
++	u64 debug_poll_empty;
++	u64 debug_poll_busy;
++	u64 debug_work_calls;
++	u64 debug_work_completed;
++	u64 debug_msix_interrupts;
++	u64 debug_legacy_interrupts;
+ };
+ 
+ /* Leave ring interrupt enabled on suspend */
+-- 
+2.53.0
+

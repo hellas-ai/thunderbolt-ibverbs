@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: usb4-rdma local <usb4-rdma-local@example.invalid>
+Date: Sat, 2 May 2026 23:20:00 +0200
+Subject: [PATCH] thunderbolt: tunnel: add debug DMA priority and weight params
+
+Add local debug-only module parameters for the priority and weight fields
+programmed into USB4/TB DMA tunnel hop registers.
+
+The upstream driver hardcodes DMA paths to priority 5 and weight 1. This
+patch keeps those defaults but lets local testing sweep the raw hop register
+fields in order to check whether router path arbitration affects xdomain DMA
+throughput on Strix Halo.
+
+Do not upstream as-is.
+---
+ drivers/thunderbolt/tunnel.c | 27 +++++++++++++++++++++++----
+ 1 file changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/thunderbolt/tunnel.c b/drivers/thunderbolt/tunnel.c
+index b7f32305f14a..ae5addce42fd 100644
+--- a/drivers/thunderbolt/tunnel.c
++++ b/drivers/thunderbolt/tunnel.c
+@@ -61,6 +61,9 @@
+ #define TB_DMA_PRIORITY			5
+ #define TB_DMA_WEIGHT			1
+ 
++#define TB_DMA_PRIORITY_MAX		7
++#define TB_DMA_WEIGHT_MAX		15
++
+ /*
+  * Reserve additional bandwidth for USB 3.x and PCIe bulk traffic
+  * according to USB4 v2 Connection Manager guide. This ends up reserving
+@@ -93,6 +96,18 @@ module_param(dma_credits, uint, 0444);
+ MODULE_PARM_DESC(dma_credits, "specify custom credits for DMA tunnels (default: "
+                 __MODULE_STRING(TB_DMA_CREDITS) ")");
+ 
++static unsigned int dma_priority = TB_DMA_PRIORITY;
++module_param(dma_priority, uint, 0444);
++MODULE_PARM_DESC(dma_priority,
++		 "debug: priority field for DMA tunnel hop registers, clamped to 0..7 "
++		 "(default: " __MODULE_STRING(TB_DMA_PRIORITY) ")");
++
++static unsigned int dma_weight = TB_DMA_WEIGHT;
++module_param(dma_weight, uint, 0444);
++MODULE_PARM_DESC(dma_weight,
++		 "debug: weight field for DMA tunnel hop registers, clamped to 0..15 "
++		 "(default: " __MODULE_STRING(TB_DMA_WEIGHT) ")");
++
+ static bool bw_alloc_mode = true;
+ module_param(bw_alloc_mode, bool, 0444);
+ MODULE_PARM_DESC(bw_alloc_mode,
+@@ -1796,6 +1811,12 @@ static int tb_dma_reserve_credits(struct tb_path_hop *hop, unsigned int credits)
+ 	return 0;
+ }
+ 
++static void tb_dma_init_path_arbitration(struct tb_path *path)
++{
++	path->priority = min_t(unsigned int, dma_priority, TB_DMA_PRIORITY_MAX);
++	path->weight = min_t(unsigned int, dma_weight, TB_DMA_WEIGHT_MAX);
++}
++
+ /* Path from lane adapter to NHI */
+ static int tb_dma_init_rx_path(struct tb_path *path, unsigned int credits)
+ {
+@@ -1806,8 +1827,7 @@ static int tb_dma_init_rx_path(struct tb_path *path, unsigned int credits)
+ 	path->ingress_fc_enable = TB_PATH_ALL;
+ 	path->egress_shared_buffer = TB_PATH_NONE;
+ 	path->ingress_shared_buffer = TB_PATH_NONE;
+-	path->priority = TB_DMA_PRIORITY;
+-	path->weight = TB_DMA_WEIGHT;
++	tb_dma_init_path_arbitration(path);
+ 	path->clear_fc = true;
+ 
+ 	/*
+@@ -1840,8 +1860,7 @@ static int tb_dma_init_tx_path(struct tb_path *path, unsigned int credits)
+ 	path->ingress_fc_enable = TB_PATH_ALL;
+ 	path->egress_shared_buffer = TB_PATH_NONE;
+ 	path->ingress_shared_buffer = TB_PATH_NONE;
+-	path->priority = TB_DMA_PRIORITY;
+-	path->weight = TB_DMA_WEIGHT;
++	tb_dma_init_path_arbitration(path);
+ 	path->clear_fc = true;
+ 
+ 	tb_path_for_each_hop(path, hop) {
+-- 
+2.53.0
+
