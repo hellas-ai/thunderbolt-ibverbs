@@ -192,7 +192,6 @@
           benchTools = pkgs.callPackage ./nix/bench-tools.nix {
             rdma-core-usb4 = rdmaCoreUsb4;
           };
-          tbTools = pkgs.callPackage ./nix/tb-tools.nix { };
         in
         {
           default = module;
@@ -202,7 +201,6 @@
           rdma-core-usb4 = rdmaCoreUsb4;
           perftest = perftest;
           bench-tools = benchTools;
-          tb-tools = tbTools;
           thunderbolt-ibverbs = module;
           thunderbolt-ibverbs-linux-thunderbolt = moduleForThunderboltKernel;
         });
@@ -232,8 +230,6 @@
           self.packages.${pkgs.stdenv.hostPlatform.system}.perftest;
         bench-tools =
           self.packages.${pkgs.stdenv.hostPlatform.system}.bench-tools;
-        tb-tools =
-          self.packages.${pkgs.stdenv.hostPlatform.system}.tb-tools;
         thunderbolt-ibverbs-linux-thunderbolt =
           self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs-linux-thunderbolt;
         checks = self.checks.${pkgs.stdenv.hostPlatform.system};
@@ -253,7 +249,6 @@
               pkgsAt.rdma-core-usb4
               pkgsAt.perftest
               pkgsAt.bench-tools
-              pkgsAt.tb-tools
             ];
           };
         });

@@ -19,8 +19,6 @@ let
   scripts = [
     "tbv_perftest_runner.py"
     "tbv_rdma_sweep.py"
-    "vllm-stream-client.py"
-    "vllm-transport-matrix.sh"
   ];
 in
 stdenv.mkDerivation {
