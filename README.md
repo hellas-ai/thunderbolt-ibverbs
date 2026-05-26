@@ -27,8 +27,7 @@ The kernel module is licensed under GPL-2.0-only, matching the SPDX tags in the
 kernel sources and `MODULE_LICENSE("GPL")`.
 
 Small userspace-facing test and protocol helper files that say
-`GPL-2.0 OR BSD-3-Clause` may be used under either license. Full license texts
-are in `LICENSE` and `LICENSES/preferred/`.
+`GPL-2.0 OR BSD-3-Clause` may be used under either license.
 
 ## Requirements
 
