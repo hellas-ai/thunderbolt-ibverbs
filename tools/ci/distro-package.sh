@@ -72,7 +72,6 @@ stage_source() {
 		Makefile \
 		dkms.conf \
 		LICENSE \
-		LICENSES \
 		README.md \
 		kernel \
 		proto \
