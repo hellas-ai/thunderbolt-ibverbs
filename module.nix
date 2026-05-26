@@ -495,6 +495,21 @@ in {
       description = "Load ib_uverbs and thunderbolt_ibverbs at boot through boot.kernelModules.";
     };
 
+    userspaceTools = {
+      enable = lib.mkOption {
+        type = types.bool;
+        default = true;
+        description = "Install rdma-core command-line tools such as rdma, ibv_devices, and ibv_devinfo.";
+      };
+
+      package = lib.mkOption {
+        type = types.package;
+        default = pkgs.rdma-core;
+        defaultText = lib.literalExpression "pkgs.rdma-core";
+        description = "rdma-core package used for userspace verbs tools.";
+      };
+    };
+
     blacklistThunderboltNet = lib.mkOption {
       type = types.nullOr types.bool;
       default = null;
@@ -653,7 +668,7 @@ in {
     environment.systemPackages = [
       reloadHelper
       checkHelper
-    ];
+    ] ++ lib.optional cfg.userspaceTools.enable cfg.userspaceTools.package;
 
     systemd.services.thunderbolt-ibverbs-check = lib.mkIf cfg.check.enable {
       description = "Validate thunderbolt_ibverbs runtime state";
