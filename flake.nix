@@ -185,13 +185,22 @@
           thunderboltLinuxPackages = mkThunderboltLinuxPackages pkgs;
           moduleForThunderboltKernel =
             thunderboltLinuxPackages.callPackage ./nix/module.nix { };
+          rdmaCoreUsb4 = mkRdmaCoreUsb4 pkgs;
+          perftest = pkgs.callPackage ./nix/perftest.nix {
+            rdma-core-usb4 = rdmaCoreUsb4;
+          };
+          benchTools = pkgs.callPackage ./nix/bench-tools.nix {
+            rdma-core-usb4 = rdmaCoreUsb4;
+          };
         in
         {
           default = module;
           linux-thunderbolt = thunderboltKernel;
           linux-thunderbolt-dev = thunderboltKernel.dev;
           linux-thunderbolt-modules = thunderboltKernel.modules;
-          rdma-core-usb4 = mkRdmaCoreUsb4 pkgs;
+          rdma-core-usb4 = rdmaCoreUsb4;
+          perftest = perftest;
+          bench-tools = benchTools;
           thunderbolt-ibverbs = module;
           thunderbolt-ibverbs-linux-thunderbolt = moduleForThunderboltKernel;
         });
@@ -217,11 +226,32 @@
           self.packages.${pkgs.stdenv.hostPlatform.system}.linux-thunderbolt-modules;
         rdma-core-usb4 =
           self.packages.${pkgs.stdenv.hostPlatform.system}.rdma-core-usb4;
+        perftest =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.perftest;
+        bench-tools =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.bench-tools;
         thunderbolt-ibverbs-linux-thunderbolt =
           self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs-linux-thunderbolt;
         checks = self.checks.${pkgs.stdenv.hostPlatform.system};
         vm-smoke.nixos = mkNixosVmSmoke pkgs;
       });
+
+      devShells = forAllSystems (pkgs:
+        let
+          pkgsAt = self.packages.${pkgs.stdenv.hostPlatform.system};
+        in
+        {
+          default = pkgs.mkShell {
+            name = "thunderbolt-ibverbs-dev";
+            packages = [
+              pkgs.kmod
+              pkgs.python3
+              pkgsAt.rdma-core-usb4
+              pkgsAt.perftest
+              pkgsAt.bench-tools
+            ];
+          };
+        });
 
       overlays.default = final: prev: {
         rdma-core-usb4 = mkRdmaCoreUsb4 final;
