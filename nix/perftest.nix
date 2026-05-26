@@ -6,6 +6,7 @@
 , rdma-core-usb4 ? null
 , pciutils ? null
 , appleCompat ? ./apple-compat
+, appleRdmaSdk ? null
 }:
 
 let
@@ -17,12 +18,15 @@ let
   };
 in
 if stdenv.hostPlatform.isDarwin then
+  assert lib.assertMsg (appleRdmaSdk != null)
+    "perftest Darwin build requires appleRdmaSdk";
   # Build perftest on Apple Macs using nixpkgs' Darwin stdenv (no Xcode
-  # hardcoded paths, no __noChroot). Headers come from the apple-compat shim
-  # that provides Linux-style <infiniband/verbs.h>, <rdma/rdma_cma.h>, etc.;
-  # the linker is told to defer libibverbs symbol resolution to dyld via
-  # -undefined dynamic_lookup. Apple's RDMA stack provides those symbols at
-  # runtime on Macs with USB4-RDMA-capable hardware.
+  # hardcoded paths in this derivation). Core libibverbs headers come from the
+  # copied Xcode 26.5 Apple RDMA SDK; apple-compat only supplies Linux-style
+  # compatibility headers around that SDK surface. The linker is told to defer
+  # libibverbs symbol resolution to dyld via -undefined dynamic_lookup.
+  # Apple's RDMA stack provides those symbols at runtime on Macs with
+  # USB4-RDMA-capable hardware.
   stdenv.mkDerivation {
     pname = "perftest-apple-rdma";
     version = "26.01.5";
@@ -51,7 +55,7 @@ if stdenv.hostPlatform.isDarwin then
         --replace-fail 'src/host_memory.c src/mmap_memory.c' 'src/host_memory.c src/mmap_memory.c src/apple_raw_ethernet_stubs.c'
     '';
 
-    env.NIX_CFLAGS_COMPILE = "-I./apple-compat";
+    env.NIX_CFLAGS_COMPILE = "-I./apple-compat -I${appleRdmaSdk}/include";
     env.NIX_LDFLAGS = "-Wl,-undefined,dynamic_lookup";
 
     configureFlags = [

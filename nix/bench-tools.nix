@@ -5,6 +5,7 @@
 , python3
 , source ? ../userspace/bench
 , appleCompat ? ./apple-compat
+, appleRdmaSdk ? null
 }:
 
 let
@@ -33,6 +34,8 @@ let
 
   cPrograms = if isDarwin then darwinPrograms else linuxPrograms;
 in
+assert lib.assertMsg (!isDarwin || appleRdmaSdk != null)
+  "bench-tools Darwin build requires appleRdmaSdk";
 stdenv.mkDerivation {
   pname =
     if isDarwin
@@ -62,6 +65,7 @@ stdenv.mkDerivation {
       for name in ${lib.concatStringsSep " " cPrograms}; do
         $CC -O2 -Wall -Wextra -std=gnu11 \
           -I${appleCompat} \
+          -I${appleRdmaSdk}/include \
           "$name.c" \
           -Wl,-undefined,dynamic_lookup \
           -o "$name"
