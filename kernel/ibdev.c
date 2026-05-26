@@ -5,6 +5,7 @@
 #include <linux/atomic.h>
 #include <linux/completion.h>
 #include <linux/crc32.h>
+#include <linux/crc32c.h>
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/highmem.h>
