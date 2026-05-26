@@ -649,6 +649,8 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 				   u32 native_lane);
 void tbv_peer_remove_rail(struct tbv_rail *rail);
 void tbv_rail_put(struct tbv_rail *rail);
+bool tbv_path_apple_tx_raw_mode(void);
+bool tbv_path_apple_rx_raw_mode(void);
 void tbv_path_default_config(enum tbv_backend_type backend,
 			     struct tbv_path_config *cfg);
 void tbv_path_init(struct tbv_path *path,

@@ -4,6 +4,7 @@
 
 #include <linux/atomic.h>
 #include <linux/completion.h>
+#include <linux/crc32.h>
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/highmem.h>
@@ -56,6 +57,10 @@
 #define TBV_APPLE_PENDING_RX_DEFAULT_SLOTS 4096
 #define TBV_APPLE_PENDING_RX_MAX_SLOTS 16384
 #define TBV_APPLE_PENDING_RX_TOTAL_BYTES_DEFAULT (64u * 1024u * 1024u)
+#define TBV_APPLE_RAW_SLOT_USER_SIZE 256
+#define TBV_APPLE_RAW_SPLIT_USER_SIZE 16
+#define TBV_APPLE_RAW_TAIL_USER_SIZE 240
+#define TBV_APPLE_RAW_DESCS_PER_CHUNK 17
 #define TBV_QP_TIMEOUT_DEFAULT_MS 5000
 #define TBV_QP_TIMEOUT_WORK_INTERVAL_MS 1000
 #define TBV_READ_RESP_RETRY_MS 100
@@ -393,6 +398,8 @@ struct tbv_send_page_stream {
 struct tbv_apple_send_fill {
 	const void *payload;
 	u32 payload_len;
+	u32 crc;
+	bool append_crc;
 };
 
 static DEFINE_IDA(tbv_qpn_ida);
@@ -1230,6 +1237,7 @@ static int tbv_query_port(struct ib_device *ibdev, u32 port_num,
 	attr->active_mtu = IB_MTU_4096;
 	attr->max_msg_sz = apple ? TBV_APPLE_MAX_MSG_SIZE :
 				   TBV_NATIVE_DATA_MAX_MSG_SIZE;
+	attr->lid = apple ? 1 : 0;
 	attr->gid_tbl_len = TBV_IBDEV_GID_TBL_LEN;
 	attr->pkey_tbl_len = 1;
 	attr->max_vl_num = 1;
@@ -2446,15 +2454,55 @@ static void tbv_apple_send_tx_done(void *ctx, int status)
 static int tbv_apple_send_fill(void *ctx, void *dst, u32 len)
 {
 	struct tbv_apple_send_fill *fill = ctx;
+	u32 valid_len = fill->payload_len;
+	__le32 crc_le;
 
-	if (fill->payload_len > len)
+	if (fill->append_crc) {
+		if (valid_len > U32_MAX - sizeof(crc_le))
+			return -EINVAL;
+		valid_len += sizeof(crc_le);
+	}
+	if (valid_len > len)
 		return -EINVAL;
 
 	memcpy(dst, fill->payload, fill->payload_len);
-	if (fill->payload_len < len)
-		memset((u8 *)dst + fill->payload_len, 0,
-		       len - fill->payload_len);
+	if (fill->append_crc) {
+		crc_le = cpu_to_le32(fill->crc);
+		memcpy((u8 *)dst + fill->payload_len, &crc_le,
+		       sizeof(crc_le));
+	}
+	if (valid_len < len)
+		memset((u8 *)dst + valid_len, 0, len - valid_len);
 	return 0;
+}
+
+static int tbv_post_apple_send_piece(struct tbv_qp *tqp,
+				     struct tbv_path *path,
+				     struct tbv_send_ctx *ctx,
+				     const void *payload, u32 payload_len,
+				     u32 wire_len, u8 sof, u8 eof,
+				     bool append_crc, u32 crc,
+				     tbv_path_tx_done_fn done, void *done_ctx)
+{
+	struct tbv_apple_send_fill fill = {
+		.payload = payload,
+		.payload_len = payload_len,
+		.crc = crc,
+		.append_crc = append_crc,
+	};
+	int ret;
+
+	tbv_send_ctx_get(ctx);
+	atomic64_inc(&tqp->owner->data_wr_path_send);
+	ret = tbv_path_send_marked_fill(path, wire_len, sof, eof,
+					TBV_PATH_SEND_DEFER,
+					tbv_apple_send_fill, &fill,
+					done, done_ctx);
+	if (ret) {
+		tbv_send_ctx_put(ctx);
+		atomic64_inc(&tqp->owner->data_wr_path_send_error);
+	}
+	return ret;
 }
 
 static int tbv_post_apple_send_frame(struct tbv_qp *tqp,
@@ -2465,23 +2513,9 @@ static int tbv_post_apple_send_frame(struct tbv_qp *tqp,
 				     tbv_path_tx_done_fn done,
 				     void *done_ctx)
 {
-	struct tbv_apple_send_fill fill = {
-		.payload = payload,
-		.payload_len = payload_len,
-	};
-	int ret;
-
-	tbv_send_ctx_get(ctx);
-	atomic64_inc(&tqp->owner->data_wr_path_send);
-	ret = tbv_path_send_marked_fill(path, payload_len, sof, eof,
-					TBV_PATH_SEND_DEFER,
-					tbv_apple_send_fill, &fill,
-					done, done_ctx);
-	if (ret) {
-		tbv_send_ctx_put(ctx);
-		atomic64_inc(&tqp->owner->data_wr_path_send_error);
-	}
-	return ret;
+	return tbv_post_apple_send_piece(tqp, path, ctx, payload,
+					 payload_len, payload_len, sof, eof,
+					 false, 0, done, done_ctx);
 }
 
 static int tbv_post_apple_send(struct tbv_qp *tqp, const struct ib_send_wr *wr)
@@ -3664,19 +3698,33 @@ static int tbv_apple_rx_copy_piece_to_buf(struct tbv_qp *tqp,
 	return 0;
 }
 
+static int tbv_apple_rx_wire_user_len(u32 len, u8 eof, u32 *user_len)
+{
+	if (tbv_path_apple_rx_raw_mode() && (eof == 2 || eof == 3)) {
+		if (len < sizeof(__le32))
+			return -EINVAL;
+		*user_len = len - sizeof(__le32);
+	} else {
+		*user_len = len;
+	}
+	return 0;
+}
+
 static int tbv_apple_rx_copy_frame(struct tbv_state *state,
 				   const struct tbv_recv_wqe *wqe,
 				   u32 dst_off, const void *payload, u32 len,
-				   u32 *delivered, u32 *out_user_len)
+				   u8 eof, u32 *delivered,
+				   u32 *out_user_len)
 {
 	int ret;
+	u32 copy_len;
 	u32 user_len = 0;
 
-	/* Apple RX rings run in NHI FRAME mode. The controller has already
-	 * assembled the raw 256-byte slot stream and stripped silicon-owned
-	 * trailer bytes, so the callback length is user payload length.
-	 */
-	ret = tbv_apple_rx_copy_piece(state, wqe, dst_off, payload, len,
+	ret = tbv_apple_rx_wire_user_len(len, eof, &copy_len);
+	if (ret)
+		return ret;
+
+	ret = tbv_apple_rx_copy_piece(state, wqe, dst_off, payload, copy_len,
 				      delivered, &user_len);
 	if (ret)
 		return ret;
@@ -3686,13 +3734,19 @@ static int tbv_apple_rx_copy_frame(struct tbv_state *state,
 
 static int tbv_apple_rx_copy_frame_to_buf(struct tbv_qp *tqp,
 					  struct tbv_apple_pending_rx *p,
-					  const void *payload, u32 len,
+					  const void *payload, u32 len, u8 eof,
 					  u32 *out_user_len)
 {
 	int ret;
+	u32 copy_len;
 	u32 user_len = 0;
 
-	ret = tbv_apple_rx_copy_piece_to_buf(tqp, p, payload, len, &user_len);
+	ret = tbv_apple_rx_wire_user_len(len, eof, &copy_len);
+	if (ret)
+		return ret;
+
+	ret = tbv_apple_rx_copy_piece_to_buf(tqp, p, payload, copy_len,
+					     &user_len);
 	if (ret)
 		return ret;
 	*out_user_len = user_len;
@@ -3706,6 +3760,7 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 	struct tbv_rx_message *msg;
 	struct tbv_qp *tqp;
 	bool terminal;
+	bool raw_rx;
 	u32 qpn;
 	u32 user_len = 0;
 	int ret;
@@ -3716,6 +3771,7 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 		atomic64_inc(&state->data_rx_bad_frame);
 		return;
 	}
+	raw_rx = tbv_path_apple_rx_raw_mode();
 
 	qpn = tbv_apple_qpn_from_path(path);
 	if (sof)
@@ -3748,7 +3804,7 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 
 		if (tqp->apple_pending_active >= 0) {
 			pending = tbv_apple_pending_active_locked(state, tqp);
-		} else if (!sof) {
+		} else if (!sof && !raw_rx) {
 			atomic64_inc(&state->apple_rx_no_sof_when_idle);
 		}
 
@@ -3773,6 +3829,7 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 		if (pending) {
 			ret = tbv_apple_rx_copy_frame_to_buf(tqp, pending,
 							     payload, len,
+							     eof,
 							     &user_len);
 			if (ret) {
 				atomic64_inc(&state->data_rx_bad_frame);
@@ -3794,7 +3851,7 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 	}
 
 	ret = tbv_apple_rx_copy_frame(state, &msg->wqe, msg->received,
-				      payload, len, &msg->delivered,
+				      payload, len, eof, &msg->delivered,
 				      &user_len);
 	if (ret) {
 		atomic64_inc(&state->data_rx_bad_frame);
@@ -4183,7 +4240,9 @@ static bool tbv_qp_apple_sq_stopping(struct tbv_qp *tqp)
 	return stopping;
 }
 
-static int tbv_apple_sq_get_tx_resources(struct tbv_qp *tqp, u32 frames,
+static int tbv_apple_sq_get_tx_resources(struct tbv_qp *tqp,
+					 u32 window_frames,
+					 u32 reserve_frames,
 					 struct tbv_path **path_out,
 					 bool *wr_acquired,
 					 u32 *frames_acquired)
@@ -4207,14 +4266,15 @@ static int tbv_apple_sq_get_tx_resources(struct tbv_qp *tqp, u32 frames,
 			return -ENOTCONN;
 		}
 
-		ret = tbv_qp_wait_apple_tx_window(tqp, frames, wr_acquired,
+		ret = tbv_qp_wait_apple_tx_window(tqp, window_frames,
+						  wr_acquired,
 						  frames_acquired);
 		if (ret) {
 			tbv_release_path_refs(&path, 1);
 			return ret;
 		}
 
-		ret = tbv_path_reserve_data(path, frames);
+		ret = tbv_path_reserve_data(path, reserve_frames);
 		if (!ret) {
 			*path_out = path;
 			return 0;
@@ -4229,6 +4289,80 @@ static int tbv_apple_sq_get_tx_resources(struct tbv_qp *tqp, u32 frames,
 			return ret;
 		msleep(1);
 	}
+}
+
+static int tbv_apple_raw_desc_count(u32 len, u32 *desc_count)
+{
+	u32 chunks;
+
+	if (!len || len % TBV_APPLE_FRAME_SIZE)
+		return -EMSGSIZE;
+
+	chunks = len / TBV_APPLE_FRAME_SIZE;
+	if (chunks > U32_MAX / TBV_APPLE_RAW_DESCS_PER_CHUNK)
+		return -EMSGSIZE;
+
+	*desc_count = chunks * TBV_APPLE_RAW_DESCS_PER_CHUNK;
+	return 0;
+}
+
+static int tbv_post_apple_send_raw_piece(struct tbv_qp *tqp,
+					 struct tbv_path *path,
+					 struct tbv_send_ctx *ctx,
+					 const u8 *payload,
+					 u32 payload_len, u32 wire_len,
+					 u8 sof, u8 eof, bool append_crc,
+					 u32 crc, u32 *remaining,
+					 u32 *posted)
+{
+	int ret;
+
+	ret = tbv_post_apple_send_piece(tqp, path, ctx, payload, payload_len,
+					wire_len, sof, eof, append_crc, crc,
+					tbv_apple_send_tx_done, ctx);
+	if (ret)
+		return ret;
+
+	(*remaining)--;
+	(*posted)++;
+	return 0;
+}
+
+static int tbv_apple_sq_transmit_raw_chunk(struct tbv_qp *tqp,
+					   struct tbv_path *path,
+					   struct tbv_send_ctx *ctx,
+					   const u8 *payload, u32 base,
+					   u8 tail_eof, u32 *remaining,
+					   u32 *posted)
+{
+	u32 crc = crc32c(~0u, payload + base, TBV_APPLE_FRAME_SIZE) ^ ~0u;
+	u32 piece;
+	int ret;
+
+	for (piece = 0; piece < 15; piece++) {
+		ret = tbv_post_apple_send_raw_piece(
+			tqp, path, ctx,
+			payload + base + piece * TBV_APPLE_RAW_SLOT_USER_SIZE,
+			TBV_APPLE_RAW_SLOT_USER_SIZE,
+			TBV_APPLE_RAW_SLOT_USER_SIZE,
+			0, piece == 0 ? 1 : 0, false, 0, remaining, posted);
+		if (ret)
+			return ret;
+	}
+
+	ret = tbv_post_apple_send_raw_piece(
+		tqp, path, ctx, payload + base + 15 * TBV_APPLE_RAW_SLOT_USER_SIZE,
+		TBV_APPLE_RAW_SPLIT_USER_SIZE, TBV_APPLE_RAW_SPLIT_USER_SIZE,
+		0, 0, false, 0, remaining, posted);
+	if (ret)
+		return ret;
+
+	return tbv_post_apple_send_raw_piece(
+		tqp, path, ctx,
+		payload + base + 15 * TBV_APPLE_RAW_SLOT_USER_SIZE +
+			TBV_APPLE_RAW_SPLIT_USER_SIZE,
+		TBV_APPLE_RAW_TAIL_USER_SIZE, TBV_APPLE_RAW_TAIL_USER_SIZE + 4,
+		0, tail_eof, true, crc, remaining, posted);
 }
 
 static int tbv_apple_sq_wait_frame_group(struct tbv_qp *tqp,
@@ -4257,15 +4391,24 @@ static int tbv_apple_sq_transmit(struct tbv_qp *tqp,
 	bool apple_wr_acquired = false;
 	u32 apple_frames_acquired = 0;
 	u32 nfrags = DIV_ROUND_UP(entry->length, TBV_APPLE_FRAME_SIZE);
+	u32 pending_descs = nfrags;
 	u32 remaining = nfrags;
 	u32 offset = 0;
 	u32 posted = 0;
 	u32 group_posted = 0;
 	u32 group_limit = READ_ONCE(apple_tx_max_inflight_frames);
+	bool raw_mode = tbv_path_apple_tx_raw_mode();
 	bool sent_any = false;
 	int ret;
 
-	ret = tbv_apple_sq_get_tx_resources(tqp, nfrags, &path,
+	if (raw_mode) {
+		ret = tbv_apple_raw_desc_count(entry->length, &pending_descs);
+		if (ret)
+			return ret;
+		remaining = pending_descs;
+	}
+
+	ret = tbv_apple_sq_get_tx_resources(tqp, nfrags, pending_descs, &path,
 					    &apple_wr_acquired,
 					    &apple_frames_acquired);
 	if (ret)
@@ -4275,7 +4418,7 @@ static int tbv_apple_sq_transmit(struct tbv_qp *tqp,
 	ctx->apple_window_frames = apple_frames_acquired;
 	ctx->apple_window_acquired = apple_wr_acquired ||
 				     apple_frames_acquired;
-	atomic_set(&ctx->apple_pending, nfrags);
+	atomic_set(&ctx->apple_pending, pending_descs);
 	tbv_qp_arm_send_timeout(tqp, ctx);
 
 	while (offset < entry->length) {
@@ -4283,16 +4426,23 @@ static int tbv_apple_sq_transmit(struct tbv_qp *tqp,
 					TBV_APPLE_FRAME_SIZE);
 		bool last = offset + payload_len == entry->length;
 
-		ret = tbv_post_apple_send_frame(tqp, path, ctx,
-						(u8 *)entry->payload + offset,
-						payload_len, 1,
-						last ? 3 : 2,
-						tbv_apple_send_tx_done, ctx);
+		if (raw_mode) {
+			ret = tbv_apple_sq_transmit_raw_chunk(
+				tqp, path, ctx, entry->payload, offset,
+				last ? 3 : 2, &remaining, &posted);
+		} else {
+			ret = tbv_post_apple_send_frame(
+				tqp, path, ctx, (u8 *)entry->payload + offset,
+				payload_len, 1, last ? 3 : 2,
+				tbv_apple_send_tx_done, ctx);
+			if (!ret) {
+				remaining--;
+				posted++;
+			}
+		}
 		if (ret)
 			goto err_release_reservation;
 
-		remaining--;
-		posted++;
 		group_posted++;
 		sent_any = true;
 		offset += payload_len;
@@ -4301,7 +4451,8 @@ static int tbv_apple_sq_transmit(struct tbv_qp *tqp,
 		    offset < entry->length) {
 			tbv_path_kick_tx(path);
 			ret = tbv_apple_sq_wait_frame_group(tqp, ctx,
-							    nfrags - posted);
+							    pending_descs -
+								    posted);
 			if (ret)
 				goto err_release_reservation;
 			group_posted = 0;

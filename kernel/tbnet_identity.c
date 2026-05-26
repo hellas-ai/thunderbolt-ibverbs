@@ -353,7 +353,7 @@ int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
 		return -ENOENT;
 
 	req_payload = (const struct tbv_arp_ipv4_payload *)(req_arp + 1);
-	if (req_payload->target_ip != proxy->ipv4)
+	if (proxy->ipv4 && req_payload->target_ip != proxy->ipv4)
 		return -ENOENT;
 
 	memset(reply, 0, frame_len);
@@ -371,7 +371,7 @@ int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
 
 	reply_payload = (struct tbv_arp_ipv4_payload *)(reply_arp + 1);
 	memcpy(reply_payload->sender_mac, proxy->mac, TBV_ETH_ALEN);
-	reply_payload->sender_ip = proxy->ipv4;
+	reply_payload->sender_ip = proxy->ipv4 ?: req_payload->target_ip;
 	memcpy(reply_payload->target_mac, req_payload->sender_mac,
 	       TBV_ETH_ALEN);
 	reply_payload->target_ip = req_payload->sender_ip;

@@ -17,16 +17,20 @@
 #include <linux/etherdevice.h>
 #include <linux/highmem.h>
 #include <linux/if_ether.h>
+#include <linux/inetdevice.h>
 #include <linux/jhash.h>
 #include <linux/kernel.h>
 #include <linux/limits.h>
 #include <linux/module.h>
+#include <linux/netdevice.h>
+#include <linux/rtnetlink.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/thunderbolt.h>
 #include <linux/uuid.h>
 #include <linux/workqueue.h>
+#include <net/net_namespace.h>
 
 #include "tbv.h"
 
@@ -141,6 +145,8 @@ tbv_tbnet_minimal_free_rings(struct tbv_tbnet_minimal_session *session);
 static int
 tbv_tbnet_minimal_send_logout_request(struct tbv_tbnet_minimal_session *session,
 				      u8 sequence);
+static __be32
+tbv_tbnet_minimal_lookup_proxy_ipv4(struct tbv_tbnet_identity *identity);
 
 static void
 tbv_tbnet_minimal_fill_reply_ctrl(struct tbv_tbnet_minimal_session *session,
@@ -648,7 +654,8 @@ tbv_tbnet_minimal_send_arp_reply(struct tbv_tbnet_minimal_session *session,
 
 	proxy_ipv4 = READ_ONCE(session->identity->proxy_ipv4);
 	if (!proxy_ipv4)
-		return -ENOENT;
+		proxy_ipv4 =
+			tbv_tbnet_minimal_lookup_proxy_ipv4(session->identity);
 
 	memset(&proxy, 0, sizeof(proxy));
 	proxy.ipv4 = proxy_ipv4;
@@ -671,6 +678,39 @@ tbv_tbnet_minimal_send_arp_reply(struct tbv_tbnet_minimal_session *session,
 	atomic64_inc(&session->arp_replies);
 	WRITE_ONCE(session->last_tx_ethertype, ETH_P_ARP);
 	return 0;
+}
+
+static __be32
+tbv_tbnet_minimal_lookup_proxy_ipv4(struct tbv_tbnet_identity *identity)
+{
+	struct net_device *dev;
+	struct in_device *in_dev;
+	struct in_ifaddr *ifa;
+	__be32 addr = 0;
+
+	if (!identity->gid_netdev_name[0])
+		return 0;
+
+	rtnl_lock();
+	dev = dev_get_by_name(&init_net, identity->gid_netdev_name);
+	if (!dev)
+		goto out_unlock;
+
+	in_dev = __in_dev_get_rtnl(dev);
+	if (in_dev) {
+		in_dev_for_each_ifa_rtnl(ifa, in_dev) {
+			addr = ifa->ifa_local;
+			break;
+		}
+	}
+	dev_put(dev);
+
+out_unlock:
+	rtnl_unlock();
+
+	if (addr)
+		WRITE_ONCE(identity->proxy_ipv4, addr);
+	return addr;
 }
 
 static void
