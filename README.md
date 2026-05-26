@@ -123,6 +123,18 @@ Build the module package:
 nix build github:hellas-ai/thunderbolt-ibverbs#thunderbolt-ibverbs
 ```
 
+Other flake outputs:
+
+```sh
+nix build github:hellas-ai/thunderbolt-ibverbs#rdma-core-usb4   # libibverbs + usb4_rdma provider
+nix build github:hellas-ai/thunderbolt-ibverbs#perftest         # ib_write_bw/ib_send_bw/... linked against rdma-core-usb4
+nix build github:hellas-ai/thunderbolt-ibverbs#bench-tools      # u4_pingpong, uc_oneway, rc_write_*, vllm-* scripts, etc.
+nix build github:hellas-ai/thunderbolt-ibverbs#tb-tools         # tb-irq, tb-speeds operator helpers
+```
+
+`nix develop` drops you in a shell with the module headers, `rdma-core-usb4`,
+`perftest`, the bench tools, and the `tb-*` helpers on PATH.
+
 On NixOS, add the flake input and import the module:
 
 ```nix
