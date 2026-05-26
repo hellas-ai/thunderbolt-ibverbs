@@ -16,7 +16,9 @@ https://blog.hellas.ai/blog/thunderbolt-ibverbs/
 
 - Native Linux-to-Linux verbs transport is the main path.
 - Apple-compatible transport exists, but is still experimental.
-- The module builds against stock kernels.
+- The module builds against stock kernels, but needs Linux 6.14 or newer
+  (or this flake's `linux-thunderbolt` kernel) for the maintainer-tree
+  Thunderbolt/USB4 subsystem changes it relies on.
 - `nhi_interrupt_throttle_ns` is active only on kernels that export
   `tb_ring_throttling()`.
 - The Nix flake builds a Thunderbolt testing kernel from the maintainer
@@ -30,6 +32,29 @@ kernel sources and `MODULE_LICENSE("GPL")`.
 
 Small userspace-facing test and protocol helper files that say
 `GPL-2.0 OR BSD-3-Clause` may be used under either license.
+
+## Install From GitHub Releases
+
+Pre-built DKMS source packages are attached to GitHub Releases:
+
+  https://github.com/hellas-ai/thunderbolt-ibverbs/releases
+
+Pick the artefact for your distro and install with the local package manager:
+
+```sh
+# Debian or Ubuntu (needs Linux 6.14+)
+sudo apt install ./thunderbolt-ibverbs-dkms_<ver>_all.deb
+
+# Fedora
+sudo dnf install ./thunderbolt-ibverbs-dkms-<ver>-1.noarch.rpm
+
+# Arch
+sudo pacman -U ./thunderbolt-ibverbs-dkms-<ver>-1-any.pkg.tar.zst
+```
+
+DKMS builds the kernel module against your running kernel on install and
+rebuilds it after every kernel upgrade. Older kernels need the
+`linux-thunderbolt` build from this flake — see "Nix Thunderbolt Kernel" below.
 
 ## Requirements
 

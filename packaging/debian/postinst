@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+NAME=thunderbolt-ibverbs
+VERSION=@VERSION@
+
+case "$1" in
+    configure)
+        if command -v dkms >/dev/null 2>&1; then
+            if ! dkms status -m "$NAME" -v "$VERSION" 2>/dev/null | grep -q .; then
+                dkms add -m "$NAME" -v "$VERSION"
+            fi
+            dkms autoinstall -m "$NAME"/"$VERSION" || true
+        fi
+        ;;
+esac
+
+exit 0

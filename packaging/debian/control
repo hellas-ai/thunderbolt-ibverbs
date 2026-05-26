@@ -1,0 +1,16 @@
+Package: thunderbolt-ibverbs-dkms
+Version: @VERSION@
+Section: kernel
+Priority: optional
+Architecture: all
+Depends: dkms (>= 2.1.0.0), kmod, libc6
+Maintainer: George Whewell <george@hellas.ai>
+Homepage: https://github.com/hellas-ai/thunderbolt-ibverbs
+Description: Thunderbolt/USB4 host-to-host RDMA verbs kernel module (DKMS source)
+ Experimental Linux kernel module exposing an RDMA verbs device over
+ Thunderbolt/USB4 host-to-host links. This package installs the module source
+ under /usr/src and registers it with DKMS, which builds the module against
+ the running kernel on install and on every subsequent kernel upgrade.
+ .
+ Requires Linux 6.14 or newer, or the linux-thunderbolt kernel built from
+ the upstream flake.

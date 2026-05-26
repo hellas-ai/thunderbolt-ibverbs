@@ -1,0 +1,19 @@
+_NAME=thunderbolt-ibverbs
+
+post_install() {
+    if command -v dkms >/dev/null 2>&1; then
+        dkms add -m "${_NAME}" -v "$1" >/dev/null 2>&1 || true
+        dkms autoinstall -m "${_NAME}/$1" >/dev/null 2>&1 || true
+    fi
+}
+
+post_upgrade() {
+    pre_remove "$2"
+    post_install "$1"
+}
+
+pre_remove() {
+    if command -v dkms >/dev/null 2>&1; then
+        dkms remove -m "${_NAME}" -v "$1" --all >/dev/null 2>&1 || true
+    fi
+}

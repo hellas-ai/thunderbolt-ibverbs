@@ -86,6 +86,8 @@
               packaging/regen-rdma-core-patches.sh \
               packaging/test-rdma-patches.sh \
               tools/ci/distro-build.sh \
+              tools/ci/distro-install.sh \
+              tools/ci/distro-package.sh \
               tools/ci/vm-guest-smoke.sh \
               tools/ci/vm-smoke.sh
             runHook postBuild
@@ -111,36 +113,6 @@
               tools/ci/proto-smoke.c \
               -o tbv-proto-smoke
             ./tbv-proto-smoke
-            runHook postBuild
-          '';
-
-          installPhase = ''
-            runHook preInstall
-            mkdir -p "$out"
-            runHook postInstall
-          '';
-        };
-      mkDockerDistroBuild = pkgs: { name, image }:
-        pkgs.stdenv.mkDerivation {
-          pname = "thunderbolt-ibverbs-distro-${name}";
-          version = "0.1.0";
-          src = ./.;
-
-          nativeBuildInputs = [
-            pkgs.bash
-            pkgs.docker-client
-          ];
-
-          requiredSystemFeatures = [ "docker" ];
-          __noChroot = true;
-          dontConfigure = true;
-
-          buildPhase = ''
-            runHook preBuild
-            export HOME="$TMPDIR/home"
-            mkdir -p "$HOME"
-            export DOCKER="${pkgs.docker-client}/bin/docker"
-            bash tools/ci/distro-build.sh ${lib.escapeShellArg image}
             runHook postBuild
           '';
 
@@ -248,20 +220,6 @@
           self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs-linux-thunderbolt;
         checks = self.checks.${pkgs.stdenv.hostPlatform.system};
         vm-smoke.nixos = mkNixosVmSmoke pkgs;
-        distro = {
-          debian-sid = mkDockerDistroBuild pkgs {
-            name = "debian-sid";
-            image = "debian:sid";
-          };
-          fedora-rawhide = mkDockerDistroBuild pkgs {
-            name = "fedora-rawhide";
-            image = "fedora:rawhide";
-          };
-          archlinux-latest = mkDockerDistroBuild pkgs {
-            name = "archlinux-latest";
-            image = "archlinux:latest";
-          };
-        };
       });
 
       overlays.default = final: prev: {

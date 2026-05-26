@@ -1,0 +1,88 @@
+name: release-artefacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Attach artefacts to a GitHub Release. Run this workflow against a v* tag for this to take effect.'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    name: build (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian
+            image: debian:sid
+            artefact_glob: 'dist/thunderbolt-ibverbs-dkms_*.deb'
+          - distro: fedora
+            image: fedora:rawhide
+            artefact_glob: 'dist/thunderbolt-ibverbs-dkms-*.rpm'
+          - distro: arch
+            image: archlinux:latest
+            artefact_glob: 'dist/thunderbolt-ibverbs-dkms-*.pkg.tar.zst'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build artefact in ${{ matrix.image }}
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            -e TBV_LINT=1 \
+            ${{ matrix.image }} \
+            bash tools/ci/distro-package.sh ${{ matrix.distro }}
+          ls -la dist/
+
+      - name: Install + DKMS build verification in ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            ${{ matrix.image }} \
+            bash tools/ci/distro-install.sh '${{ matrix.artefact_glob }}'
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: thunderbolt-ibverbs-${{ matrix.distro }}
+          path: ${{ matrix.artefact_glob }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List collected artefacts
+        run: ls -la dist/
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "$tag" \
+              --generate-notes
+          fi
