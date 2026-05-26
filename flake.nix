@@ -14,19 +14,81 @@
       ];
       systems = [
         "x86_64-linux"
-        "aarch64-linux"
       ];
       forAllSystems = f:
         lib.genAttrs systems (system:
           f (import nixpkgs { inherit system; }));
-    in {
+      mkProtoSmoke = pkgs:
+        pkgs.stdenv.mkDerivation {
+          pname = "thunderbolt-ibverbs-proto-smoke";
+          version = "0.1.0";
+          src = ./.;
+
+          dontConfigure = true;
+
+          buildPhase = ''
+            runHook preBuild
+            $CC -std=c11 -Wall -Wextra -Werror -I. \
+              tools/ci/proto-smoke.c \
+              -o tbv-proto-smoke
+            ./tbv-proto-smoke
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out"
+            runHook postInstall
+          '';
+        };
+      mkVerbsSmokeBuild = pkgs:
+        pkgs.stdenv.mkDerivation {
+          pname = "thunderbolt-ibverbs-verbs-smoke-build";
+          version = "0.1.0";
+          src = ./.;
+
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.rdma-core ];
+
+          dontConfigure = true;
+
+          buildPhase = ''
+            runHook preBuild
+            $CC -std=c11 -Wall -Wextra -Werror \
+              tools/ci/verbs-smoke.c \
+              $(pkg-config --cflags --libs libibverbs) \
+              -o tbv-verbs-smoke
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out"
+            runHook postInstall
+          '';
+        };
+    in
+    {
       packages = forAllSystems (pkgs:
         let
           module = pkgs.linuxPackages.callPackage ./nix/module.nix { };
-        in {
+        in
+        {
           default = module;
           thunderbolt-ibverbs = module;
         });
+
+      checks = forAllSystems (pkgs: {
+        thunderbolt-ibverbs =
+          self.packages.${pkgs.stdenv.hostPlatform.system}.thunderbolt-ibverbs;
+        proto-smoke = mkProtoSmoke pkgs;
+        verbs-smoke-build = mkVerbsSmokeBuild pkgs;
+      });
+
+      hydraJobs.x86_64-linux = {
+        thunderbolt-ibverbs = self.packages.x86_64-linux.thunderbolt-ibverbs;
+        checks = self.checks.x86_64-linux;
+      };
 
       overlays.default = final: prev: {
         thunderbolt-ibverbs =
@@ -44,7 +106,8 @@
           cfg = config.hardware.thunderbolt-ibverbs;
           module =
             config.boot.kernelPackages.callPackage ./nix/module.nix { };
-        in {
+        in
+        {
           options.hardware.thunderbolt-ibverbs.enable =
             lib.mkEnableOption "the thunderbolt_ibverbs kernel module";
 

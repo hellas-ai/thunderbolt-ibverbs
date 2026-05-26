@@ -21,11 +21,8 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Evaluate flake
-        run: nix flake check --all-systems --no-build
-
-      - name: Build kernel module package
-        run: nix build .#thunderbolt-ibverbs --print-build-logs
+      - name: Check flake
+        run: nix flake check --print-build-logs
 
   distro:
     name: distro (${{ matrix.image }})
