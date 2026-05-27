@@ -128,7 +128,7 @@ CSV_FIELDS = [
     "server",
     "client",
     "kernel",
-    "module_srcversion",
+    "module_sha256",
     "iommu",
     "direction",
     "dev",
@@ -303,12 +303,15 @@ def parse_iommu_setting(cmdline: str) -> str:
 
 def collect_host_identity(host: str) -> dict[str, str]:
     cmd = (
+        "ko=$(modinfo -F filename thunderbolt_ibverbs 2>/dev/null); "
         "echo kernel=$(uname -r); "
         "echo srcversion=$(cat /sys/module/thunderbolt_ibverbs/srcversion 2>/dev/null); "
         "echo taint=$(cat /sys/module/thunderbolt_ibverbs/taint 2>/dev/null); "
+        "echo ko_path=$ko; "
+        "echo module_sha256=$(sha256sum \"$ko\" 2>/dev/null | cut -c1-16); "
         "echo cmdline=$(tr -d '\\n' < /proc/cmdline 2>/dev/null)"
     )
-    out = run_ssh(host, cmd, check=False, timeout=10).stdout
+    out = run_ssh(host, cmd, check=False, timeout=15).stdout
     fields: dict[str, str] = {}
     for line in out.splitlines():
         key, sep, value = line.partition("=")
@@ -322,7 +325,8 @@ def format_identity(label: str, identity: dict[str, str]) -> str:
     return (
         f"tbv-perftest: {label} "
         f"kernel={identity.get('kernel', '?')} "
-        f"srcversion={identity.get('srcversion') or 'not-loaded'} "
+        f"module_sha256={identity.get('module_sha256') or 'unknown'} "
+        f"srcversion={identity.get('srcversion') or '-'} "
         f"taint={identity.get('taint') or '-'} "
         f"iommu={identity['iommu']}"
     )
@@ -805,7 +809,7 @@ def main() -> int:
         identity_client = collect_host_identity(client_host)
         print(format_identity(server, identity_server), flush=True)
         print(format_identity(client, identity_client), flush=True)
-        for field in ("kernel", "srcversion", "iommu"):
+        for field in ("kernel", "module_sha256", "iommu"):
             if identity_server.get(field) != identity_client.get(field):
                 print(
                     f"tbv-perftest: WARNING: server/client {field} mismatch",
@@ -861,7 +865,7 @@ def main() -> int:
                             "server": run_server,
                             "client": run_client,
                             "kernel": identity_server.get("kernel", ""),
-                            "module_srcversion": identity_server.get("srcversion", ""),
+                            "module_sha256": identity_server.get("module_sha256", ""),
                             "iommu": identity_server.get("iommu", ""),
                             "direction": direction_name,
                             "dev": dev,
