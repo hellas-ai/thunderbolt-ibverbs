@@ -19,8 +19,10 @@ modules.order
 result
 result-*
 
-# Local benchmark raw artifacts. Keep compact CSV/Markdown reports in Git, but
-# leave full telemetry/log captures local unless intentionally curated.
+# Local benchmark raw artifacts. CSV/JSONL outputs live in each run's
+# `result/` sibling and are picked up by the committed symlinks under
+# `data/`. README per run documents the recreate command.
+bench/results/**/result/
 bench/results/**/*.json
 bench/results/**/*.jsonl
 bench/results/**/logs/

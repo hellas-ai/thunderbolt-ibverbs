@@ -3,50 +3,45 @@
 Two Strix Halo hosts were booted with `iommu=off` and connected by two
 Thunderbolt/USB4 cables, giving four native `usb4_rdma` rails at 20 Gb/s each.
 
-Only compact CSV summaries are checked in. The original JSONL telemetry logs
-were 25+ MB and are intentionally excluded; use the commands below to recreate
-them.
+No CSVs or JSONL are checked in. `data/*.csv` are committed symlinks pointing
+at `../result/<name>.csv`; the `result/` sibling is gitignored and populated
+by the recreate commands below. The runner used here is the unified
+`tbv-perftest` (post-collapse); the originally-recorded values from this run
+window are in the headline summary at the bottom.
 
-## Recreate Native RDMA Artifacts
+## Recreate native four-rail
 
 ```sh
-out=/tmp/tbv-iommu-off-sweep/native-rdma
+out=bench/results/2026-05-27-iommu-off-lowlevel-sweep/result
 mkdir -p "$out"
-nix run .#tbv-perftest-native4rail -- \
+nix run .#tbv-perftest -- \
   --hosts strix-1,strix-2 \
-  --directions both \
-  --tag native4rail-iommu-off \
-  --timeout 90 \
+  --expect-rails 4 --expect-speed 20Gb/s \
   --base-port 19000 \
+  --tag native4rail-iommu-off \
   --csv "$out/native4rail.csv" \
   --jsonl "$out/native4rail.jsonl"
 ```
 
-## Recreate RXE-over-Ethernet Artifacts
-
-Create the RXE link on both hosts first:
+## Recreate RXE-over-Ethernet
 
 ```sh
-ssh root@strix-1 'rdma link del rxe_eth0 2>/dev/null || true; rdma link add rxe_eth0 type rxe netdev br0.lan'
-ssh root@strix-2 'rdma link del rxe_eth0 2>/dev/null || true; rdma link add rxe_eth0 type rxe netdev br0.lan'
-```
+ssh root@strix-1 'modprobe rdma_rxe; rdma link del rxe_eth0 2>/dev/null; rdma link add rxe_eth0 type rxe netdev br0.lan'
+ssh root@strix-2 'modprobe rdma_rxe; rdma link del rxe_eth0 2>/dev/null; rdma link add rxe_eth0 type rxe netdev br0.lan'
 
-Then run:
-
-```sh
-out=/tmp/tbv-iommu-off-sweep/rxe-ethernet
+out=bench/results/2026-05-27-iommu-off-lowlevel-sweep/result
 mkdir -p "$out"
-nix run .#tbv-perftest-rxe-ethernet -- \
+nix run .#tbv-perftest -- \
   --hosts strix-1,strix-2 \
-  --directions both \
-  --tag rxe-ethernet-iommu-off \
-  --timeout 90 \
+  --dev rxe_eth0 --backend '' \
+  --no-rail-check \
   --base-port 19100 \
+  --tag rxe-ethernet-iommu-off \
   --csv "$out/rxe-ethernet.csv" \
   --jsonl "$out/rxe-ethernet.jsonl"
 ```
 
-## Recreate RXE-over-TB-net Artifacts
+## Recreate RXE-over-TB-net
 
 The native `thunderbolt_ibverbs` module and `thunderbolt_net` cannot own the
 same Thunderbolt services at the same time. Switch to TB-net first:
@@ -62,35 +57,35 @@ ssh root@strix-1 'rdma link del rxe_tb0 2>/dev/null || true; rdma link del rxe_t
 ssh root@strix-2 'rdma link del rxe_tb0 2>/dev/null || true; rdma link del rxe_tb1 2>/dev/null || true; rdma link add rxe_tb0 type rxe netdev thunderbolt0; rdma link add rxe_tb1 type rxe netdev thunderbolt1'
 ```
 
-Then run each TB-net RXE device:
+Then sweep each TB-net RXE device:
 
 ```sh
-out=/tmp/tbv-iommu-off-sweep/rxe-tbnet
+out=bench/results/2026-05-27-iommu-off-lowlevel-sweep/result
 mkdir -p "$out"
-nix run .#tbv-perftest-rxe-tbnet -- \
+
+nix run .#tbv-perftest -- \
   --hosts strix-1,strix-2 \
-  --directions both \
-  --dev rxe_tb0 \
-  --tag rxe-tb0-iommu-off \
-  --timeout 90 \
+  --dev rxe_tb0 --backend '' \
+  --no-rail-check \
   --base-port 19200 \
+  --tag rxe-tb0-iommu-off \
   --csv "$out/rxe-tb0.csv" \
   --jsonl "$out/rxe-tb0.jsonl"
 
-nix run .#tbv-perftest-rxe-tbnet -- \
+nix run .#tbv-perftest -- \
   --hosts strix-1,strix-2 \
-  --directions both \
-  --dev rxe_tb1 \
-  --tag rxe-tb1-iommu-off \
-  --timeout 90 \
+  --dev rxe_tb1 --backend '' \
+  --no-rail-check \
   --base-port 19300 \
+  --tag rxe-tb1-iommu-off \
   --csv "$out/rxe-tb1.csv" \
   --jsonl "$out/rxe-tb1.jsonl"
 ```
 
 ## Summary
 
-Regenerate this table from the checked-in CSV data:
+Once you've recreated the CSVs locally, the committed symlinks resolve and
+the summarizer reproduces this table:
 
 ```sh
 python3 bench/summarize_perftest.py \

@@ -18,20 +18,23 @@ This boot only had `usb4_rdma{0,1,5,6}` rails plus `rxe_eth0` available — no
 `thunderbolt0` / `thunderbolt1` netdevs, so the prior `rxe-tb0` / `rxe-tb1`
 sweeps are not reproduced here.
 
-Only the compact CSVs are checked in. JSONL telemetry lives at
-`/tmp/tbv-rerun/*.jsonl` and is intentionally not committed.
+No CSVs or JSONL are checked in. `data/*.csv` are committed symlinks pointing
+at `../result/<name>.csv`; the `result/` sibling is gitignored and populated
+by the recreate commands below. The headline numbers from this run are
+captured in the comparison table further down.
 
 ## Recreate native four-rail
 
 ```sh
-out=bench/results/2026-05-27-iommu-off-rerun/data
+out=bench/results/2026-05-27-iommu-off-rerun/result
+mkdir -p "$out"
 nix run .#tbv-perftest -- \
   --hosts strix-1,strix-2 \
   --expect-rails 4 --expect-speed 20Gb/s \
   --base-port 19000 \
   --tag native4rail-iommu-off \
   --csv "$out/native4rail.csv" \
-  --jsonl /tmp/tbv-rerun/native4rail.jsonl
+  --jsonl "$out/native4rail.jsonl"
 ```
 
 ## Recreate RXE-over-LAN
@@ -40,7 +43,8 @@ nix run .#tbv-perftest -- \
 ssh root@strix-1 'modprobe rdma_rxe; rdma link del rxe_eth0 2>/dev/null; rdma link add rxe_eth0 type rxe netdev br0.lan'
 ssh root@strix-2 'modprobe rdma_rxe; rdma link del rxe_eth0 2>/dev/null; rdma link add rxe_eth0 type rxe netdev br0.lan'
 
-out=bench/results/2026-05-27-iommu-off-rerun/data
+out=bench/results/2026-05-27-iommu-off-rerun/result
+mkdir -p "$out"
 nix run .#tbv-perftest -- \
   --hosts strix-1,strix-2 \
   --dev rxe_eth0 --backend '' \
@@ -48,12 +52,13 @@ nix run .#tbv-perftest -- \
   --base-port 19100 \
   --tag rxe-ethernet-iommu-off \
   --csv "$out/rxe-ethernet.csv" \
-  --jsonl /tmp/tbv-rerun/rxe-ethernet.jsonl
+  --jsonl "$out/rxe-ethernet.jsonl"
 ```
 
 ## Summary
 
-Regenerate from the checked-in CSVs:
+Once you've recreated the CSVs locally, the committed symlinks resolve and you
+can summarize:
 
 ```sh
 python3 bench/summarize_perftest.py \
