@@ -35,193 +35,11 @@
       inherit source;
     };
 
-  optionSpecs = {
-    profile = {
-      param = "profile";
-      type = types.enum ["auto" "mac_compat" "linux_perf" "mixed"];
-      default = "linux_perf";
-      description = "Driver profile. mac_compat enables the Apple-compatible UC path; linux_perf enables the native Linux path; mixed enables both.";
-    };
-    compat = {
-      param = "compat";
-      type = types.enum ["auto" "force" "off"];
-      default = "off";
-      description = "Compatibility mode for peer/backend selection.";
-    };
-    tbnet = {
-      param = "tbnet";
-      type = types.enum ["auto" "allow" "prefer_rdma" "block"];
-      default = "prefer_rdma";
-      description = "Thunderbolt-net coexistence policy.";
-    };
-    tbnetIdentity = {
-      param = "tbnet_identity";
-      type = types.enum ["auto" "stock" "stock_proxy" "minimal_packet" "off"];
-      default = "off";
-      description = "ThunderboltIP identity strategy used for Apple compatibility.";
-    };
-    tbnetIdentityTbnet = {
-      param = "tbnet_identity_tbnet";
-      type = types.str;
-      default = "thunderbolt0";
-      description = "Thunderbolt-net interface name used by stock or proxy identity modes.";
-    };
-    tbnetIdentityGid = {
-      param = "tbnet_identity_gid";
-      type = types.str;
-      default = "auto";
-      description = "Netdev name used for the Apple-compatible GID identity.";
-    };
-    tbnetIdentityMinimalE2e = {
-      param = "tbnet_identity_minimal_e2e";
-      type = types.bool;
-      default = false;
-      description = "Enable E2E flow control on minimal ThunderboltIP packet rings. Keep disabled for Strix Halo Mac compatibility.";
-    };
-    tbnetIdentityMinimalAppleOnly = {
-      param = "tbnet_identity_minimal_apple_only";
-      type = types.bool;
-      default = true;
-      description = "Bind minimal ThunderboltIP identity only to Apple peers so Linux peers remain available for the native backend.";
-    };
-    roceNetdev = {
-      param = "roce_netdev";
-      type = types.nullOr types.str;
-      default = "br0.lan";
-      description = "Netdev used for RoCE GID metadata. Set null to omit roce_netdev.";
-    };
-    lanes = {
-      param = "lanes";
-      type = types.str;
-      default = "2";
-      description = "Lane request passed to the driver: auto, N, or MIN-MAX.";
-    };
-    bindServices = {
-      param = "bind_services";
-      type = types.bool;
-      default = true;
-      description = "Bind supported Thunderbolt services.";
-    };
-    nativePrtcstns = {
-      param = "native_prtcstns";
-      type = types.ints.unsigned;
-      default = 0;
-      description = "Native backend PRTCSTNS override. 0 lets the driver choose.";
-    };
-    applePrtcstns = {
-      param = "apple_prtcstns";
-      type = types.ints.unsigned;
-      default = 0;
-      description = "Apple-compatible backend PRTCSTNS override. 0 lets the driver choose.";
-    };
-    allocateRings = {
-      param = "allocate_rings";
-      type = types.bool;
-      default = true;
-      description = "Allocate Thunderbolt DMA rings.";
-    };
-    startRings = {
-      param = "start_rings";
-      type = types.bool;
-      default = true;
-      description = "Start allocated Thunderbolt DMA rings.";
-    };
-    negotiateNative = {
-      param = "negotiate_native";
-      type = types.bool;
-      default = true;
-      description = "Run native Linux peer/rail negotiation.";
-    };
-    enableTunnels = {
-      param = "enable_tunnels";
-      type = types.bool;
-      default = true;
-      description = "Enable Thunderbolt DMA tunnels after negotiation.";
-    };
-    nativeData = {
-      param = "native_data";
-      type = types.bool;
-      default = true;
-      description = "Enable native Linux data path.";
-    };
-    appleData = {
-      param = "apple_data";
-      type = types.bool;
-      default = false;
-      description = "Enable Apple-compatible data path.";
-    };
-    nativeFragmentStriping = {
-      param = "native_fragment_striping";
-      type = types.bool;
-      default = false;
-      description = "Enable experimental native fragment striping.";
-    };
-    registerVerbs = {
-      param = "register_verbs";
-      type = types.bool;
-      default = true;
-      description = "Register the ibverbs device.";
-    };
-    zcopyMinBytes = {
-      param = "zcopy_min_bytes";
-      type = types.ints.unsigned;
-      default = 4096;
-      description = "Minimum native RDMA WRITE bytes before zero-copy page streaming is used; 0 disables zero-copy.";
-    };
-    qpTimeoutMs = {
-      param = "qp_timeout_ms";
-      type = types.ints.unsigned;
-      default = 5000;
-      description = "Default QP operation timeout in milliseconds.";
-    };
-    appleTxMaxInflightWr = {
-      param = "apple_tx_max_inflight_wr";
-      type = types.ints.unsigned;
-      default = 1;
-      description = "Maximum Apple-compatible UC SEND work requests in flight per QP; 0 disables the software window.";
-    };
-    appleTxMaxInflightFrames = {
-      param = "apple_tx_max_inflight_frames";
-      type = types.ints.unsigned;
-      default = 2;
-      description = "Maximum Apple-compatible 4 KiB FA57 frames queued from one SEND before waiting for TX completions; 0 disables the frame window.";
-    };
-    appleRxPendingBytes = {
-      param = "apple_rx_pending_bytes";
-      type = types.ints.unsigned;
-      default = 16777216;
-      description = "Maximum bytes buffered per early Apple UC receive when no receive WQE is posted.";
-    };
-    appleRxPendingSlots = {
-      param = "apple_rx_pending_slots";
-      type = types.ints.unsigned;
-      default = 4096;
-      description = "Maximum number of early Apple UC receives buffered per QP.";
-    };
-    appleRxPendingTotalBytes = {
-      param = "apple_rx_pending_total_bytes";
-      type = types.ints.unsigned;
-      default = 67108864;
-      description = "Maximum aggregate bytes buffered for early Apple UC receives per QP.";
-    };
-    appleRxTrace = {
-      param = "apple_rx_trace";
-      type = types.ints.unsigned;
-      default = 0;
-      description = "Print the first N Apple RX callbacks with SOF/EOF and assembly state.";
-    };
-    nhiInterruptThrottleNs = {
-      param = "nhi_interrupt_throttle_ns";
-      type = types.ints.unsigned;
-      default = 0;
-      description = "NHI interrupt throttle in nanoseconds; 0 leaves driver default behavior.";
-    };
-  };
-
-  mkDriverOption = _name: spec:
-    lib.mkOption {
-      inherit (spec) type default description;
-    };
+  # Strict declarative config: cfg.config is either `false` (do not manage
+  # module params at all) or an attrset of exact kernel-module param names
+  # to values. No camelCase mapping; whatever you write is what gets emitted.
+  managed = cfg.config != false;
+  managedConfig = if managed then cfg.config else {};
 
   renderValue = value:
     if value == null
@@ -233,16 +51,20 @@
       else "0"
     else toString value;
 
-  renderDriverOption = name: value: let
-    rendered = renderValue value;
-    param = optionSpecs.${name}.param or name;
-  in
-    lib.optional (rendered != null) "${param}=${rendered}";
-
   renderedModuleOptions =
     lib.concatStringsSep " "
-    ((lib.concatLists (lib.mapAttrsToList renderDriverOption cfg.moduleOptions))
-      ++ cfg.extraModuleOptions);
+    (lib.concatLists (lib.mapAttrsToList
+      (name: value:
+        let rendered = renderValue value;
+        in lib.optional (rendered != null) "${name}=${rendered}")
+      managedConfig));
+
+  configuredTbnetIdentity = managedConfig.tbnet_identity or null;
+  configuredTbnet = managedConfig.tbnet or null;
+  configuredTbnetIdentityTbnet = managedConfig.tbnet_identity_tbnet or "thunderbolt0";
+
+  loadStockThunderboltNet =
+    builtins.elem configuredTbnetIdentity ["stock" "stock_proxy"];
 
   thunderboltIbverbsModule =
     if cfg.package != null
@@ -262,16 +84,9 @@
     else "0";
 
   effectiveExpectedProfile =
-    if cfg.check.expectedProfile == null
-    then cfg.moduleOptions.profile
-    else cfg.check.expectedProfile;
-
-  effectiveBlacklistThunderboltNet =
-    if cfg.blacklistThunderboltNet != null
-    then cfg.blacklistThunderboltNet
-    else cfg.moduleOptions.tbnetIdentity == "minimal_packet";
-
-  loadStockThunderboltNet = builtins.elem cfg.moduleOptions.tbnetIdentity ["stock" "stock_proxy"];
+    if cfg.check.expectedProfile != null
+    then cfg.check.expectedProfile
+    else managedConfig.profile or null;
 
   checkHelper = pkgs.writeShellApplication {
     name = "thunderbolt-ibverbs-check";
@@ -374,9 +189,9 @@
       options="''${TBV_OPTIONS:-${renderedModuleOptions}}"
       wait_secs="''${TBV_WAIT_SECS:-${toString cfg.waitSeconds}}"
       check_after_reload="''${TBV_CHECK_AFTER_RELOAD:-${boolString cfg.check.afterReload}}"
-      tbnet_policy="prefer_rdma"
-      tbnet_identity="off"
-      tbnet_identity_tbnet="thunderbolt0"
+      tbnet_policy="${if configuredTbnet == null then "prefer_rdma" else configuredTbnet}"
+      tbnet_identity="${if configuredTbnetIdentity == null then "off" else configuredTbnetIdentity}"
+      tbnet_identity_tbnet="${configuredTbnetIdentityTbnet}"
       booted_module="/run/booted-system/kernel-modules/lib/modules/$(uname -r)/extra/thunderbolt_ibverbs.ko"
 
       if [ "''${TBV_ALLOW_NON_BOOTED_MODULE:-0}" != "1" ] &&
@@ -513,10 +328,15 @@ in {
       };
     };
 
-    blacklistThunderboltNet = lib.mkOption {
-      type = types.nullOr types.bool;
-      default = null;
-      description = "Whether to blacklist thunderbolt_net. The default blacklists it only when tbnetIdentity is minimal_packet.";
+    blacklist.enable = lib.mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Blacklist potentially-interfering kernel modules (currently:
+        thunderbolt_net). Useful when running with tbnet_identity=minimal_packet,
+        which requires thunderbolt_ibverbs to own the ThunderboltIP service
+        from boot. Off by default — set true only when you know you want it.
+      '';
     };
 
     waitSeconds = lib.mkOption {
@@ -525,19 +345,48 @@ in {
       description = "Default seconds the reload helper waits after loading thunderbolt_ibverbs.";
     };
 
+    config = lib.mkOption {
+      type = types.either (types.enum [false]) (types.attrsOf (types.oneOf [
+        types.bool
+        types.int
+        types.str
+        (types.nullOr types.str)
+      ]));
+      default = false;
+      example = lib.literalExpression ''
+        {
+          profile = "linux_perf";
+          tbnet = "prefer_rdma";
+          tbnet_identity = "off";
+          lanes = "2";
+          register_verbs = true;
+        }
+      '';
+      description = ''
+        Strict declarative thunderbolt_ibverbs module configuration.
+
+        - `false` (default): enable the module and load it on boot, but do not
+          emit modprobe options, do not run the activation reload helper, and
+          do not touch existing module state. The driver runs with its
+          compiled-in defaults. Use this when you want the module present but
+          intend to manage it manually (e.g. during interactive testing).
+
+        - attrset: strict mode. Exactly the listed keys are written to
+          `/etc/modprobe.d/` as `options thunderbolt_ibverbs <key=value> ...`,
+          and the activation reload helper applies them on switch. Keys are
+          the raw kernel-module parameter names (snake_case), values may be
+          bool (rendered "1"/"0"), int, or string. `null` values are dropped.
+      '';
+    };
+
     extraModuleOptions = lib.mkOption {
       type = types.listOf types.str;
       default = [];
       example = ["debug=1"];
-      description = "Additional raw thunderbolt_ibverbs module options appended after typed options.";
-    };
-
-    moduleOptions = lib.mkOption {
-      type = types.submodule {
-        options = lib.mapAttrs mkDriverOption optionSpecs;
-      };
-      default = {};
-      description = "Typed thunderbolt_ibverbs kernel module parameters.";
+      description = ''
+        Additional raw thunderbolt_ibverbs module options appended after the
+        keys from `config`. Only used when `config` is an attrset.
+      '';
     };
 
     renderedModuleOptions = lib.mkOption {
@@ -599,9 +448,9 @@ in {
         description = "Debugfs directory exported by thunderbolt_ibverbs.";
       };
       expectedProfile = lib.mkOption {
-        type = types.nullOr optionSpecs.profile.type;
+        type = types.nullOr types.str;
         default = null;
-        description = "Expected profile in debugfs summary. Defaults to the configured module profile when checks run.";
+        description = "Expected profile in debugfs summary. Defaults to the configured `profile` key when checks run.";
       };
       expectedNativeControl = lib.mkOption {
         type = types.nullOr (types.enum ["source_aware" "legacy"]);
@@ -642,14 +491,17 @@ in {
 
     warnings =
       lib.optional
-      (cfg.moduleOptions.tbnetIdentity == "minimal_packet" && effectiveBlacklistThunderboltNet == false)
-      "hardware.thunderbolt-ibverbs: tbnetIdentity=minimal_packet normally requires thunderbolt_net to be absent before module load.";
+      (managed && configuredTbnetIdentity == "minimal_packet" && !cfg.blacklist.enable)
+      "hardware.thunderbolt-ibverbs: config.tbnet_identity=minimal_packet normally requires thunderbolt_net to be absent at boot. Set hardware.thunderbolt-ibverbs.blacklist.enable = true to blacklist it.";
 
     hardware."thunderbolt-ibverbs" = {
       resolvedPackage = thunderboltIbverbsModule;
       reloadHelper = reloadHelper;
       checkHelper = checkHelper;
-      renderedModuleOptions = renderedModuleOptions;
+      renderedModuleOptions =
+        if managed
+        then lib.concatStringsSep " " (lib.filter (s: s != "") [renderedModuleOptions (lib.concatStringsSep " " cfg.extraModuleOptions)])
+        else "";
     };
 
     boot.kernelPackages =
@@ -657,15 +509,15 @@ in {
       (lib.mkOverride cfg.kernel.overridePriority projectKernelPackages);
 
     boot.blacklistedKernelModules =
-      lib.optional effectiveBlacklistThunderboltNet "thunderbolt_net";
+      lib.optional cfg.blacklist.enable "thunderbolt_net";
 
     boot.kernelModules =
       lib.optionals cfg.loadOnBoot (["ib_uverbs"] ++ lib.optional loadStockThunderboltNet "thunderbolt_net" ++ ["thunderbolt_ibverbs"]);
 
     boot.extraModulePackages = [thunderboltIbverbsModule];
 
-    boot.extraModprobeConfig = ''
-      options thunderbolt_ibverbs ${renderedModuleOptions}
+    boot.extraModprobeConfig = lib.mkIf managed ''
+      options thunderbolt_ibverbs ${renderedModuleOptions} ${lib.concatStringsSep " " cfg.extraModuleOptions}
     '';
 
     environment.systemPackages = [
