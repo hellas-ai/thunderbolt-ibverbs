@@ -235,13 +235,7 @@
             rdma-core-usb4 = rdmaCoreUsb4;
             thunderbolt-ibverbs = module;
             thunderbolt-ibverbs-linux-thunderbolt = moduleForThunderboltKernel;
-            tbv-perftest = perftestBench.runners.default;
-            tbv-perftest-smoke = perftestBench.runners.smoke;
-            tbv-perftest-full = perftestBench.runners.full;
-            tbv-perftest-native4rail = perftestBench.runners.native4rail;
-            tbv-perftest-rxe-ethernet = perftestBench.runners.rxeEthernet;
-            tbv-perftest-rxe-tbnet = perftestBench.runners.rxeTbnet;
-            tbv-perftest-read-outs = perftestBench.runners.readOuts;
+            tbv-perftest = perftestBench.runner;
           }
         )
       );
@@ -250,19 +244,12 @@
         pkgs:
         let
           pkgsAt = self.packages.${pkgs.stdenv.hostPlatform.system};
-          mkApp = drv: {
-            type = "app";
-            program = lib.getExe drv;
-          };
         in
         {
-          tbv-perftest = mkApp pkgsAt.tbv-perftest;
-          tbv-perftest-smoke = mkApp pkgsAt.tbv-perftest-smoke;
-          tbv-perftest-full = mkApp pkgsAt.tbv-perftest-full;
-          tbv-perftest-native4rail = mkApp pkgsAt.tbv-perftest-native4rail;
-          tbv-perftest-rxe-ethernet = mkApp pkgsAt.tbv-perftest-rxe-ethernet;
-          tbv-perftest-rxe-tbnet = mkApp pkgsAt.tbv-perftest-rxe-tbnet;
-          tbv-perftest-read-outs = mkApp pkgsAt.tbv-perftest-read-outs;
+          tbv-perftest = {
+            type = "app";
+            program = lib.getExe pkgsAt.tbv-perftest;
+          };
         }
       );
 
