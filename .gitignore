@@ -18,3 +18,9 @@ modules.order
 *.tar.*
 result
 result-*
+
+# Local benchmark raw artifacts. Keep compact CSV/Markdown reports in Git, but
+# leave full telemetry/log captures local unless intentionally curated.
+bench/results/**/*.json
+bench/results/**/*.jsonl
+bench/results/**/logs/

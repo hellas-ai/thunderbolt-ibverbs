@@ -196,11 +196,22 @@
           isLinux = pkgs.stdenv.hostPlatform.isLinux;
           isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
           appleRdmaSdk = mkAppleRdmaSdk pkgs;
+          rdmaCoreUsb4 = mkRdmaCoreUsb4 pkgs;
           packageArgs =
-            lib.optionalAttrs isLinux { rdma-core-usb4 = mkRdmaCoreUsb4 pkgs; }
+            lib.optionalAttrs isLinux { rdma-core-usb4 = rdmaCoreUsb4; }
             // lib.optionalAttrs isDarwin { inherit appleRdmaSdk; };
           perftest = pkgs.callPackage ./nix/perftest.nix packageArgs;
           benchTools = pkgs.callPackage ./nix/bench-tools.nix packageArgs;
+          perftestBench =
+            if isLinux then
+              import ./bench/perftest.nix {
+                inherit lib pkgs perftest;
+                rdma-core-usb4 = rdmaCoreUsb4;
+                runnerSrc = ./userspace/bench/tbv_perftest_runner.py;
+                benchConfig = import ./bench/common.nix { inherit lib; };
+              }
+            else
+              null;
         in
         {
           perftest = perftest;
@@ -221,11 +232,38 @@
             linux-thunderbolt = thunderboltKernel;
             linux-thunderbolt-dev = thunderboltKernel.dev;
             linux-thunderbolt-modules = thunderboltKernel.modules;
-            rdma-core-usb4 = mkRdmaCoreUsb4 pkgs;
+            rdma-core-usb4 = rdmaCoreUsb4;
             thunderbolt-ibverbs = module;
             thunderbolt-ibverbs-linux-thunderbolt = moduleForThunderboltKernel;
+            tbv-perftest = perftestBench.runners.default;
+            tbv-perftest-smoke = perftestBench.runners.smoke;
+            tbv-perftest-full = perftestBench.runners.full;
+            tbv-perftest-native4rail = perftestBench.runners.native4rail;
+            tbv-perftest-rxe-ethernet = perftestBench.runners.rxeEthernet;
+            tbv-perftest-rxe-tbnet = perftestBench.runners.rxeTbnet;
+            tbv-perftest-read-outs = perftestBench.runners.readOuts;
           }
         )
+      );
+
+      apps = forLinuxSystems (
+        pkgs:
+        let
+          pkgsAt = self.packages.${pkgs.stdenv.hostPlatform.system};
+          mkApp = drv: {
+            type = "app";
+            program = lib.getExe drv;
+          };
+        in
+        {
+          tbv-perftest = mkApp pkgsAt.tbv-perftest;
+          tbv-perftest-smoke = mkApp pkgsAt.tbv-perftest-smoke;
+          tbv-perftest-full = mkApp pkgsAt.tbv-perftest-full;
+          tbv-perftest-native4rail = mkApp pkgsAt.tbv-perftest-native4rail;
+          tbv-perftest-rxe-ethernet = mkApp pkgsAt.tbv-perftest-rxe-ethernet;
+          tbv-perftest-rxe-tbnet = mkApp pkgsAt.tbv-perftest-rxe-tbnet;
+          tbv-perftest-read-outs = mkApp pkgsAt.tbv-perftest-read-outs;
+        }
       );
 
       checks = forAllSystems (
