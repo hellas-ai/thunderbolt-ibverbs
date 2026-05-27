@@ -14,35 +14,32 @@ These are also captured at runtime as CSV columns (`kernel`, `module_sha256`,
 
 ```
 strix-2x40-noiommu/
-├── perftest.md               this file
-├── tbverbs/                  native thunderbolt_ibverbs backend
-│   ├── strix-2x40g-noiommu.csv -> result/strix-2x40g-noiommu.csv
-│   └── result/               (gitignored; populated by `nix run`)
-├── rxe_eth/                  RXE over br0.lan
-│   ├── strix-2x40g-noiommu.csv -> result/strix-2x40g-noiommu.csv
-│   └── result/               (gitignored)
-└── rxe_tbnet/                RXE over thunderbolt_net (requires module swap)
-    ├── strix-2x40g-noiommu.csv -> result/strix-2x40g-noiommu.csv
-    └── result/               (gitignored)
+├── perftest.md                            this file
+├── perftest-tbverbs.csv      -> result/   native thunderbolt_ibverbs
+├── perftest-rxe_eth.csv      -> result/   RXE over br0.lan
+├── perftest-rxe_tbnet.csv    -> result/   RXE over thunderbolt_net
+└── result/                                (gitignored; populated by `nix run`)
 ```
 
 CSV symlinks dangle on a fresh clone — they resolve once a sweep writes the
-named CSV into `result/` per the recreate commands.
+named CSV into `result/` per the recreate commands. Future suites (e.g.
+`jaccl.md` + `jaccl-<transport>.csv` siblings) plug into the same topology
+without changing the directory shape.
 
 ## Recreate
 
 ### tbverbs (native four-rail)
 
 ```sh
-out=bench/results/perftest/strix-2x40-noiommu/tbverbs/result
+out=bench/results/strix-2x40-noiommu/result
 mkdir -p "$out"
 nix run .#tbv-perftest -- \
   --hosts strix-1,strix-2 \
   --expect-rails 4 --expect-speed 20Gb/s \
   --base-port 19000 \
-  --tag strix-2x40g-noiommu \
-  --csv "$out/strix-2x40g-noiommu.csv" \
-  --jsonl "$out/strix-2x40g-noiommu.jsonl"
+  --tag perftest-tbverbs \
+  --csv "$out/perftest-tbverbs.csv" \
+  --jsonl "$out/perftest-tbverbs.jsonl"
 ```
 
 ### rxe_eth (RXE over br0.lan)
@@ -51,16 +48,16 @@ nix run .#tbv-perftest -- \
 ssh root@strix-1 'modprobe rdma_rxe; rdma link del rxe_eth0 2>/dev/null; rdma link add rxe_eth0 type rxe netdev br0.lan'
 ssh root@strix-2 'modprobe rdma_rxe; rdma link del rxe_eth0 2>/dev/null; rdma link add rxe_eth0 type rxe netdev br0.lan'
 
-out=bench/results/perftest/strix-2x40-noiommu/rxe_eth/result
+out=bench/results/strix-2x40-noiommu/result
 mkdir -p "$out"
 nix run .#tbv-perftest -- \
   --hosts strix-1,strix-2 \
   --dev rxe_eth0 --backend '' \
   --no-rail-check \
   --base-port 19100 \
-  --tag strix-2x40g-noiommu \
-  --csv "$out/strix-2x40g-noiommu.csv" \
-  --jsonl "$out/strix-2x40g-noiommu.jsonl"
+  --tag perftest-rxe_eth \
+  --csv "$out/perftest-rxe_eth.csv" \
+  --jsonl "$out/perftest-rxe_eth.jsonl"
 ```
 
 ### rxe_tbnet (RXE over thunderbolt_net)
@@ -80,16 +77,16 @@ for h in strix-1 strix-2; do
   ssh root@$h 'rdma link add rxe_tb0 type rxe netdev thunderbolt0; rdma link add rxe_tb1 type rxe netdev thunderbolt1'
 done
 
-out=bench/results/perftest/strix-2x40-noiommu/rxe_tbnet/result
+out=bench/results/strix-2x40-noiommu/result
 mkdir -p "$out"
 nix run .#tbv-perftest -- \
   --hosts strix-1,strix-2 \
   --dev rxe_tb0 --backend '' \
   --no-rail-check \
   --base-port 19200 \
-  --tag strix-2x40g-noiommu \
-  --csv "$out/strix-2x40g-noiommu.csv" \
-  --jsonl "$out/strix-2x40g-noiommu.jsonl"
+  --tag perftest-rxe_tbnet \
+  --csv "$out/perftest-rxe_tbnet.csv" \
+  --jsonl "$out/perftest-rxe_tbnet.jsonl"
 ```
 
 ## Headline (2026-05-27 capture)
@@ -100,8 +97,8 @@ nix run .#tbv-perftest -- \
 - **rxe_eth**: 246 rows, 245 ok. Documented fail: `odd.ud.ib_send_bw.*`
   (timed out at 90 s on RXE here too).
 - **rxe_tbnet**: not captured — `thunderbolt_net` data plane failed to come
-  up between the two hosts during the most recent attempt at the module
-  swap. Slot reserved.
+  up between the two hosts during the most recent module-swap attempt. Slot
+  reserved.
 
 ### Bandwidth peaks (Gb/s)
 
@@ -124,5 +121,5 @@ nix run .#tbv-perftest -- \
 After recreating any backend locally, the committed symlink resolves and:
 
 ```sh
-python3 bench/summarize_perftest.py bench/results/perftest/strix-2x40-noiommu/*/strix-2x40g-noiommu.csv
+python3 bench/summarize_perftest.py bench/results/strix-2x40-noiommu/perftest-*.csv
 ```
