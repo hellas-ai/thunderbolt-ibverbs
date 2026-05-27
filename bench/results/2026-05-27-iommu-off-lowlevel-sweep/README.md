@@ -112,9 +112,26 @@ Headline results:
 
 The same boot window was used for short MiniMax M2.7 AWQ TP=2 generation
 checks through `nix-strix-halo`. These application logs are not checked in
-here, but the aggregate numbers are useful context. This small `64 in / 16
-out` generation shape is not a strong transport discriminator once vLLM can
-batch enough concurrent sequences.
+here, but the aggregate numbers are useful context.
+
+The `64 in / 128 out` screen used matched vLLM shapes while varying
+`--max-num-seqs`. Here, `n` is the total `--num-prompts`, while max seqs is
+the scheduler's active sequence cap. RDMA leads most clearly at low active
+sequence counts and the advantage narrows as vLLM batches more work:
+
+| transport | shape | n | max seqs | output tok/s | total tok/s | req/s | vs TB-net |
+|---|---|---:|---:|---:|---:|---:|---:|
+| TB-net Socket over thunderbolt0 | random 64 in / 128 out | 16 | 1 | 9.92 | 14.88 | 0.078 | baseline |
+| native RDMA, 4 HCA, QPS=2 split=1 | random 64 in / 128 out | 16 | 1 | 12.90 | 19.35 | 0.101 | +30.0% |
+| TB-net Socket over thunderbolt0 | random 64 in / 128 out | 16 | 2 | 14.41 | 21.62 | 0.113 | baseline |
+| native RDMA, 4 HCA, QPS=2 split=1 | random 64 in / 128 out | 16 | 2 | 17.22 | 25.82 | 0.134 | +19.5% |
+| TB-net Socket over thunderbolt0 | random 64 in / 128 out | 16 | 4 | 21.27 | 31.90 | 0.166 | baseline |
+| native RDMA, 4 HCA, QPS=2 split=1 | random 64 in / 128 out | 16 | 4 | 23.73 | 35.60 | 0.185 | +11.6% |
+| TB-net Socket over thunderbolt0 | random 64 in / 128 out | 32 | 8 | 31.05 | 46.57 | 0.243 | baseline |
+| native RDMA, 4 HCA, QPS=2 split=1 | random 64 in / 128 out | 32 | 8 | 32.75 | 49.13 | 0.256 | +5.5% |
+
+This explains why the high-concurrency `64 in / 16 out` shape below looks
+close: vLLM has enough active sequences to amortize transport overhead.
 
 | transport | shape | max seqs | output tok/s | total tok/s | req/s |
 |---|---|---:|---:|---:|---:|
