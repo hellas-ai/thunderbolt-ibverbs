@@ -9,7 +9,6 @@ snapshots before and after each case.
 from __future__ import annotations
 
 import argparse
-import base64
 import csv
 import datetime as dt
 import fnmatch
@@ -332,31 +331,19 @@ def format_identity(label: str, identity: dict[str, str]) -> str:
     )
 
 
-def collect_debugfs(host: str) -> dict[str, str]:
-    cmd = (
-        "find /sys/kernel/debug -type f 2>/dev/null | while read -r f; do "
-        "printf '%s\\t' \"$f\"; "
-        "timeout 1 cat -- \"$f\" 2>/dev/null | base64 -w0; "
-        "printf '\\n'; "
-        "done"
-    )
-    out = run_ssh(host, cmd, check=False, timeout=120).stdout
-    result: dict[str, str] = {}
-    for line in out.splitlines():
-        path, sep, b64 = line.partition("\t")
-        if not sep:
-            continue
-        try:
-            result[path] = base64.b64decode(b64).decode("utf-8", errors="replace")
-        except Exception:
-            result[path] = ""
-    return result
-
-
 def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | None) -> dict[str, Any]:
-    debugfs = collect_debugfs(host)
-    summary = debugfs.get("/sys/kernel/debug/thunderbolt_ibverbs/summary", "")
-    peers = debugfs.get("/sys/kernel/debug/thunderbolt_ibverbs/peers", "")
+    summary = run_ssh(
+        host,
+        "cat /sys/kernel/debug/thunderbolt_ibverbs/summary 2>/dev/null || true",
+        check=False,
+        timeout=10,
+    ).stdout
+    peers = run_ssh(
+        host,
+        "cat /sys/kernel/debug/thunderbolt_ibverbs/peers 2>/dev/null || true",
+        check=False,
+        timeout=10,
+    ).stdout
     rdma_link = run_ssh(host, "rdma link show 2>&1 || true", check=False, timeout=10).stdout
     devinfo = run_ssh(
         host,
@@ -384,7 +371,6 @@ def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | No
         "devinfo": devinfo,
         "params": params,
         "ip_stats": ip_stats,
-        "debugfs": debugfs,
     }
 
 
