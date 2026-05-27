@@ -1,15 +1,29 @@
 # Benchmarks
 
-This directory contains the reproducible benchmark plan and compact historical
-results for the Thunderbolt/USB4 RDMA transport.
+## How it works
 
-The Nix flake exposes a single perftest runner (`tbv-perftest`) that copies the
-matching `rdma-core-usb4` and `perftest` builds to both hosts, runs the matrix
-over SSH, and writes two outputs:
+Each suite (currently just `perftest`) is a Nix-defined case list — for
+`tbv-perftest` see `perftest.nix`. `nix run .#tbv-perftest` copies the matching
+`rdma-core-usb4` and `perftest` builds to both hosts, runs every case over SSH,
+and writes a `--csv` summary plus a `--jsonl` per-case telemetry log. Run-time
+state (kernel, loaded module sha256, IOMMU setting, rail counts) is captured
+into the CSV row and a startup banner so a stray file is self-describing.
 
-- `*.csv`: compact metrics suitable for checking into Git.
-- `*.jsonl`: full raw per-case logs and telemetry snapshots; useful locally,
-  but intentionally not checked in.
+## How results are stored
+
+```
+bench/results/<topology>/                e.g. strix-2x40-noiommu/
+├── <suite>.md                           perftest.md — committed report
+├── <suite>-<transport>.csv → result/…   committed symlink, dangling on a fresh clone
+└── result/                              gitignored; populated by the recreate command
+```
+
+Dir name asserts the topology (hosts × link rate × kernel flags). CSVs are
+named `<suite>-<transport>` (e.g. `perftest-tbverbs.csv`, `perftest-rxe_eth.csv`)
+and live as symlinks pointing into a sibling `result/` that's not checked in.
+The `.md` next to them holds the recreate commands and headline numbers from
+the last capture. Future suites (`jaccl.md` + `jaccl-<transport>.csv`) slot in
+as siblings without changing the shape.
 
 The plan is built in `perftest.nix` as five blocks of cases, each prefixed by
 kind so `--only` patterns can target a slice cleanly:
