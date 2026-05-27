@@ -713,6 +713,7 @@ def main() -> int:
     parser.add_argument("--backend")
     parser.add_argument("--netdev")
     parser.add_argument("--expect-rails", type=int)
+    parser.add_argument("--no-rail-check", action="store_true", help="skip the ready-rails / rail-speed topology check (e.g. RXE runs)")
     parser.add_argument("--expect-speed")
     parser.add_argument("--timeout", type=int)
     parser.add_argument("--base-port", type=int)
@@ -748,8 +749,12 @@ def main() -> int:
     gid_index = args.gid_index if args.gid_index is not None else int(defaults["gidIndex"])
     backend = args.backend if args.backend is not None else defaults.get("backend")
     netdev = args.netdev or defaults.get("netdev")
-    expect_rails = args.expect_rails if args.expect_rails is not None else defaults.get("expectRails")
-    expect_speed = args.expect_speed if args.expect_speed is not None else defaults.get("expectSpeed")
+    if args.no_rail_check:
+        expect_rails = None
+        expect_speed = None
+    else:
+        expect_rails = args.expect_rails if args.expect_rails is not None else defaults.get("expectRails")
+        expect_speed = args.expect_speed if args.expect_speed is not None else defaults.get("expectSpeed")
     timeout = args.timeout or int(defaults["timeout"])
     base_port = args.base_port or int(defaults["basePort"])
     directions = args.directions or defaults.get("directions", "from-plan")

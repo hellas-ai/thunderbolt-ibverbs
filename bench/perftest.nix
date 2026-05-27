@@ -115,8 +115,9 @@ let
   oddCases = [
     # Verb path: WQE / MR / SRQ posting variants.
     (mkBwOdd  { tag = "inline256";   bin = "ib_write_bw"; size = 256;   opts = { inline_size = 256; }; })
-    (mkBwOdd  { tag = "postlist64";  bin = "ib_write_bw"; size = 4096;  opts = { post_list = 64; }; })
-    (mkBwOdd  { tag = "postlist64";  bin = "ib_send_bw";  size = 4096;  opts = { post_list = 64; recv_post_list = 64; }; })
+    # post_list requires iters % post_list == 0, so override the default 1000.
+    (mkBwOdd  { tag = "postlist64";  bin = "ib_write_bw"; size = 4096;  opts = { iters = 1024; post_list = 64; }; })
+    (mkBwOdd  { tag = "postlist64";  bin = "ib_send_bw";  size = 4096;  opts = { iters = 1024; post_list = 64; recv_post_list = 64; }; })
     (mkBwOdd  { tag = "mrperqp";     bin = "ib_write_bw"; size = 65536; qp = 4; opts = { mr_per_qp = true; }; })
     (mkBwOdd  { tag = "srq";         bin = "ib_send_bw";  size = 4096;  qp = 4; opts = { "use-srq" = true; }; })
     (mkBwOdd  { tag = "oldpostsend"; bin = "ib_write_bw"; size = 4096;  opts = { use_old_post_send = true; }; })
