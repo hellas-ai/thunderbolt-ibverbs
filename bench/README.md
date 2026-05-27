@@ -12,18 +12,27 @@ into the CSV row and a startup banner so a stray file is self-describing.
 ## How results are stored
 
 ```
-bench/results/<topology>/                e.g. strix-2x40-noiommu/
-├── <suite>.md                           perftest.md — committed report
-├── <suite>-<transport>.csv → result/…   committed symlink, dangling on a fresh clone
-└── result/                              gitignored; populated by the recreate command
+bench/results/<hw-profile>/                e.g. strix-2p-noiommu-2x40g/
+├── <suite>.md                             perftest.md — committed report
+├── <suite>-<transport>.csv → result/…     committed symlink, dangling on a fresh clone
+└── result/                                gitignored; populated by the recreate command
 ```
 
-Dir name asserts the topology (hosts × link rate × kernel flags). CSVs are
-named `<suite>-<transport>` (e.g. `perftest-tbverbs.csv`, `perftest-rxe_eth.csv`)
-and live as symlinks pointing into a sibling `result/` that's not checked in.
-The `.md` next to them holds the recreate commands and headline numbers from
-the last capture. Future suites (`jaccl.md` + `jaccl-<transport>.csv`) slot in
-as siblings without changing the shape.
+The hw-profile dir name asserts the topology — endpoints, their kernel/iommu
+flags, and the link spec. Two shapes:
+
+- **Symmetric**: `<endpoint>-Np-<asserts>-<link>` when both sides are the same,
+  e.g. `strix-2p-noiommu-2x40g` (two strix peers, both iommu=off, 2×40g cables).
+- **Asymmetric**: `<endpoint>-<asserts>-<endpoint>-<asserts>-<link>` when sides
+  differ, e.g. `strix-noiommu-mbp-1x40g` (one strix iommu=off, one mac, 1×40g
+  cable). The CSV filename grows a per-side disambiguator when needed, like
+  `perftest-tbverbs-strix1.csv` and `perftest-tbverbs-strix2.csv`.
+
+CSVs live as symlinks pointing into a sibling `result/` that's not checked in.
+The `.md` holds recreate commands and headline numbers from the last capture.
+Future suites (`jaccl.md` + `jaccl-<transport>.csv`) slot in as siblings without
+changing the shape. The runner also writes `kernel` / `module_sha256` / `iommu`
+columns into every row, so a stray CSV self-describes even if the dir name lies.
 
 The plan is built in `perftest.nix` as five blocks of cases, each prefixed by
 kind so `--only` patterns can target a slice cleanly:

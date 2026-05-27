@@ -1,11 +1,11 @@
-# perftest — `strix-2x40-noiommu`
+# perftest — `strix-2p-noiommu-2x40g`
 
 Topology assertion in the dir name:
 
-- **strix**: two Strix Halo hosts, paired strix-1 ↔ strix-2.
-- **2x40**: two Thunderbolt/USB4 cables, each negotiating 2 lanes at 20 Gb/s
-  (40 Gb/s aggregate per cable, 4 native `usb4_rdma` rails total).
+- **strix-2p**: two Strix Halo hosts (2 peers), paired strix-1 ↔ strix-2.
 - **noiommu**: both hosts booted with `iommu=off` in the kernel cmdline.
+- **2x40g**: two Thunderbolt/USB4 cables, each negotiating 2 lanes at
+  20 Gb/s (40 Gb/s aggregate per cable, 4 native `usb4_rdma` rails total).
 
 These are also captured at runtime as CSV columns (`kernel`, `module_sha256`,
 `iommu`) on every row, so deviations are visible without trusting the dir name.
@@ -13,7 +13,7 @@ These are also captured at runtime as CSV columns (`kernel`, `module_sha256`,
 ## Layout
 
 ```
-strix-2x40-noiommu/
+strix-2p-noiommu-2x40g/
 ├── perftest.md                            this file
 ├── perftest-tbverbs.csv      -> result/   native thunderbolt_ibverbs
 ├── perftest-rxe_eth.csv      -> result/   RXE over br0.lan
@@ -31,7 +31,7 @@ without changing the directory shape.
 ### tbverbs (native four-rail)
 
 ```sh
-out=bench/results/strix-2x40-noiommu/result
+out=bench/results/strix-2p-noiommu-2x40g/result
 mkdir -p "$out"
 nix run .#tbv-perftest -- \
   --hosts strix-1,strix-2 \
@@ -48,7 +48,7 @@ nix run .#tbv-perftest -- \
 ssh root@strix-1 'modprobe rdma_rxe; rdma link del rxe_eth0 2>/dev/null; rdma link add rxe_eth0 type rxe netdev br0.lan'
 ssh root@strix-2 'modprobe rdma_rxe; rdma link del rxe_eth0 2>/dev/null; rdma link add rxe_eth0 type rxe netdev br0.lan'
 
-out=bench/results/strix-2x40-noiommu/result
+out=bench/results/strix-2p-noiommu-2x40g/result
 mkdir -p "$out"
 nix run .#tbv-perftest -- \
   --hosts strix-1,strix-2 \
@@ -77,7 +77,7 @@ for h in strix-1 strix-2; do
   ssh root@$h 'rdma link add rxe_tb0 type rxe netdev thunderbolt0; rdma link add rxe_tb1 type rxe netdev thunderbolt1'
 done
 
-out=bench/results/strix-2x40-noiommu/result
+out=bench/results/strix-2p-noiommu-2x40g/result
 mkdir -p "$out"
 nix run .#tbv-perftest -- \
   --hosts strix-1,strix-2 \
@@ -121,5 +121,5 @@ nix run .#tbv-perftest -- \
 After recreating any backend locally, the committed symlink resolves and:
 
 ```sh
-python3 bench/summarize_perftest.py bench/results/strix-2x40-noiommu/perftest-*.csv
+python3 bench/summarize_perftest.py bench/results/strix-2p-noiommu-2x40g/perftest-*.csv
 ```
