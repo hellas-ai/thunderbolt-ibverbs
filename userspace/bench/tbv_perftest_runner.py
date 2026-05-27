@@ -9,6 +9,7 @@ snapshots before and after each case.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import datetime as dt
 import fnmatch
@@ -126,6 +127,9 @@ CSV_FIELDS = [
     "kind",
     "server",
     "client",
+    "kernel",
+    "module_srcversion",
+    "iommu",
     "direction",
     "dev",
     "gid_index",
@@ -287,19 +291,68 @@ def collect_params(host: str) -> str:
     return run_ssh(host, cmd, check=False, timeout=10).stdout
 
 
+def parse_iommu_setting(cmdline: str) -> str:
+    matches = re.findall(r"\b(?:intel_iommu|amd_iommu|iommu)=(\S+)", cmdline)
+    if not matches:
+        return "default"
+    for preferred in ("off", "pt", "on"):
+        if preferred in matches:
+            return preferred
+    return ",".join(matches)
+
+
+def collect_host_identity(host: str) -> dict[str, str]:
+    cmd = (
+        "echo kernel=$(uname -r); "
+        "echo srcversion=$(cat /sys/module/thunderbolt_ibverbs/srcversion 2>/dev/null); "
+        "echo taint=$(cat /sys/module/thunderbolt_ibverbs/taint 2>/dev/null); "
+        "echo cmdline=$(tr -d '\\n' < /proc/cmdline 2>/dev/null)"
+    )
+    out = run_ssh(host, cmd, check=False, timeout=10).stdout
+    fields: dict[str, str] = {}
+    for line in out.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            fields[key.strip()] = value.strip()
+    fields["iommu"] = parse_iommu_setting(fields.get("cmdline", ""))
+    return fields
+
+
+def format_identity(label: str, identity: dict[str, str]) -> str:
+    return (
+        f"tbv-perftest: {label} "
+        f"kernel={identity.get('kernel', '?')} "
+        f"srcversion={identity.get('srcversion') or 'not-loaded'} "
+        f"taint={identity.get('taint') or '-'} "
+        f"iommu={identity['iommu']}"
+    )
+
+
+def collect_debugfs(host: str) -> dict[str, str]:
+    cmd = (
+        "find /sys/kernel/debug -type f 2>/dev/null | while read -r f; do "
+        "printf '%s\\t' \"$f\"; "
+        "timeout 1 cat -- \"$f\" 2>/dev/null | base64 -w0; "
+        "printf '\\n'; "
+        "done"
+    )
+    out = run_ssh(host, cmd, check=False, timeout=120).stdout
+    result: dict[str, str] = {}
+    for line in out.splitlines():
+        path, sep, b64 = line.partition("\t")
+        if not sep:
+            continue
+        try:
+            result[path] = base64.b64decode(b64).decode("utf-8", errors="replace")
+        except Exception:
+            result[path] = ""
+    return result
+
+
 def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | None) -> dict[str, Any]:
-    summary = run_ssh(
-        host,
-        "cat /sys/kernel/debug/thunderbolt_ibverbs/summary 2>/dev/null || true",
-        check=False,
-        timeout=10,
-    ).stdout
-    peers = run_ssh(
-        host,
-        "cat /sys/kernel/debug/thunderbolt_ibverbs/peers 2>/dev/null || true",
-        check=False,
-        timeout=10,
-    ).stdout
+    debugfs = collect_debugfs(host)
+    summary = debugfs.get("/sys/kernel/debug/thunderbolt_ibverbs/summary", "")
+    peers = debugfs.get("/sys/kernel/debug/thunderbolt_ibverbs/peers", "")
     rdma_link = run_ssh(host, "rdma link show 2>&1 || true", check=False, timeout=10).stdout
     devinfo = run_ssh(
         host,
@@ -327,6 +380,7 @@ def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | No
         "devinfo": devinfo,
         "params": params,
         "ip_stats": ip_stats,
+        "debugfs": debugfs,
     }
 
 
@@ -747,6 +801,18 @@ def main() -> int:
     failures = 0
     run_index = 0
     try:
+        identity_server = collect_host_identity(server_host)
+        identity_client = collect_host_identity(client_host)
+        print(format_identity(server, identity_server), flush=True)
+        print(format_identity(client, identity_client), flush=True)
+        for field in ("kernel", "srcversion", "iommu"):
+            if identity_server.get(field) != identity_client.get(field):
+                print(
+                    f"tbv-perftest: WARNING: server/client {field} mismatch",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
         initial_server = collect_telemetry(server_host, dev, backend, netdev)
         initial_client = collect_telemetry(client_host, dev, backend, netdev)
         assert_topology(server, initial_server, expect_rails, expect_speed)
@@ -794,6 +860,9 @@ def main() -> int:
                             "kind": perftest_kind(case),
                             "server": run_server,
                             "client": run_client,
+                            "kernel": identity_server.get("kernel", ""),
+                            "module_srcversion": identity_server.get("srcversion", ""),
+                            "iommu": identity_server.get("iommu", ""),
                             "direction": direction_name,
                             "dev": dev,
                             "gid_index": str(gid_index),
@@ -882,6 +951,10 @@ def main() -> int:
                             "row": row,
                             "case": case,
                             "raw": raw,
+                            "host_identity": {
+                                "server": identity_server,
+                                "client": identity_client,
+                            },
                             "telemetry": {
                                 "before_server": before_server,
                                 "before_client": before_client,
