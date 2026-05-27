@@ -112,12 +112,18 @@ Headline results:
 
 The same boot window was used for short MiniMax M2.7 AWQ TP=2 generation
 checks through `nix-strix-halo`. These application logs are not checked in
-here, but the aggregate numbers are useful context:
+here, but the aggregate numbers are useful context. This small `64 in / 16
+out` generation shape is not a strong transport discriminator once vLLM can
+batch enough concurrent sequences.
 
-| transport | shape | output tok/s | total tok/s | req/s |
-|---|---|---:|---:|---:|
-| native RDMA, 4 HCA, QPS=2 split=1 | random 64 in / 16 out, n=128 | 68.81 | 344.04 | 4.30 |
-| TB-net Socket over thunderbolt0 | random 64 in / 16 out, n=128 | 64.03 | 320.13 | 4.00 |
+| transport | shape | max seqs | output tok/s | total tok/s | req/s |
+|---|---|---:|---:|---:|---:|
+| native RDMA, 4 HCA | random 64 in / 16 out, n=16 | 16 | 29.37 | 146.86 | 1.84 |
+| TB-net Socket over thunderbolt0 | random 64 in / 16 out, n=16 | 64 | 30.87 | 154.34 | 1.93 |
+| native RDMA, 4 HCA | random 64 in / 16 out, n=64 | 64 | 68.03 | 340.16 | 4.25 |
+| TB-net Socket over thunderbolt0 | random 64 in / 16 out, n=64 | 64 | 62.42 | 312.11 | 3.90 |
+| native RDMA, 4 HCA, QPS=2 split=1 | random 64 in / 16 out, n=128 | 64 | 68.81 | 344.04 | 4.30 |
+| TB-net Socket over thunderbolt0 | random 64 in / 16 out, n=128 | 64 | 64.03 | 320.13 | 4.00 |
 
-The TB-net run confirmed `NCCL_NET=Socket`, `NCCL_IB_DISABLE=1`, and NCCL
+The TB-net runs confirmed `NCCL_NET=Socket`, `NCCL_IB_DISABLE=1`, and NCCL
 channels using `NET/Socket/0` over `thunderbolt0`.
