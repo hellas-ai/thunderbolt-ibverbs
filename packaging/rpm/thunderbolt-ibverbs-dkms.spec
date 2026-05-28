@@ -51,5 +51,10 @@ fi
 /usr/src/%{modname}-%{version}/*
 
 %changelog
+* Thu May 28 2026 George Whewell <george@hellas.ai> - 0.2.0-1
+- v0.2.0: aarch64-darwin perftest and bench-tools, IOMMU-off transport
+  sweep results, Mac↔Linux UC SEND harness, additional kernel and
+  userspace fixes since 0.1.0.
+
 * Tue May 26 2026 George Whewell <george@hellas.ai> - 0.1.0-1
 - Initial DKMS source package.
