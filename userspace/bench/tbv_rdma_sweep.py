@@ -79,7 +79,7 @@ def ssh_args(target: str, command: str) -> list[str]:
         "-o",
         "BatchMode=yes",
         target,
-        "bash -lc " + shlex.quote(command),
+        "sudo -n bash -lc " + shlex.quote(command),
     ]
 
 
@@ -251,7 +251,7 @@ def perftest_command(bin_name: str, args: argparse.Namespace, size: int, iters: 
 
 def run_pair(bin_name: str, parser, args: argparse.Namespace, server_host: str, client_host: str, size: int, iters: int, qps: int, port: int) -> tuple[str, dict[str, str], str]:
     server_cmd = perftest_command(bin_name, args, size, iters, qps, port, None)
-    client_cmd = perftest_command(bin_name, args, size, iters, qps, port, server_host.split("@", 1)[-1])
+    client_cmd = perftest_command(bin_name, args, size, iters, qps, port, server_host)
 
     server_proc = subprocess.Popen(
         ssh_args(server_host, server_cmd),

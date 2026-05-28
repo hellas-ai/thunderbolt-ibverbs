@@ -183,11 +183,6 @@ RDMA_CORE = require_env("TBV_RDMA_CORE")
 PERFTEST = require_env("TBV_PERFTEST")
 
 
-def split_host(target: str) -> str:
-    """Strip any `user@` prefix and return just the host part."""
-    return target.split("@", 1)[1] if "@" in target else target
-
-
 def ssh_args(target: str, command: str) -> list[str]:
     return [
         "ssh",
@@ -196,7 +191,7 @@ def ssh_args(target: str, command: str) -> list[str]:
         "-o",
         "BatchMode=yes",
         target,
-        "bash -lc " + shlex.quote(command),
+        "sudo -n bash -lc " + shlex.quote(command),
     ]
 
 
@@ -584,7 +579,7 @@ def run_pair(
         port=port,
         timeout=timeout,
         remote_json=client_json,
-        peer=split_host(server),
+        peer=server,
     )
 
     server_proc = subprocess.Popen(
@@ -765,10 +760,10 @@ def main() -> int:
     no_copy_hosts = set(args.no_copy)
 
     def perftest_for(target: str) -> str:
-        return host_perftest_overrides.get(split_host(target), PERFTEST)
+        return host_perftest_overrides.get(target, PERFTEST)
 
     def rdma_core_for(target: str) -> str:
-        return host_rdma_core_overrides.get(split_host(target), RDMA_CORE)
+        return host_rdma_core_overrides.get(target, RDMA_CORE)
 
     dev = args.dev or defaults["dev"]
     gid_index = args.gid_index if args.gid_index is not None else int(defaults["gidIndex"])
@@ -800,7 +795,7 @@ def main() -> int:
 
     if copy and not args.dry_run:
         for host in sorted({server, client}):
-            if split_host(host) in no_copy_hosts:
+            if host in no_copy_hosts:
                 continue
             paths = [p for p in [rdma_core_for(host), perftest_for(host)] if p]
             copy_tools(host, paths)

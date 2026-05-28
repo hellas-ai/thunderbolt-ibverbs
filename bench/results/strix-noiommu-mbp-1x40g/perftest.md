@@ -82,8 +82,10 @@ Notes:
   strix-strix native four-rail expectation; one cable yields 2 rails to the
   mac. Tighten with `--expect-rails 2 --expect-speed 20Gb/s` once we know
   what the apple-compatible backend reports here.
-- Hostnames are passed through to ssh as-is; use `user@host` if your strix
-  or mac account isn't ssh's default. Resolution is via your normal DNS.
+- Hostnames are passed through to ssh as-is; resolution is via your normal
+  DNS, login is whatever your ssh config does. The runner prepends
+  `sudo -n` on the remote shell, so the account needs passwordless sudo for
+  the operations that touch debugfs, /dev/infiniband/*, and the like.
 
 ## Headline
 
