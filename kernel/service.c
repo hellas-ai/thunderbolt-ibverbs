@@ -26,10 +26,15 @@ static const char tbv_apple_ca_key[TB_PROPERTY_KEY_SIZE + 1] = {
 	(char)0xff, (char)0xff, 'C', 'A', '\0',
 };
 
-static const char tbv_apple_protocol_key[TB_PROPERTY_KEY_SIZE + 1] = {
-	(char)0xff, (char)0xff, (char)0xff, (char)0xff,
-	(char)0xff, (char)0xff, 'A', 'D', '\0',
-};
+/*
+ * Apple's AppleThunderboltRDMA.kext matches inbound services on
+ * { Protocol ID = 64087 (0xFA57), Protocol Version = 1 } and does not
+ * require a specific Service Key. But Apple's own RDMA services advertise
+ * themselves under the property key "rdma" (per TN3205, April 2026) — so
+ * use that key so macOS userspace tools (system_profiler, ioreg) report
+ * the peer correctly instead of "Service: Unknown".
+ */
+static const char tbv_apple_protocol_key[] = "rdma";
 
 static struct tbv_state *tbv_service_state;
 
