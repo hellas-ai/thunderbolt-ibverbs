@@ -19,6 +19,7 @@ let
     "rc_write_verify"
     "u4_pingpong"
     "uc_oneway"
+    "uc_write_verify"
   ];
 
   # Full Linux set. ibv_trace (LD_PRELOAD tracer, built as .so) and

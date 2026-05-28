@@ -168,7 +168,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	o->ib_port = 1;
 	o->depth = 64;
 	o->count = 1000;
-	o->mtu = 4096;
+	o->mtu = 1024;
 	o->recv_wr_id_base = -1;
 	o->send_wr_id_base = -1;
 	o->size = 4096;
@@ -388,7 +388,8 @@ static int qp_to_rts(struct ibv_qp *qp, int port, int sgid_index,
 	a.qp_state = IBV_QPS_INIT;
 	a.pkey_index = 0;
 	a.port_num = (uint8_t)port;
-	a.qp_access_flags = 0;
+	a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE |
+			    IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
 	errno = 0;
 	ret = ibv_modify_qp(qp, &a, IBV_QP_STATE | IBV_QP_PKEY_INDEX |
 			    IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
@@ -408,10 +409,15 @@ static int qp_to_rts(struct ibv_qp *qp, int port, int sgid_index,
 	a.ah_attr.sl = 0;
 	a.ah_attr.src_path_bits = 0;
 	a.ah_attr.port_num = (uint8_t)port;
-	a.ah_attr.is_global = 1;
-	a.ah_attr.grh.dgid = *dgid;
-	a.ah_attr.grh.sgid_index = sgid_index;
-	a.ah_attr.grh.hop_limit = 1;
+	/* Match JACCL: only enable global routing when the dgid has a non-zero
+	 * interface_id (i.e. it's a real GID, not the zero default). */
+	a.ah_attr.is_global = 0;
+	if (dgid->global.interface_id) {
+		a.ah_attr.is_global = 1;
+		a.ah_attr.grh.dgid = *dgid;
+		a.ah_attr.grh.sgid_index = sgid_index;
+		a.ah_attr.grh.hop_limit = 1;
+	}
 	errno = 0;
 	ret = ibv_modify_qp(qp, &a, IBV_QP_STATE | IBV_QP_AV |
 			    IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
@@ -642,7 +648,8 @@ int main(int argc, char **argv)
 	send_buf = buf;
 	recv_buf = is_bidi ? buf + send_region_size : buf;
 	debug_step("register mr");
-	mr = ibv_reg_mr(pd, buf, bufsz, IBV_ACCESS_LOCAL_WRITE);
+	mr = ibv_reg_mr(pd, buf, bufsz, IBV_ACCESS_LOCAL_WRITE |
+				IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
 	if (!mr) {
 		perror("ibv_reg_mr");
 		goto out_buf;
@@ -676,7 +683,8 @@ int main(int argc, char **argv)
 		qpia.cap.max_send_sge, qpia.cap.max_recv_sge);
 	fflush(stderr);
 
-	psn = (uint32_t)(now_ns() ^ (uint64_t)getpid()) & 0xffffffu;
+	/* Match JACCL's fixed initial PSN to rule it out as a delivery factor. */
+	psn = 7;
 	memset(&local, 0, sizeof(local));
 	local.magic = 0x55433157u; /* UC1W */
 	local.qpn = qp->qp_num;

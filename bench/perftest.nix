@@ -20,8 +20,16 @@ let
   readOuts = [ 1 2 4 8 16 32 64 128 ];
   bothDirections = [ "forward" "reverse" ];
 
+  # Full RC bin set. Used by strix↔strix native runs. RDMA READ is RC-only
+  # by InfiniBand spec, so it never appears in the UC bin lists below.
   bwBins = [ "ib_write_bw" "ib_read_bw" "ib_send_bw" ];
   latBins = [ "ib_write_lat" "ib_read_lat" "ib_send_lat" ];
+
+  # UC bin set, for Apple-compatible runs (macOS Thunderbolt RDMA is UC-only;
+  # `Connection_type: RC` errors on QP modify against rdma_en* devices). No
+  # ib_read_* because UC has no RDMA READ.
+  bwBinsUc = [ "ib_write_bw" "ib_send_bw" ];
+  latBinsUc = [ "ib_write_lat" "ib_send_lat" ];
 
   bwIters = size:
     if size >= 1048576 then 300
@@ -37,18 +45,16 @@ let
   sendRxDepthOpt = bin:
     optionalAttrs (hasPrefix "ib_send_" bin) { "rx-depth" = 512; };
 
-  bwOpts = { bin, size, qp }: {
-    connection = "RC";
+  bwOpts = { bin, size, qp, connection ? "RC" }: {
+    inherit connection qp size;
     iters = bwIters size;
-    inherit qp size;
     "tx-depth" = bwTxDepth size;
   } // sendRxDepthOpt bin;
 
-  latOpts = { bin, size }: {
-    connection = "RC";
+  latOpts = { bin, size, connection ? "RC" }: {
+    inherit connection size;
     iters = 1000;
     qp = 1;
-    inherit size;
   } // sendRxDepthOpt bin;
 
   renderOption = flag: value:
@@ -65,23 +71,23 @@ let
   };
 
   mkBwCases =
-    { prefix, bins, sizes, qps, directions ? [ "forward" ], bidirectional ? false }:
+    { prefix, bins, sizes, qps, directions ? [ "forward" ], bidirectional ? false, connection ? "RC" }:
     let
       one = bin: qp: size: mkCase {
         name = "${prefix}.${bin}.size${toString size}.qps${toString qp}";
         inherit bin directions;
-        options = bwOpts { inherit bin size qp; }
+        options = bwOpts { inherit bin size qp connection; }
           // optionalAttrs bidirectional { bidirectional = true; };
       };
     in
     concatMap (bin: concatMap (qp: map (one bin qp) sizes) qps) bins;
 
-  mkLatCases = { prefix, bins, sizes, directions ? [ "forward" ] }:
+  mkLatCases = { prefix, bins, sizes, directions ? [ "forward" ], connection ? "RC" }:
     let
       one = bin: size: mkCase {
         name = "${prefix}.${bin}.size${toString size}";
         inherit bin directions;
-        options = latOpts { inherit bin size; };
+        options = latOpts { inherit bin size connection; };
       };
     in
     concatMap (bin: map (one bin) sizes) bins;
@@ -158,11 +164,27 @@ let
       copyTools = true;
       stopOnFail = false;
     };
+    # RC matrix: full coverage for strix↔strix native (RC + UC + RDMA READ).
+    # Apple Thunderbolt RDMA is UC-only, so all these cases fail at
+    # `ibv_modify_qp` RTR when the peer is macOS. For Apple-compatible runs
+    # filter to `--only '*.uc.*' --only 'odd.uc.*' --only 'odd.ud.*'` (or
+    # drop these axes entirely on profiles that only see Apple peers).
     cases =
       mkBwCases { prefix = "bw";   bins = bwBins;  sizes = bwSizes;   qps = allQps; directions = bothDirections; }
       ++ mkBwCases { prefix = "bidi"; bins = bwBins; sizes = bidiSizes; qps = allQps; bidirectional = true; }
       ++ mkLatCases { prefix = "lat"; bins = latBins; sizes = latSizes; directions = bothDirections; }
+      # readouts = ib_read_lat outstanding sweep; RDMA READ is RC-only and
+      # therefore unavailable on Apple peers — keep this axis here for
+      # strix↔strix and skip via `--only '*.uc.*'` when the peer is mac.
       ++ mkReadOutCases { prefix = "readouts"; sizes = [ 4096 65536 ]; outs = readOuts; }
+
+      # UC matrix: Apple-compatible BW + LAT + bidi at the same sizes/QPs.
+      # ib_read_bw / ib_read_lat are intentionally absent — RDMA READ
+      # requires RC, which Apple's stack does not implement.
+      ++ mkBwCases { prefix = "bw.uc";   bins = bwBinsUc; sizes = bwSizes;   qps = allQps; directions = bothDirections; connection = "UC"; }
+      ++ mkBwCases { prefix = "bidi.uc"; bins = bwBinsUc; sizes = bidiSizes; qps = allQps; bidirectional = true; connection = "UC"; }
+      ++ mkLatCases { prefix = "lat.uc"; bins = latBinsUc; sizes = latSizes; directions = bothDirections; connection = "UC"; }
+
       ++ oddCases;
   };
 
