@@ -51,10 +51,14 @@ if stdenv.hostPlatform.isDarwin then
       substituteInPlace src/perftest_resources.c \
         --replace-fail 'goto xrc_srq;' 'goto xrcd;'
       # Apple's SDK adds IBV_LINK_LAYER_THUNDERBOLT (=100); upstream perftest
-      # treats it as Unknown and aborts. Map it to Ethernet so RoCE-style
-      # operation works.
+      # treats it as Unknown and aborts. Map it to Ethernet at the source so
+      # every downstream check (link_layer_str, gid_index defaulting, the
+      # KEY_MSG_SIZE_GID branch in ethernet_read_keys/write_keys, etc.) sees
+      # Ethernet — without that, gid_index defaults diverge between hosts and
+      # the on-wire dest-address exchange uses different lengths.
       substituteInPlace src/perftest_parameters.c \
-        --replace-fail 'case IBV_LINK_LAYER_ETHERNET:' 'case IBV_LINK_LAYER_ETHERNET: case IBV_LINK_LAYER_THUNDERBOLT:'
+        --replace-fail 'case IBV_LINK_LAYER_ETHERNET:' 'case IBV_LINK_LAYER_ETHERNET: case IBV_LINK_LAYER_THUNDERBOLT:' \
+        --replace-fail 'params->link_type = port_attr.link_layer;' 'params->link_type = (port_attr.link_layer == IBV_LINK_LAYER_THUNDERBOLT) ? IBV_LINK_LAYER_ETHERNET : port_attr.link_layer;'
       substituteInPlace Makefile.am \
         --replace-fail 'src/host_memory.c src/mmap_memory.c' 'src/host_memory.c src/mmap_memory.c src/apple_raw_ethernet_stubs.c'
     '';

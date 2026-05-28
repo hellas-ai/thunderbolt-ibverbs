@@ -451,7 +451,6 @@ def build_perftest_command(
     *,
     perftest_path: str,
     rdma_lib: str,
-    is_darwin: bool,
     pair_has_darwin: bool,
     dev: str,
     gid_index: int,
@@ -464,15 +463,10 @@ def build_perftest_command(
         [str(x) for x in case.get("argv", [])],
         {"--ib-dev", "-d", "--gid-index", "-x", "--port", "-p", "--out_json_file"},
     )
-    if is_darwin:
-        # Apple perftest auto-picks the first ibv device and uses the default
-        # GID; the strix-side device name (`usb4_rdma*`) is meaningless here.
-        argv.extend(["--port", str(port), "-F"])
-    else:
-        argv.extend(["--ib-dev", dev, "--gid-index", str(gid_index), "--port", str(port), "-F"])
+    argv.extend(["--ib-dev", dev, "--gid-index", str(gid_index), "--port", str(port), "-F"])
     if pair_has_darwin and "--use_old_post_send" not in argv:
-        # Apple build is configured with --disable-ibv_wr_api, so both sides
-        # must use the legacy post-send flow for the negotiation to succeed.
+        # Apple perftest is built with --disable-ibv_wr_api; force both sides
+        # to use the legacy post-send flow so the negotiated ABI matches.
         argv.append("--use_old_post_send")
     if perftest_kind(case) == "bw":
         argv.append("--report_gbits")
@@ -583,7 +577,8 @@ def run_pair(
     client_perftest: str,
     server_rdma_lib: str,
     client_rdma_lib: str,
-    dev: str,
+    server_dev: str,
+    client_dev: str,
     gid_index: int,
     port: int,
     timeout: int,
@@ -592,16 +587,13 @@ def run_pair(
     remote_dir = f"/tmp/tbv-perftest/{run_id}"
     server_json = f"{remote_dir}/server.json"
     client_json = f"{remote_dir}/client.json"
-    server_darwin = HOST_SYSTEM.get(server) == "Darwin"
-    client_darwin = HOST_SYSTEM.get(client) == "Darwin"
-    pair_has_darwin = server_darwin or client_darwin
+    pair_has_darwin = "Darwin" in (HOST_SYSTEM.get(server), HOST_SYSTEM.get(client))
     server_cmd = build_perftest_command(
         case,
         perftest_path=server_perftest,
         rdma_lib=server_rdma_lib,
-        is_darwin=server_darwin,
         pair_has_darwin=pair_has_darwin,
-        dev=dev,
+        dev=server_dev,
         gid_index=gid_index,
         port=port,
         timeout=timeout,
@@ -612,9 +604,8 @@ def run_pair(
         case,
         perftest_path=client_perftest,
         rdma_lib=client_rdma_lib,
-        is_darwin=client_darwin,
         pair_has_darwin=pair_has_darwin,
-        dev=dev,
+        dev=client_dev,
         gid_index=gid_index,
         port=port,
         timeout=timeout,
@@ -742,6 +733,8 @@ def main() -> int:
     parser.add_argument("--client")
     parser.add_argument("--hosts", help="Shortcut for --server A --client B")
     parser.add_argument("--dev")
+    parser.add_argument("--server-dev", help="override --dev on the server side (asymmetric pairs)")
+    parser.add_argument("--client-dev", help="override --dev on the client side (asymmetric pairs)")
     parser.add_argument("--gid-index", type=int)
     parser.add_argument("--backend")
     parser.add_argument("--netdev")
@@ -777,6 +770,12 @@ def main() -> int:
     server = args.server or defaults["server"]
     client = args.client or defaults["client"]
     dev = args.dev or defaults["dev"]
+    # Pin device per host (not per role); directions swap server/client but
+    # the host -> dev mapping stays fixed.
+    host_dev = {
+        server: args.server_dev or dev,
+        client: args.client_dev or dev,
+    }
     gid_index = args.gid_index if args.gid_index is not None else int(defaults["gidIndex"])
     backend = args.backend if args.backend is not None else defaults.get("backend")
     netdev = args.netdev or defaults.get("netdev")
@@ -846,8 +845,8 @@ def main() -> int:
                     flush=True,
                 )
 
-        initial_server = collect_telemetry(server, dev, backend, netdev, rdma_core_for(server))
-        initial_client = collect_telemetry(client, dev, backend, netdev, rdma_core_for(client))
+        initial_server = collect_telemetry(server, host_dev[server], backend, netdev, rdma_core_for(server))
+        initial_client = collect_telemetry(client, host_dev[client], backend, netdev, rdma_core_for(client))
         assert_topology(server, initial_server, expect_rails, expect_speed)
         assert_topology(client, initial_client, expect_rails, expect_speed)
         print(
@@ -874,8 +873,8 @@ def main() -> int:
                             f"{tag}-r{repeat_index:02d}-"
                             f"{run_index:04d}-{case['name'].replace('.', '-')}-{direction_name}"
                         )
-                        before_server = collect_telemetry(run_server, dev, backend, netdev, rdma_core_for(run_server))
-                        before_client = collect_telemetry(run_client, dev, backend, netdev, rdma_core_for(run_client))
+                        before_server = collect_telemetry(run_server, host_dev[run_server], backend, netdev, rdma_core_for(run_server))
+                        before_client = collect_telemetry(run_client, host_dev[run_client], backend, netdev, rdma_core_for(run_client))
                         assert_topology(run_server, before_server, expect_rails, expect_speed)
                         assert_topology(run_client, before_client, expect_rails, expect_speed)
 
@@ -915,15 +914,16 @@ def main() -> int:
                             client_perftest=perftest_for(run_client),
                             server_rdma_lib=rdma_core_for(run_server),
                             client_rdma_lib=rdma_core_for(run_client),
-                            dev=dev,
+                            server_dev=host_dev[run_server],
+                            client_dev=host_dev[run_client],
                             gid_index=gid_index,
                             port=port,
                             timeout=timeout,
                             server_start_delay=float(defaults["serverStartDelay"]),
                         )
                         elapsed = time.monotonic() - start
-                        after_server = collect_telemetry(run_server, dev, backend, netdev, rdma_core_for(run_server))
-                        after_client = collect_telemetry(run_client, dev, backend, netdev, rdma_core_for(run_client))
+                        after_server = collect_telemetry(run_server, host_dev[run_server], backend, netdev, rdma_core_for(run_server))
+                        after_client = collect_telemetry(run_client, host_dev[run_client], backend, netdev, rdma_core_for(run_client))
                         server_delta = delta_ints(after_server["summary_counters"], before_server["summary_counters"])
                         client_delta = delta_ints(after_client["summary_counters"], before_client["summary_counters"])
                         server_rail_delta = delta_ints(after_server["rail_totals"], before_server["rail_totals"])
