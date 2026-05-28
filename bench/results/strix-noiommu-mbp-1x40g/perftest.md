@@ -28,26 +28,20 @@ commands. The runner also writes `kernel`, `module_sha256`, `iommu`, and
 `server`/`client` columns per row, so the strix side identifies itself even
 if the file is moved or renamed.
 
-## Prerequisites
+## Mac-side prerequisites
 
-The runner pushes its Linux closure to strix hosts via `nix copy`. For the
-mac side, those binaries aren't substitutable across architectures — you need
-a Darwin build of `perftest` already in the store and pass the path via the
-`TBV_PERFTEST_MBP` env var. `TBV_RDMA_CORE_MBP=` (empty) tells the runner not
-to set `LD_LIBRARY_PATH` — the Apple build uses dyld dynamic-lookup against
-Apple's runtime libs.
+The runner pushes its Linux closure to strix hosts via `nix-copy-closure`.
+The mac side isn't substitutable across architectures, so you need a Darwin
+`perftest` build already in the store and you point the runner at it via the
+`--host-perftest` / `--host-rdma-core` switches. Set `--no-copy <mac-host>`
+so the runner doesn't try to push to it. Set `--host-rdma-core <mac-host>=`
+(empty) so the runner skips `LD_LIBRARY_PATH` wrapping — the Apple build uses
+dyld dynamic-lookup against Apple's runtime libs.
 
 ```sh
-# build the darwin perftest (run this on a darwin builder or via remote build)
-mac_perftest=$(nix build --no-link --print-out-paths \
-  .#packages.aarch64-darwin.perftest 2>/dev/null) || \
-  mac_perftest=$(ssh mbp 'nix build --no-link --print-out-paths /path/to/thunderbolt-ibverbs#perftest')
-export TBV_PERFTEST_MBP="$mac_perftest"
-export TBV_RDMA_CORE_MBP=""
+mac_host=<your-mac-ssh-target>            # e.g. user@host
+mac_perftest=$(nix build --no-link --print-out-paths .#packages.aarch64-darwin.perftest)
 ```
-
-`mbp` is already in `HOST_ALIASES` (user=`grw`, address=`mbp.lan.satanic.link`,
-`skip_copy=True`) so the runner won't try to push to it.
 
 ## Recreate (strix-1 ↔ mac)
 
@@ -55,8 +49,11 @@ export TBV_RDMA_CORE_MBP=""
 out=bench/results/strix-noiommu-mbp-1x40g/result
 mkdir -p "$out"
 nix run .#tbv-perftest -- \
-  --hosts strix-1,mbp \
+  --hosts strix-1,"$mac_host" \
   --no-rail-check \
+  --no-copy "$mac_host" \
+  --host-perftest "$mac_host=$mac_perftest" \
+  --host-rdma-core "$mac_host=" \
   --base-port 19400 \
   --tag perftest-tbverbs-strix1 \
   --csv "$out/perftest-tbverbs-strix1.csv" \
@@ -69,8 +66,11 @@ nix run .#tbv-perftest -- \
 out=bench/results/strix-noiommu-mbp-1x40g/result
 mkdir -p "$out"
 nix run .#tbv-perftest -- \
-  --hosts strix-2,mbp \
+  --hosts strix-2,"$mac_host" \
   --no-rail-check \
+  --no-copy "$mac_host" \
+  --host-perftest "$mac_host=$mac_perftest" \
+  --host-rdma-core "$mac_host=" \
   --base-port 19500 \
   --tag perftest-tbverbs-strix2 \
   --csv "$out/perftest-tbverbs-strix2.csv" \
@@ -79,9 +79,11 @@ nix run .#tbv-perftest -- \
 
 Notes:
 - `--no-rail-check` because the rail-count assertion defaults to the
-  strix-strix native four-rail expectation; one cable yields 2 rails to mbp.
-  Tighten with `--expect-rails 2 --expect-speed 20Gb/s` once we know what
-  the apple-compatible backend reports here.
+  strix-strix native four-rail expectation; one cable yields 2 rails to the
+  mac. Tighten with `--expect-rails 2 --expect-speed 20Gb/s` once we know
+  what the apple-compatible backend reports here.
+- Hostnames are passed through to ssh as-is; use `user@host` if your strix
+  or mac account isn't ssh's default. Resolution is via your normal DNS.
 
 ## Headline
 

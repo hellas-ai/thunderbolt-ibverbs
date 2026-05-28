@@ -11,12 +11,6 @@ import time
 from pathlib import Path
 
 
-HOST_ALIASES = {
-    "strix-1": "192.168.23.136",
-    "strix-2": "192.168.23.192",
-}
-
-
 CSV_FIELDS = [
     "timestamp_utc",
     "tag",
@@ -77,20 +71,14 @@ def parse_csv_ints(value: str) -> list[int]:
     return out
 
 
-def resolve_host(host: str) -> str:
-    return HOST_ALIASES.get(host, host)
-
-
-def ssh_args(host: str, command: str) -> list[str]:
+def ssh_args(target: str, command: str) -> list[str]:
     return [
         "ssh",
         "-o",
         "ConnectTimeout=8",
         "-o",
         "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        f"root@{host}",
+        target,
         "bash -lc " + shlex.quote(command),
     ]
 
@@ -112,19 +100,8 @@ def run_ssh(host: str, command: str, *, check: bool = True, timeout: int | None 
     return run_local(ssh_args(host, command), check=check, timeout=timeout)
 
 
-def copy_tools(host: str) -> None:
-    run_local(
-        [
-            "nix",
-            "copy",
-            "--no-check-sigs",
-            "--to",
-            f"ssh-ng://root@{host}",
-            RDMA_CORE,
-            PERFTEST,
-        ],
-        check=True,
-    )
+def copy_tools(target: str) -> None:
+    run_local(["nix-copy-closure", "--to", target, RDMA_CORE, PERFTEST], check=True)
 
 
 def speed_gbps(value: str) -> float | None:
@@ -274,7 +251,7 @@ def perftest_command(bin_name: str, args: argparse.Namespace, size: int, iters: 
 
 def run_pair(bin_name: str, parser, args: argparse.Namespace, server_host: str, client_host: str, size: int, iters: int, qps: int, port: int) -> tuple[str, dict[str, str], str]:
     server_cmd = perftest_command(bin_name, args, size, iters, qps, port, None)
-    client_cmd = perftest_command(bin_name, args, size, iters, qps, port, resolve_host(server_host))
+    client_cmd = perftest_command(bin_name, args, size, iters, qps, port, server_host.split("@", 1)[-1])
 
     server_proc = subprocess.Popen(
         ssh_args(server_host, server_cmd),
@@ -392,8 +369,8 @@ def main() -> int:
     if any(qps != 1 for qps in lat_qps):
         die("ib_write_lat only supports qps=1; use --bw-qps/--qps for multi-QP bandwidth sweeps")
 
-    server_host = resolve_host(args.server)
-    client_host = resolve_host(args.client)
+    server_host = args.server
+    client_host = args.client
 
     for host in {server_host, client_host}:
         copy_tools(host)

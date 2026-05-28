@@ -23,44 +23,6 @@ from pathlib import Path
 from typing import Any
 
 
-HOST_ALIASES: dict[str, dict[str, Any]] = {
-    "strix-1": {"address": "192.168.23.136", "user": "root"},
-    "strix-2": {"address": "192.168.23.192", "user": "root"},
-    "router":  {"address": "192.168.23.1",   "user": "root"},
-    "mbp":     {"address": "mbp.lan.satanic.link", "user": "grw", "skip_copy": True},
-}
-
-_ADDRESS_TO_ALIAS = {entry["address"]: name for name, entry in HOST_ALIASES.items()}
-
-
-def resolve_alias(host: str) -> dict[str, Any]:
-    if host in HOST_ALIASES:
-        return HOST_ALIASES[host]
-    if host in _ADDRESS_TO_ALIAS:
-        return HOST_ALIASES[_ADDRESS_TO_ALIAS[host]]
-    return {"address": host, "user": "root"}
-
-
-def host_env_key(host: str) -> str:
-    name = host
-    if host in _ADDRESS_TO_ALIAS:
-        name = _ADDRESS_TO_ALIAS[host]
-    return name.upper().replace("-", "_").replace(".", "_")
-
-
-def host_perftest(host: str) -> str:
-    return os.environ.get(f"TBV_PERFTEST_{host_env_key(host)}", PERFTEST)
-
-
-def host_rdma_core(host: str) -> str:
-    key = f"TBV_RDMA_CORE_{host_env_key(host)}"
-    if key in os.environ:
-        # explicit empty string means "no library path" (e.g. Darwin builds
-        # use dyld dynamic_lookup against Apple's runtime libs)
-        return os.environ[key]
-    return RDMA_CORE
-
-
 IMPORTANT_COUNTERS = [
     "verbs_qps",
     "verbs_mrs",
@@ -221,21 +183,18 @@ RDMA_CORE = require_env("TBV_RDMA_CORE")
 PERFTEST = require_env("TBV_PERFTEST")
 
 
-def resolve_host(host: str) -> str:
-    return resolve_alias(host)["address"]
+def split_host(target: str) -> str:
+    """Strip any `user@` prefix and return just the host part."""
+    return target.split("@", 1)[1] if "@" in target else target
 
 
-def ssh_args(host: str, command: str) -> list[str]:
-    alias = resolve_alias(host)
-    target = f"{alias['user']}@{alias['address']}"
+def ssh_args(target: str, command: str) -> list[str]:
     return [
         "ssh",
         "-o",
         "ConnectTimeout=8",
         "-o",
         "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
         target,
         "bash -lc " + shlex.quote(command),
     ]
@@ -254,30 +213,15 @@ def run_local(args: list[str], *, check: bool = True, timeout: int | None = None
     return proc
 
 
-def run_ssh(host: str, command: str, *, check: bool = True, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
-    return run_local(ssh_args(host, command), check=check, timeout=timeout)
+def run_ssh(target: str, command: str, *, check: bool = True, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
+    return run_local(ssh_args(target, command), check=check, timeout=timeout)
 
 
-def copy_tools(host: str) -> None:
-    alias = resolve_alias(host)
-    if alias.get("skip_copy"):
-        # Darwin / non-x86_64-linux hosts: closures aren't substitutable from
-        # this builder's store. Caller pre-stages the binaries on that host and
-        # points at them via TBV_PERFTEST_<HOST> / TBV_RDMA_CORE_<HOST>.
+def copy_tools(target: str, paths: list[str]) -> None:
+    paths = [p for p in paths if p]
+    if not paths:
         return
-    target = f"ssh-ng://{alias['user']}@{alias['address']}"
-    run_local(
-        [
-            "nix",
-            "copy",
-            "--no-check-sigs",
-            "--to",
-            target,
-            host_rdma_core(host),
-            host_perftest(host),
-        ],
-        check=True,
-    )
+    run_local(["nix-copy-closure", "--to", target, *paths], check=True)
 
 
 def now_utc() -> str:
@@ -371,7 +315,7 @@ def format_identity(label: str, identity: dict[str, str]) -> str:
     )
 
 
-def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | None) -> dict[str, Any]:
+def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | None, rdma_lib: str) -> dict[str, Any]:
     summary = run_ssh(
         host,
         "cat /sys/kernel/debug/thunderbolt_ibverbs/summary 2>/dev/null || true",
@@ -385,7 +329,6 @@ def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | No
         timeout=10,
     ).stdout
     rdma_link = run_ssh(host, "rdma link show 2>&1 || true", check=False, timeout=10).stdout
-    rdma_lib = host_rdma_core(host)
     if rdma_lib:
         devinfo = run_ssh(
             host,
@@ -395,8 +338,9 @@ def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | No
             timeout=15,
         ).stdout
     else:
-        # Darwin / non-linux: no rdma-core build to invoke ibv_devinfo from.
-        devinfo = "(skipped: no rdma-core path configured for this host)"
+        # No rdma-core path configured for this host (e.g. Darwin); ibv_devinfo
+        # isn't available to invoke.
+        devinfo = "(skipped: no rdma-core path)"
     params = collect_params(host)
     ip_stats = ""
     if netdev:
@@ -488,7 +432,8 @@ def strip_option(argv: list[str], flags: set[str]) -> list[str]:
 def build_perftest_command(
     case: dict[str, Any],
     *,
-    host: str,
+    perftest_path: str,
+    rdma_lib: str,
     dev: str,
     gid_index: int,
     port: int,
@@ -509,9 +454,8 @@ def build_perftest_command(
     if peer:
         argv.append(peer)
 
-    bin_path = f"{host_perftest(host)}/bin/{case['bin']}"
+    bin_path = f"{perftest_path}/bin/{case['bin']}"
     quoted = " ".join(shlex.quote(str(arg)) for arg in argv)
-    rdma_lib = host_rdma_core(host)
     lib_prefix = f"LD_LIBRARY_PATH={shlex.quote(rdma_lib + '/lib')} " if rdma_lib else ""
     return (
         "set -euo pipefail; "
@@ -607,8 +551,10 @@ def run_pair(
     run_id: str,
     server: str,
     client: str,
-    server_host: str,
-    client_host: str,
+    server_perftest: str,
+    client_perftest: str,
+    server_rdma_lib: str,
+    client_rdma_lib: str,
     dev: str,
     gid_index: int,
     port: int,
@@ -620,7 +566,8 @@ def run_pair(
     client_json = f"{remote_dir}/client.json"
     server_cmd = build_perftest_command(
         case,
-        host=server,
+        perftest_path=server_perftest,
+        rdma_lib=server_rdma_lib,
         dev=dev,
         gid_index=gid_index,
         port=port,
@@ -630,23 +577,24 @@ def run_pair(
     )
     client_cmd = build_perftest_command(
         case,
-        host=client,
+        perftest_path=client_perftest,
+        rdma_lib=client_rdma_lib,
         dev=dev,
         gid_index=gid_index,
         port=port,
         timeout=timeout,
         remote_json=client_json,
-        peer=server_host,
+        peer=split_host(server),
     )
 
     server_proc = subprocess.Popen(
-        ssh_args(server_host, server_cmd),
+        ssh_args(server, server_cmd),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
     time.sleep(server_start_delay)
-    client_proc = run_ssh(client_host, client_cmd, check=False, timeout=timeout + 20)
+    client_proc = run_ssh(client, client_cmd, check=False, timeout=timeout + 20)
     server_reap_error = ""
     try:
         server_stdout, _ = server_proc.communicate(timeout=15)
@@ -657,7 +605,7 @@ def run_pair(
         except subprocess.TimeoutExpired:
             server_proc.kill()
             server_stdout, _ = server_proc.communicate()
-            cleanup_remote_run(server_host, remote_dir)
+            cleanup_remote_run(server, remote_dir)
             server_reap_error = "server ssh cleanup timeout"
 
     raw = {
@@ -665,8 +613,8 @@ def run_pair(
         "client_stdout": client_proc.stdout,
         "server_returncode": server_proc.returncode,
         "client_returncode": client_proc.returncode,
-        "server_json": load_remote_json(server_host, server_json),
-        "client_json": load_remote_json(client_host, client_json),
+        "server_json": load_remote_json(server, server_json),
+        "client_json": load_remote_json(client, client_json),
     }
     if server_reap_error:
         return "fail", {}, f"{server_reap_error}: {server_stdout.strip()[-800:]}", raw
@@ -752,6 +700,19 @@ def parse_hosts(value: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
+def parse_host_kv(specs: list[str]) -> dict[str, str]:
+    """Parse `--host-foo HOST=VALUE` repeated args into a dict.
+
+    Empty VALUE is preserved (used to disable LD_LIBRARY_PATH for darwin)."""
+    out: dict[str, str] = {}
+    for spec in specs:
+        if "=" not in spec:
+            die(f"expected HOST=VALUE, got {spec!r}")
+        host, _, value = spec.partition("=")
+        out[host.strip()] = value.strip()
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a Nix-generated perftest benchmark plan.")
     parser.add_argument("--plan", required=True)
@@ -775,6 +736,12 @@ def main() -> int:
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-copy-tools", action="store_true")
+    parser.add_argument("--no-copy", action="append", default=[], metavar="HOST",
+        help="Skip nix-copy-closure for HOST (e.g. when the closure isn't substitutable across architectures). Repeatable.")
+    parser.add_argument("--host-perftest", action="append", default=[], metavar="HOST=PATH",
+        help="Override the perftest store path for a specific host. Repeatable.")
+    parser.add_argument("--host-rdma-core", action="append", default=[], metavar="HOST=PATH",
+        help="Override the rdma-core store path for a specific host; empty PATH disables LD_LIBRARY_PATH wrapping. Repeatable.")
     parser.add_argument("--stop-on-fail", action="store_true")
     parser.add_argument(
         "--repeat",
@@ -793,8 +760,16 @@ def main() -> int:
 
     server = args.server or defaults["server"]
     client = args.client or defaults["client"]
-    server_host = resolve_host(server)
-    client_host = resolve_host(client)
+    host_perftest_overrides = parse_host_kv(args.host_perftest)
+    host_rdma_core_overrides = parse_host_kv(args.host_rdma_core)
+    no_copy_hosts = set(args.no_copy)
+
+    def perftest_for(target: str) -> str:
+        return host_perftest_overrides.get(split_host(target), PERFTEST)
+
+    def rdma_core_for(target: str) -> str:
+        return host_rdma_core_overrides.get(split_host(target), RDMA_CORE)
+
     dev = args.dev or defaults["dev"]
     gid_index = args.gid_index if args.gid_index is not None else int(defaults["gidIndex"])
     backend = args.backend if args.backend is not None else defaults.get("backend")
@@ -824,8 +799,11 @@ def main() -> int:
         return 0
 
     if copy and not args.dry_run:
-        for host in sorted({server_host, client_host}):
-            copy_tools(host)
+        for host in sorted({server, client}):
+            if split_host(host) in no_copy_hosts:
+                continue
+            paths = [p for p in [rdma_core_for(host), perftest_for(host)] if p]
+            copy_tools(host, paths)
 
     if args.dry_run:
         runs = selected_runs(
@@ -846,8 +824,8 @@ def main() -> int:
     failures = 0
     run_index = 0
     try:
-        identity_server = collect_host_identity(server_host)
-        identity_client = collect_host_identity(client_host)
+        identity_server = collect_host_identity(server)
+        identity_client = collect_host_identity(client)
         print(format_identity(server, identity_server), flush=True)
         print(format_identity(client, identity_client), flush=True)
         for field in ("kernel", "module_sha256", "iommu"):
@@ -858,8 +836,8 @@ def main() -> int:
                     flush=True,
                 )
 
-        initial_server = collect_telemetry(server_host, dev, backend, netdev)
-        initial_client = collect_telemetry(client_host, dev, backend, netdev)
+        initial_server = collect_telemetry(server, dev, backend, netdev, rdma_core_for(server))
+        initial_client = collect_telemetry(client, dev, backend, netdev, rdma_core_for(client))
         assert_topology(server, initial_server, expect_rails, expect_speed)
         assert_topology(client, initial_client, expect_rails, expect_speed)
         print(
@@ -886,10 +864,8 @@ def main() -> int:
                             f"{tag}-r{repeat_index:02d}-"
                             f"{run_index:04d}-{case['name'].replace('.', '-')}-{direction_name}"
                         )
-                        run_server_host = resolve_host(run_server)
-                        run_client_host = resolve_host(run_client)
-                        before_server = collect_telemetry(run_server_host, dev, backend, netdev)
-                        before_client = collect_telemetry(run_client_host, dev, backend, netdev)
+                        before_server = collect_telemetry(run_server, dev, backend, netdev, rdma_core_for(run_server))
+                        before_client = collect_telemetry(run_client, dev, backend, netdev, rdma_core_for(run_client))
                         assert_topology(run_server, before_server, expect_rails, expect_speed)
                         assert_topology(run_client, before_client, expect_rails, expect_speed)
 
@@ -925,8 +901,10 @@ def main() -> int:
                             run_id=run_id,
                             server=run_server,
                             client=run_client,
-                            server_host=run_server_host,
-                            client_host=run_client_host,
+                            server_perftest=perftest_for(run_server),
+                            client_perftest=perftest_for(run_client),
+                            server_rdma_lib=rdma_core_for(run_server),
+                            client_rdma_lib=rdma_core_for(run_client),
                             dev=dev,
                             gid_index=gid_index,
                             port=port,
@@ -934,8 +912,8 @@ def main() -> int:
                             server_start_delay=float(defaults["serverStartDelay"]),
                         )
                         elapsed = time.monotonic() - start
-                        after_server = collect_telemetry(run_server_host, dev, backend, netdev)
-                        after_client = collect_telemetry(run_client_host, dev, backend, netdev)
+                        after_server = collect_telemetry(run_server, dev, backend, netdev, rdma_core_for(run_server))
+                        after_client = collect_telemetry(run_client, dev, backend, netdev, rdma_core_for(run_client))
                         server_delta = delta_ints(after_server["summary_counters"], before_server["summary_counters"])
                         client_delta = delta_ints(after_client["summary_counters"], before_client["summary_counters"])
                         server_rail_delta = delta_ints(after_server["rail_totals"], before_server["rail_totals"])
