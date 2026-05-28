@@ -451,6 +451,8 @@ def build_perftest_command(
     *,
     perftest_path: str,
     rdma_lib: str,
+    is_darwin: bool,
+    pair_has_darwin: bool,
     dev: str,
     gid_index: int,
     port: int,
@@ -462,7 +464,16 @@ def build_perftest_command(
         [str(x) for x in case.get("argv", [])],
         {"--ib-dev", "-d", "--gid-index", "-x", "--port", "-p", "--out_json_file"},
     )
-    argv.extend(["--ib-dev", dev, "--gid-index", str(gid_index), "--port", str(port), "-F"])
+    if is_darwin:
+        # Apple perftest auto-picks the first ibv device and uses the default
+        # GID; the strix-side device name (`usb4_rdma*`) is meaningless here.
+        argv.extend(["--port", str(port), "-F"])
+    else:
+        argv.extend(["--ib-dev", dev, "--gid-index", str(gid_index), "--port", str(port), "-F"])
+    if pair_has_darwin and "--use_old_post_send" not in argv:
+        # Apple build is configured with --disable-ibv_wr_api, so both sides
+        # must use the legacy post-send flow for the negotiation to succeed.
+        argv.append("--use_old_post_send")
     if perftest_kind(case) == "bw":
         argv.append("--report_gbits")
     if perftest_kind(case) == "bw" and "--bidirectional" in argv and "--report-both" not in argv:
@@ -581,10 +592,15 @@ def run_pair(
     remote_dir = f"/tmp/tbv-perftest/{run_id}"
     server_json = f"{remote_dir}/server.json"
     client_json = f"{remote_dir}/client.json"
+    server_darwin = HOST_SYSTEM.get(server) == "Darwin"
+    client_darwin = HOST_SYSTEM.get(client) == "Darwin"
+    pair_has_darwin = server_darwin or client_darwin
     server_cmd = build_perftest_command(
         case,
         perftest_path=server_perftest,
         rdma_lib=server_rdma_lib,
+        is_darwin=server_darwin,
+        pair_has_darwin=pair_has_darwin,
         dev=dev,
         gid_index=gid_index,
         port=port,
@@ -596,6 +612,8 @@ def run_pair(
         case,
         perftest_path=client_perftest,
         rdma_lib=client_rdma_lib,
+        is_darwin=client_darwin,
+        pair_has_darwin=pair_has_darwin,
         dev=dev,
         gid_index=gid_index,
         port=port,
