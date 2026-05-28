@@ -75,7 +75,6 @@
           pname = "rdma-core-usb4";
           patches = (old.patches or [ ]) ++ rdmaCoreUsb4Patches;
         });
-      mkAppleRdmaSdk = pkgs: pkgs.callPackage ./nix/apple-rdma-sdk.nix { };
       mkScriptSyntaxCheck =
         pkgs:
         pkgs.stdenv.mkDerivation {
@@ -195,11 +194,10 @@
         let
           isLinux = pkgs.stdenv.hostPlatform.isLinux;
           isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
-          appleRdmaSdk = mkAppleRdmaSdk pkgs;
           rdmaCoreUsb4 = mkRdmaCoreUsb4 pkgs;
           packageArgs =
             lib.optionalAttrs isLinux { rdma-core-usb4 = rdmaCoreUsb4; }
-            // lib.optionalAttrs isDarwin { inherit appleRdmaSdk; };
+            // lib.optionalAttrs isDarwin { inherit (pkgs) apple-sdk_26; };
           perftest = pkgs.callPackage ./nix/perftest.nix packageArgs;
           benchTools = pkgs.callPackage ./nix/bench-tools.nix packageArgs;
           perftestBench =
@@ -220,9 +218,6 @@
         {
           perftest = perftest;
           bench-tools = benchTools;
-        }
-        // lib.optionalAttrs isDarwin {
-          apple-rdma-sdk = appleRdmaSdk;
         }
         // lib.optionalAttrs isLinux (
           let
@@ -328,16 +323,12 @@
           packageArgs = lib.optionalAttrs isLinux {
             rdma-core-usb4 = final.rdma-core-usb4;
           } // lib.optionalAttrs isDarwin {
-            appleRdmaSdk = final.apple-rdma-sdk;
+            inherit (final) apple-sdk_26;
           };
         in
         {
           thunderbolt-ibverbs-bench-tools = final.callPackage ./nix/bench-tools.nix packageArgs;
           thunderbolt-ibverbs-perftest = final.callPackage ./nix/perftest.nix packageArgs;
-        }
-        // lib.optionalAttrs isDarwin {
-          apple-rdma-sdk = final.callPackage ./nix/apple-rdma-sdk.nix { };
-          thunderbolt-ibverbs-apple-rdma-sdk = final.apple-rdma-sdk;
         }
         // lib.optionalAttrs isLinux (
           let
