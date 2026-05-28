@@ -51,7 +51,7 @@ install_deps() {
 			bash ca-certificates diffutils dkms file findutils gcc git \
 			kernel-devel kernel-headers kmod make openssl tar xz >/dev/null
 	elif command -v pacman >/dev/null 2>&1; then
-		pacman -Sy --noconfirm --needed \
+		pacman -Syu --noconfirm --needed \
 			base-devel ca-certificates dkms file gcc git kmod linux-headers \
 			make openssl pahole tar xz
 	else

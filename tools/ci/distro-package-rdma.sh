@@ -64,7 +64,7 @@ install_deps() {
 				python3-docutils python3-pyelftools systemd-devel tar
 			;;
 		arch)
-			pacman -Sy --noconfirm --needed \
+			pacman -Syu --noconfirm --needed \
 				base-devel ca-certificates cmake git libnl ninja patch \
 				patchelf python-docutils python-pyelftools sudo systemd
 			;;
