@@ -1,16 +1,48 @@
 # thunderbolt-ibverbs
 
-Experimental Linux kernel module exposing an RDMA verbs device over
-Thunderbolt/USB4 host-to-host links.
+*** WARNING ***
 
-This is a research driver. It is useful for controlled Linux-to-Linux testing,
-but it is not a production storage, cluster, or security boundary. Use it on
-machines you can reboot, over links to machines you trust.
-
-For the background, hardware notes, and benchmark narrative, see the Hellas
-blog post:
-
+this is a research driver. It is buggy, it is insecure, it is not for production.
+for context, narrative, notes and benchmarks see the Hellas blog post:
 https://blog.hellas.ai/blog/thunderbolt-ibverbs/
+
+## what is it?
+a linux kernel module + userspace shim to emulate an InfiniBand RDMA verb device across generic usb4/thunderbolt4 DMA rings
+
+## does it work?
+yes! obviously not as well as real hardware, but better than onboard ethernet and lower latency than RXE-over-`thunderbolt-net`
+
+![Per-rail bandwidth by verb (read / write / send), strix-1 ↔ strix-2: native usb4_rdma vs RXE over thunderbolt-net vs RXE over 2.5G LAN](docs/img/bw_vs_size.svg)
+
+![One-way latency by verb (read / write / send), 1 QP, 64 B → 1 MiB, native usb4_rdma vs RXE over thunderbolt-net vs RXE over 2.5G LAN](docs/img/lat_vs_size.svg)
+
+## does it do anything useful?
+with my two 128GB devices, i can:
+
+ - perform inference at ~20 tok/s on a 230B-param MoE model that doesn't fit on a single device — ~30% faster than running the same TP=2 split over TCP-over-Thunderbolt ([MiniMax-M2.7 TP=2 on 2× Strix Halo](https://blog.hellas.ai/blog/thunderbolt-ibverbs/5-closing/))
+ - make batch=1 inference go faster with TP=2 than single node ([Llama-3.1-8B solo vs TP=2 4-HCA RDMA](https://blog.hellas.ai/blog/thunderbolt-ibverbs/4-thunderbolt-ibverbs/#vllm-benchmarks))
+ - full finetune a 12b param model 11x faster than ethernet ([Gemma 3 12B full FSDP train wall time](https://blog.hellas.ai/blog/thunderbolt-ibverbs/4-thunderbolt-ibverbs/#finetune))
+
+## i can do that better by doing xyz..
+okay
+
+## is it slop?
+i guess
+
+## how do i use it?
+tell your agent- check out github.com/hellas-ai/thunderbolt-ibverbs and find out how we can use it
+
+## no, really, how do i use it?
+at a high level:
+
+load this kernel module- instructions differ by OS- this will create IB devices in `/dev/sys/class/infiniband` for each visible HCA:
+connect usb4 cables
+pass them and your gpu(s) to the ibverbs-enabled docker images from `nix-strix-halo`
+
+## that sounds complicated, is there any easier way?
+sure, download and write the usb-bootable image from here, insert it into your machines, hit f11 while its booting to select the usb stick
+
+TODO: instructions for how to start vllm once its booted. check benchmark/test scripts for reference.
 
 ## Status
 

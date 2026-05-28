@@ -8,7 +8,7 @@
  * Example:
  *   # Mac receiver, connecting outbound to avoid macOS inbound firewall prompts
  *   ./uc_oneway --role recv --dev rdma_en1 --gid-index 1 \
- *       --connect 192.168.23.192 --port 18515 \
+ *       --connect 192.168.1.11 --port 18515 \
  *       --size 4096 --count 2048 --depth 512
  *
  *   # Linux sender, listening for the TCP metadata connection
@@ -24,7 +24,7 @@
  *   ./uc_oneway --role bidi --dev rdma_en1 --gid-index 1 --port 18515 \
  *       --size 16384 --count 64 --depth 2 --recv-posts 2 --check
  *   ./uc_oneway --role bidi --dev usb4_apple0 --gid-index 1 \
- *       --connect 192.168.23.73 --port 18515 \
+ *       --connect 192.168.1.20 --port 18515 \
  *       --size 16384 --count 64 --depth 2 --recv-posts 2 --check
  */
 

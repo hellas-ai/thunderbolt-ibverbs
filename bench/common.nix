@@ -26,15 +26,17 @@ let
 in
 rec {
   hosts = {
+    # Override `address` / `lanIp` for your network. The values below are
+    # placeholders; the bench just needs ssh-reachable hostnames or IPs.
     strix-1 = {
-      address = "192.168.23.136";
-      lanIp = "192.168.23.136";
+      address = "192.168.1.10";
+      lanIp = "192.168.1.10";
       role = "head";
       gpu = "gfx1151";
     };
     strix-2 = {
-      address = "192.168.23.192";
-      lanIp = "192.168.23.192";
+      address = "192.168.1.11";
+      lanIp = "192.168.1.11";
       role = "worker";
       gpu = "gfx1151";
     };

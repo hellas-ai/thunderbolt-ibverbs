@@ -44,10 +44,10 @@ for this profile we filter to UC-compatible cases only:
 out=bench/results/8845HS-mbp-1x40g/result
 mkdir -p "$out"
 
-# Mac is on wifi DHCP and renames between sessions; resolve once at
-# recreate time. Replace 192.168.23.73 with whatever mbp.local hits.
+# Mac is on wifi DHCP and renames between sessions; resolve at
+# recreate time, or set MBP_IP=<your-mac-ip> in the environment.
 MBP_IP=$(getent hosts mbp 2>/dev/null | awk '{print $1}')
-MBP_IP=${MBP_IP:-192.168.23.73}
+MBP_IP=${MBP_IP:?set MBP_IP to your mac LAN ip}
 
 nix run .#tbv-perftest -- \
   --hosts 8845HS,"$MBP_IP" \
