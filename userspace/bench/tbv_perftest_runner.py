@@ -181,6 +181,20 @@ def require_env(name: str) -> str:
 
 RDMA_CORE = require_env("TBV_RDMA_CORE")
 PERFTEST = require_env("TBV_PERFTEST")
+PERFTEST_DARWIN = os.environ.get("TBV_PERFTEST_DARWIN", "")
+
+
+# Set once per run by detect_systems(); maps hostname -> "Linux" / "Darwin".
+HOST_SYSTEM: dict[str, str] = {}
+
+
+def perftest_for(host: str) -> str:
+    return PERFTEST_DARWIN if HOST_SYSTEM.get(host) == "Darwin" else PERFTEST
+
+
+def rdma_core_for(host: str) -> str:
+    # Darwin uses dyld dynamic-lookup; no rdma-core build, no LD_LIBRARY_PATH.
+    return "" if HOST_SYSTEM.get(host) == "Darwin" else RDMA_CORE
 
 
 def ssh_args(target: str, command: str) -> list[str]:
@@ -212,11 +226,19 @@ def run_ssh(target: str, command: str, *, check: bool = True, timeout: int | Non
     return run_local(ssh_args(target, command), check=check, timeout=timeout)
 
 
-def copy_tools(target: str, paths: list[str]) -> None:
-    paths = [p for p in paths if p]
-    if not paths:
+def detect_system(host: str) -> str:
+    """Return 'Linux' or 'Darwin' for the host via `uname -s`."""
+    out = run_ssh(host, "uname -s", check=False, timeout=10).stdout.strip()
+    return out or "Linux"
+
+
+def copy_tools(host: str) -> None:
+    if HOST_SYSTEM.get(host) == "Darwin":
+        # Darwin closures are built natively (via remote builder); the
+        # linux closure isn't substitutable here. The mac already has its
+        # perftest path in its own nix store.
         return
-    run_local(["nix-copy-closure", "--to", target, *paths], check=True)
+    run_local(["nix-copy-closure", "--to", host, RDMA_CORE, PERFTEST], check=True)
 
 
 def now_utc() -> str:
@@ -695,19 +717,6 @@ def parse_hosts(value: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
-def parse_host_kv(specs: list[str]) -> dict[str, str]:
-    """Parse `--host-foo HOST=VALUE` repeated args into a dict.
-
-    Empty VALUE is preserved (used to disable LD_LIBRARY_PATH for darwin)."""
-    out: dict[str, str] = {}
-    for spec in specs:
-        if "=" not in spec:
-            die(f"expected HOST=VALUE, got {spec!r}")
-        host, _, value = spec.partition("=")
-        out[host.strip()] = value.strip()
-    return out
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a Nix-generated perftest benchmark plan.")
     parser.add_argument("--plan", required=True)
@@ -731,12 +740,6 @@ def main() -> int:
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-copy-tools", action="store_true")
-    parser.add_argument("--no-copy", action="append", default=[], metavar="HOST",
-        help="Skip nix-copy-closure for HOST (e.g. when the closure isn't substitutable across architectures). Repeatable.")
-    parser.add_argument("--host-perftest", action="append", default=[], metavar="HOST=PATH",
-        help="Override the perftest store path for a specific host. Repeatable.")
-    parser.add_argument("--host-rdma-core", action="append", default=[], metavar="HOST=PATH",
-        help="Override the rdma-core store path for a specific host; empty PATH disables LD_LIBRARY_PATH wrapping. Repeatable.")
     parser.add_argument("--stop-on-fail", action="store_true")
     parser.add_argument(
         "--repeat",
@@ -755,16 +758,6 @@ def main() -> int:
 
     server = args.server or defaults["server"]
     client = args.client or defaults["client"]
-    host_perftest_overrides = parse_host_kv(args.host_perftest)
-    host_rdma_core_overrides = parse_host_kv(args.host_rdma_core)
-    no_copy_hosts = set(args.no_copy)
-
-    def perftest_for(target: str) -> str:
-        return host_perftest_overrides.get(target, PERFTEST)
-
-    def rdma_core_for(target: str) -> str:
-        return host_rdma_core_overrides.get(target, RDMA_CORE)
-
     dev = args.dev or defaults["dev"]
     gid_index = args.gid_index if args.gid_index is not None else int(defaults["gidIndex"])
     backend = args.backend if args.backend is not None else defaults.get("backend")
@@ -793,12 +786,16 @@ def main() -> int:
             print(f"{idx:03d} {case['name']} {case['bin']} {' '.join(case.get('argv', []))}")
         return 0
 
+    if not args.dry_run:
+        for host in sorted({server, client}):
+            HOST_SYSTEM[host] = detect_system(host)
+            print(f"tbv-perftest: {host} system={HOST_SYSTEM[host]}", flush=True)
+        if "Darwin" in HOST_SYSTEM.values() and not PERFTEST_DARWIN:
+            die("a host reports Darwin but TBV_PERFTEST_DARWIN is unset; the wrapper was built without a darwin perftest reference")
+
     if copy and not args.dry_run:
         for host in sorted({server, client}):
-            if host in no_copy_hosts:
-                continue
-            paths = [p for p in [rdma_core_for(host), perftest_for(host)] if p]
-            copy_tools(host, paths)
+            copy_tools(host)
 
     if args.dry_run:
         runs = selected_runs(

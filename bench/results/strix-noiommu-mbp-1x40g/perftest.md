@@ -28,64 +28,40 @@ commands. The runner also writes `kernel`, `module_sha256`, `iommu`, and
 `server`/`client` columns per row, so the strix side identifies itself even
 if the file is moved or renamed.
 
-## Mac-side prerequisites
+## Recreate
 
-The runner pushes its Linux closure to strix hosts via `nix-copy-closure`.
-The mac side isn't substitutable across architectures, so you need a Darwin
-`perftest` build already in the store and you point the runner at it via the
-`--host-perftest` / `--host-rdma-core` switches. Set `--no-copy <mac-host>`
-so the runner doesn't try to push to it. Set `--host-rdma-core <mac-host>=`
-(empty) so the runner skips `LD_LIBRARY_PATH` wrapping — the Apple build uses
-dyld dynamic-lookup against Apple's runtime libs.
-
-```sh
-mac_host=<your-mac-ssh-target>            # e.g. user@host
-mac_perftest=$(nix build --no-link --print-out-paths .#packages.aarch64-darwin.perftest)
-```
-
-## Recreate (strix-1 ↔ mac)
+The runner ssh's each host to read `uname -s` and picks the linux or darwin
+perftest closure baked into the flake. The darwin closure is built via your
+local nix's remote-builder config, so a plain `nix run` is sufficient — no
+manual staging.
 
 ```sh
 out=bench/results/strix-noiommu-mbp-1x40g/result
 mkdir -p "$out"
+
+# strix-1 ↔ mac
 nix run .#tbv-perftest -- \
-  --hosts strix-1,"$mac_host" \
+  --hosts strix-1,<your-mac> \
   --no-rail-check \
-  --no-copy "$mac_host" \
-  --host-perftest "$mac_host=$mac_perftest" \
-  --host-rdma-core "$mac_host=" \
   --base-port 19400 \
   --tag perftest-tbverbs-strix1 \
   --csv "$out/perftest-tbverbs-strix1.csv" \
   --jsonl "$out/perftest-tbverbs-strix1.jsonl"
-```
 
-## Recreate (strix-2 ↔ mac)
-
-```sh
-out=bench/results/strix-noiommu-mbp-1x40g/result
-mkdir -p "$out"
+# strix-2 ↔ mac
 nix run .#tbv-perftest -- \
-  --hosts strix-2,"$mac_host" \
+  --hosts strix-2,<your-mac> \
   --no-rail-check \
-  --no-copy "$mac_host" \
-  --host-perftest "$mac_host=$mac_perftest" \
-  --host-rdma-core "$mac_host=" \
   --base-port 19500 \
   --tag perftest-tbverbs-strix2 \
   --csv "$out/perftest-tbverbs-strix2.csv" \
   --jsonl "$out/perftest-tbverbs-strix2.jsonl"
 ```
 
-Notes:
-- `--no-rail-check` because the rail-count assertion defaults to the
-  strix-strix native four-rail expectation; one cable yields 2 rails to the
-  mac. Tighten with `--expect-rails 2 --expect-speed 20Gb/s` once we know
-  what the apple-compatible backend reports here.
-- Hostnames are passed through to ssh as-is; resolution is via your normal
-  DNS, login is whatever your ssh config does. The runner prepends
-  `sudo -n` on the remote shell, so the account needs passwordless sudo for
-  the operations that touch debugfs, /dev/infiniband/*, and the like.
+`--no-rail-check` because the rail-count assertion defaults to the
+strix-strix native four-rail expectation; one cable yields 2 rails to the
+mac. Tighten with `--expect-rails 2 --expect-speed 20Gb/s` once we know
+what the apple-compatible backend reports here.
 
 ## Headline
 

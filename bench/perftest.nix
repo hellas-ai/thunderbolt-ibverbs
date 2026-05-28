@@ -1,6 +1,7 @@
 { lib
 , pkgs
 , perftest
+, perftestDarwin ? null
 , rdma-core-usb4
 , runnerSrc
 , benchConfig
@@ -173,6 +174,7 @@ let
     text = ''
       export TBV_RDMA_CORE=${rdma-core-usb4}
       export TBV_PERFTEST=${perftest}
+      ${lib.optionalString (perftestDarwin != null) "export TBV_PERFTEST_DARWIN=${perftestDarwin}"}
       exec ${pkgs.python3}/bin/python3 -u ${runnerSrc} --plan ${planFile} "$@"
     '';
     meta = {
