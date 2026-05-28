@@ -26,3 +26,7 @@ bench/results/**/result/
 bench/results/**/*.json
 bench/results/**/*.jsonl
 bench/results/**/logs/
+
+# Python bytecode
+__pycache__/
+*.pyc

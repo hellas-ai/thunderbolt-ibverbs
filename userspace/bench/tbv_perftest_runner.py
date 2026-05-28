@@ -23,11 +23,42 @@ from pathlib import Path
 from typing import Any
 
 
-HOST_ALIASES = {
-    "strix-1": "192.168.23.136",
-    "strix-2": "192.168.23.192",
-    "router": "192.168.23.1",
+HOST_ALIASES: dict[str, dict[str, Any]] = {
+    "strix-1": {"address": "192.168.23.136", "user": "root"},
+    "strix-2": {"address": "192.168.23.192", "user": "root"},
+    "router":  {"address": "192.168.23.1",   "user": "root"},
+    "mbp":     {"address": "mbp.lan.satanic.link", "user": "grw", "skip_copy": True},
 }
+
+_ADDRESS_TO_ALIAS = {entry["address"]: name for name, entry in HOST_ALIASES.items()}
+
+
+def resolve_alias(host: str) -> dict[str, Any]:
+    if host in HOST_ALIASES:
+        return HOST_ALIASES[host]
+    if host in _ADDRESS_TO_ALIAS:
+        return HOST_ALIASES[_ADDRESS_TO_ALIAS[host]]
+    return {"address": host, "user": "root"}
+
+
+def host_env_key(host: str) -> str:
+    name = host
+    if host in _ADDRESS_TO_ALIAS:
+        name = _ADDRESS_TO_ALIAS[host]
+    return name.upper().replace("-", "_").replace(".", "_")
+
+
+def host_perftest(host: str) -> str:
+    return os.environ.get(f"TBV_PERFTEST_{host_env_key(host)}", PERFTEST)
+
+
+def host_rdma_core(host: str) -> str:
+    key = f"TBV_RDMA_CORE_{host_env_key(host)}"
+    if key in os.environ:
+        # explicit empty string means "no library path" (e.g. Darwin builds
+        # use dyld dynamic_lookup against Apple's runtime libs)
+        return os.environ[key]
+    return RDMA_CORE
 
 
 IMPORTANT_COUNTERS = [
@@ -191,10 +222,12 @@ PERFTEST = require_env("TBV_PERFTEST")
 
 
 def resolve_host(host: str) -> str:
-    return HOST_ALIASES.get(host, host)
+    return resolve_alias(host)["address"]
 
 
 def ssh_args(host: str, command: str) -> list[str]:
+    alias = resolve_alias(host)
+    target = f"{alias['user']}@{alias['address']}"
     return [
         "ssh",
         "-o",
@@ -203,7 +236,7 @@ def ssh_args(host: str, command: str) -> list[str]:
         "BatchMode=yes",
         "-o",
         "StrictHostKeyChecking=accept-new",
-        f"root@{host}",
+        target,
         "bash -lc " + shlex.quote(command),
     ]
 
@@ -226,15 +259,22 @@ def run_ssh(host: str, command: str, *, check: bool = True, timeout: int | None 
 
 
 def copy_tools(host: str) -> None:
+    alias = resolve_alias(host)
+    if alias.get("skip_copy"):
+        # Darwin / non-x86_64-linux hosts: closures aren't substitutable from
+        # this builder's store. Caller pre-stages the binaries on that host and
+        # points at them via TBV_PERFTEST_<HOST> / TBV_RDMA_CORE_<HOST>.
+        return
+    target = f"ssh-ng://{alias['user']}@{alias['address']}"
     run_local(
         [
             "nix",
             "copy",
             "--no-check-sigs",
             "--to",
-            f"ssh-ng://root@{host}",
-            RDMA_CORE,
-            PERFTEST,
+            target,
+            host_rdma_core(host),
+            host_perftest(host),
         ],
         check=True,
     )
@@ -345,13 +385,18 @@ def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | No
         timeout=10,
     ).stdout
     rdma_link = run_ssh(host, "rdma link show 2>&1 || true", check=False, timeout=10).stdout
-    devinfo = run_ssh(
-        host,
-        f"LD_LIBRARY_PATH={shlex.quote(RDMA_CORE + '/lib')} "
-        f"{shlex.quote(RDMA_CORE + '/bin/ibv_devinfo')} -d {shlex.quote(dev)} -v 2>&1 || true",
-        check=False,
-        timeout=15,
-    ).stdout
+    rdma_lib = host_rdma_core(host)
+    if rdma_lib:
+        devinfo = run_ssh(
+            host,
+            f"LD_LIBRARY_PATH={shlex.quote(rdma_lib + '/lib')} "
+            f"{shlex.quote(rdma_lib + '/bin/ibv_devinfo')} -d {shlex.quote(dev)} -v 2>&1 || true",
+            check=False,
+            timeout=15,
+        ).stdout
+    else:
+        # Darwin / non-linux: no rdma-core build to invoke ibv_devinfo from.
+        devinfo = "(skipped: no rdma-core path configured for this host)"
     params = collect_params(host)
     ip_stats = ""
     if netdev:
@@ -443,6 +488,7 @@ def strip_option(argv: list[str], flags: set[str]) -> list[str]:
 def build_perftest_command(
     case: dict[str, Any],
     *,
+    host: str,
     dev: str,
     gid_index: int,
     port: int,
@@ -463,13 +509,15 @@ def build_perftest_command(
     if peer:
         argv.append(peer)
 
-    bin_path = f"{PERFTEST}/bin/{case['bin']}"
+    bin_path = f"{host_perftest(host)}/bin/{case['bin']}"
     quoted = " ".join(shlex.quote(str(arg)) for arg in argv)
+    rdma_lib = host_rdma_core(host)
+    lib_prefix = f"LD_LIBRARY_PATH={shlex.quote(rdma_lib + '/lib')} " if rdma_lib else ""
     return (
         "set -euo pipefail; "
         f"mkdir -p {shlex.quote(str(Path(remote_json).parent))}; "
         f"cd {shlex.quote(str(Path(remote_json).parent))}; "
-        f"LD_LIBRARY_PATH={shlex.quote(RDMA_CORE + '/lib')} "
+        f"{lib_prefix}"
         f"timeout {shlex.quote(str(timeout))} {shlex.quote(bin_path)} {quoted}"
     )
 
@@ -572,6 +620,7 @@ def run_pair(
     client_json = f"{remote_dir}/client.json"
     server_cmd = build_perftest_command(
         case,
+        host=server,
         dev=dev,
         gid_index=gid_index,
         port=port,
@@ -581,6 +630,7 @@ def run_pair(
     )
     client_cmd = build_perftest_command(
         case,
+        host=client,
         dev=dev,
         gid_index=gid_index,
         port=port,

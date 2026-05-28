@@ -28,6 +28,27 @@ commands. The runner also writes `kernel`, `module_sha256`, `iommu`, and
 `server`/`client` columns per row, so the strix side identifies itself even
 if the file is moved or renamed.
 
+## Prerequisites
+
+The runner pushes its Linux closure to strix hosts via `nix copy`. For the
+mac side, those binaries aren't substitutable across architectures — you need
+a Darwin build of `perftest` already in the store and pass the path via the
+`TBV_PERFTEST_MBP` env var. `TBV_RDMA_CORE_MBP=` (empty) tells the runner not
+to set `LD_LIBRARY_PATH` — the Apple build uses dyld dynamic-lookup against
+Apple's runtime libs.
+
+```sh
+# build the darwin perftest (run this on a darwin builder or via remote build)
+mac_perftest=$(nix build --no-link --print-out-paths \
+  .#packages.aarch64-darwin.perftest 2>/dev/null) || \
+  mac_perftest=$(ssh mbp 'nix build --no-link --print-out-paths /path/to/thunderbolt-ibverbs#perftest')
+export TBV_PERFTEST_MBP="$mac_perftest"
+export TBV_RDMA_CORE_MBP=""
+```
+
+`mbp` is already in `HOST_ALIASES` (user=`grw`, address=`mbp.lan.satanic.link`,
+`skip_copy=True`) so the runner won't try to push to it.
+
 ## Recreate (strix-1 ↔ mac)
 
 ```sh
@@ -57,12 +78,10 @@ nix run .#tbv-perftest -- \
 ```
 
 Notes:
-- `--no-rail-check` because the rail-count assertion in the plan defaults to
-  the strix-strix native four-rail expectation; one cable yields 2 rails.
+- `--no-rail-check` because the rail-count assertion defaults to the
+  strix-strix native four-rail expectation; one cable yields 2 rails to mbp.
   Tighten with `--expect-rails 2 --expect-speed 20Gb/s` once we know what
   the apple-compatible backend reports here.
-- Replace `--hosts strix-N,mbp` once the mac's SSH alias / IP is known. The
-  runner expects two hostnames it can reach via the LAN bridge.
 
 ## Headline
 
