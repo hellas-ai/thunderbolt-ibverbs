@@ -29,5 +29,8 @@ install -m 0644 %{_sourcedir}/usb4_rdma.driver %{buildroot}%{provider_etc_dir}/
 %{provider_etc_dir}/usb4_rdma.driver
 
 %changelog
+* Thu May 28 2026 George Whewell <george@hellas.ai> - 0.2.0-1
+- v0.2.0: version bump alongside thunderbolt-ibverbs-dkms 0.2.0.
+
 * Tue May 26 2026 George Whewell <george@hellas.ai> - 0.1.0-1
 - Initial release.
