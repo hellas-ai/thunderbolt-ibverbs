@@ -233,8 +233,13 @@ static struct ibv_mr *usb4_rdma_reg_dmabuf_mr(struct ibv_pd *pd,
 	if (!vmr)
 		return NULL;
 
+#ifdef USB4_RDMA_OLD_REG_DMABUF_MR
+	/* rdma-core < v55 (Ubuntu 22.04/24.04 etc.) — no trailing driver_data. */
+	rv = ibv_cmd_reg_dmabuf_mr(pd, offset, length, iova, fd, access, vmr);
+#else
 	rv = ibv_cmd_reg_dmabuf_mr(pd, offset, length, iova, fd, access, vmr,
 				   NULL);
+#endif
 	if (rv) {
 		free(vmr);
 		errno = rv;
@@ -289,8 +294,14 @@ static struct verbs_context *usb4_rdma_alloc_context(struct ibv_device *base_dev
 	if (!ctx)
 		return NULL;
 
+#ifdef USB4_RDMA_OLD_GET_CONTEXT
+	/* rdma-core < v55 — no async event channel param. */
+	rv = ibv_cmd_get_context(&ctx->base, &cmd, sizeof(cmd),
+				 &resp, sizeof(resp));
+#else
 	rv = ibv_cmd_get_context(&ctx->base, &cmd, sizeof(cmd),
 				 NULL, &resp, sizeof(resp));
+#endif
 	if (rv) {
 		verbs_uninit_context(&ctx->base);
 		free(ctx);

@@ -19,31 +19,50 @@ concurrency:
 
 jobs:
   build:
-    name: build (${{ matrix.distro }})
+    name: build (${{ matrix.name }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - distro: debian
+          - name: debian
+            distro: debian
             image: debian:sid
+            build_dkms: true
             dkms_glob: 'dist/thunderbolt-ibverbs-dkms_*.deb'
             rdma_glob: 'dist/usb4-rdma-provider_*.deb'
-            all_glob:  'dist/*.deb'
-          - distro: fedora
+            upload_glob: 'dist/*.deb'
+          - name: fedora
+            distro: fedora
             image: fedora:rawhide
+            build_dkms: true
             dkms_glob: 'dist/thunderbolt-ibverbs-dkms-*.rpm'
             rdma_glob: 'dist/usb4-rdma-provider-*.rpm'
-            all_glob:  'dist/*.rpm'
-          - distro: arch
+            upload_glob: 'dist/*.rpm'
+          - name: arch
+            distro: arch
             image: archlinux:latest
+            build_dkms: true
             dkms_glob: 'dist/thunderbolt-ibverbs-dkms-*.pkg.tar.zst'
             rdma_glob: 'dist/usb4-rdma-provider-*.pkg.tar.zst'
-            all_glob:  'dist/*.pkg.tar.zst'
+            upload_glob: 'dist/*.pkg.tar.zst'
+          - name: ubuntu-jammy
+            distro: ubuntu
+            image: ubuntu:22.04
+            build_dkms: false
+            rdma_glob: 'dist/usb4-rdma-provider_*~jammy_amd64.deb'
+            upload_glob: 'dist/usb4-rdma-provider_*~jammy_amd64.deb'
+          - name: ubuntu-noble
+            distro: ubuntu
+            image: ubuntu:24.04
+            build_dkms: false
+            rdma_glob: 'dist/usb4-rdma-provider_*~noble_amd64.deb'
+            upload_glob: 'dist/usb4-rdma-provider_*~noble_amd64.deb'
     steps:
       - uses: actions/checkout@v4
 
       - name: Build DKMS package in ${{ matrix.image }}
+        if: matrix.build_dkms
         run: |
           mkdir -p dist
           docker run --rm \
@@ -55,6 +74,7 @@ jobs:
 
       - name: Build rdma-provider package in ${{ matrix.image }}
         run: |
+          mkdir -p dist
           docker run --rm \
             -v "$PWD:/work" \
             -w /work \
@@ -63,6 +83,7 @@ jobs:
           ls -la dist/
 
       - name: Verify DKMS install in ${{ matrix.image }}
+        if: matrix.build_dkms
         run: |
           docker run --rm \
             -v "$PWD:/work" \
@@ -81,8 +102,8 @@ jobs:
       - name: Upload artefacts
         uses: actions/upload-artifact@v4
         with:
-          name: thunderbolt-ibverbs-${{ matrix.distro }}
-          path: ${{ matrix.all_glob }}
+          name: thunderbolt-ibverbs-${{ matrix.name }}
+          path: ${{ matrix.upload_glob }}
           if-no-files-found: error
 
   release:

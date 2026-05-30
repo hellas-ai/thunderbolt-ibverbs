@@ -1,6 +1,6 @@
-From 567b981eb9306da0f970769a7ebab16ef8991b97 Mon Sep 17 00:00:00 2001
+From 45cdeef137e9576ced14c81cfdfa0ca0dd7e2b1c Mon Sep 17 00:00:00 2001
 From: thunderbolt-ibverbs <ci@thunderbolt-ibverbs>
-Date: Sun, 17 May 2026 01:29:14 +0200
+Date: Sat, 30 May 2026 10:39:00 +0200
 Subject: [PATCH 2/3] CMakeLists.txt: build the usb4_rdma provider
 
 ---
@@ -16,8 +16,9 @@ index 718b7d2..b2b9f0c 100644
  add_subdirectory(providers/rxe/man)
  add_subdirectory(providers/siw)
 +add_subdirectory(providers/usb4_rdma)
-
+ 
  add_subdirectory(libibmad)
  add_subdirectory(libibnetdisc)
---
+-- 
 2.53.0
+

@@ -1,6 +1,6 @@
-From b1f99e9908c2d3d8ab70008765e8ac1e47e0a60f Mon Sep 17 00:00:00 2001
+From 3043fc974d36dd07a926f206b66cbcd8d42c9862 Mon Sep 17 00:00:00 2001
 From: thunderbolt-ibverbs <ci@thunderbolt-ibverbs>
-Date: Sun, 17 May 2026 01:29:14 +0200
+Date: Sat, 30 May 2026 10:39:00 +0200
 Subject: [PATCH 3/3] libibverbs/verbs.h: declare verbs_provider_usb4_rdma
 
 Required for the static-archive build path (libibverbs/all_providers.c)
@@ -22,5 +22,6 @@ index 36d120e..1212662 100644
  extern const struct verbs_device_ops verbs_provider_vmw_pvrdma;
  extern const struct verbs_device_ops verbs_provider_ionic;
  extern const struct verbs_device_ops verbs_provider_all;
---
+-- 
 2.53.0
+

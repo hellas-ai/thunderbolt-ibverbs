@@ -1,6 +1,6 @@
-From 0b38d4653e9471df61c3b161cc213a2f98c1e83c Mon Sep 17 00:00:00 2001
+From 64a125f47ebf75f51f138cb6ccbf5ecdc9382bbd Mon Sep 17 00:00:00 2001
 From: thunderbolt-ibverbs <ci@thunderbolt-ibverbs>
-Date: Sun, 17 May 2026 01:29:14 +0200
+Date: Sat, 30 May 2026 10:39:00 +0200
 Subject: [PATCH 1/3] providers/usb4_rdma: add USB4 soft-RDMA provider
 
 Out-of-tree provider for the usb4_rdma kernel module which exposes
@@ -9,12 +9,12 @@ devices.
 
 Source: https://github.com/hellas-ai/thunderbolt-ibverbs
 ---
- providers/usb4_rdma/CMakeLists.txt   |   3 +
- providers/usb4_rdma/usb4_rdma.c      | 335 +++++++++++++++++++++++++++
+ providers/usb4_rdma/CMakeLists.txt   |  14 +
+ providers/usb4_rdma/usb4_rdma.c      | 370 +++++++++++++++++++++++++++
  providers/usb4_rdma/usb4_rdma.driver |   1 +
- providers/usb4_rdma/usb4_rdma.h      |  26 +++
+ providers/usb4_rdma/usb4_rdma.h      |  26 ++
  providers/usb4_rdma/usb4_rdma_abi.h  |  15 ++
- 5 files changed, 380 insertions(+)
+ 5 files changed, 426 insertions(+)
  create mode 100644 providers/usb4_rdma/CMakeLists.txt
  create mode 100644 providers/usb4_rdma/usb4_rdma.c
  create mode 100644 providers/usb4_rdma/usb4_rdma.driver
@@ -23,19 +23,30 @@ Source: https://github.com/hellas-ai/thunderbolt-ibverbs
 
 diff --git a/providers/usb4_rdma/CMakeLists.txt b/providers/usb4_rdma/CMakeLists.txt
 new file mode 100644
-index 0000000..c032062
+index 0000000..c45c710
 --- /dev/null
 +++ b/providers/usb4_rdma/CMakeLists.txt
-@@ -0,0 +1,3 @@
+@@ -0,0 +1,14 @@
++# rdma-core v55+ grew two extra parameters on internal helpers the provider
++# uses: ibv_cmd_get_context (new fd_arr parameter at position 4) and
++# ibv_cmd_reg_dmabuf_mr (new driver command-buffer parameter at the end).
++# Provider source defaults to the v55+ form; here we set guards so the older
++# form is used when building against pre-v55 rdma-core (e.g. Ubuntu 22.04
++# ships v39, Ubuntu 24.04 ships v50). The exact cutoff is v55.
++if(PACKAGE_VERSION VERSION_LESS "55")
++    add_definitions(-DUSB4_RDMA_OLD_GET_CONTEXT=1)
++    add_definitions(-DUSB4_RDMA_OLD_REG_DMABUF_MR=1)
++endif()
++
 +rdma_provider(usb4_rdma
 +  usb4_rdma.c
 +)
 diff --git a/providers/usb4_rdma/usb4_rdma.c b/providers/usb4_rdma/usb4_rdma.c
 new file mode 100644
-index 0000000..6afd084
+index 0000000..9c34ff8
 --- /dev/null
 +++ b/providers/usb4_rdma/usb4_rdma.c
-@@ -0,0 +1,359 @@
+@@ -0,0 +1,370 @@
 +// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 +/*
 + * usb4_rdma userspace verbs provider — Tier 1 skeleton.
@@ -271,8 +282,13 @@ index 0000000..6afd084
 +	if (!vmr)
 +		return NULL;
 +
++#ifdef USB4_RDMA_OLD_REG_DMABUF_MR
++	/* rdma-core < v55 (Ubuntu 22.04/24.04 etc.) — no trailing driver_data. */
++	rv = ibv_cmd_reg_dmabuf_mr(pd, offset, length, iova, fd, access, vmr);
++#else
 +	rv = ibv_cmd_reg_dmabuf_mr(pd, offset, length, iova, fd, access, vmr,
 +				   NULL);
++#endif
 +	if (rv) {
 +		free(vmr);
 +		errno = rv;
@@ -327,8 +343,14 @@ index 0000000..6afd084
 +	if (!ctx)
 +		return NULL;
 +
++#ifdef USB4_RDMA_OLD_GET_CONTEXT
++	/* rdma-core < v55 — no async event channel param. */
++	rv = ibv_cmd_get_context(&ctx->base, &cmd, sizeof(cmd),
++				 &resp, sizeof(resp));
++#else
 +	rv = ibv_cmd_get_context(&ctx->base, &cmd, sizeof(cmd),
 +				 NULL, &resp, sizeof(resp));
++#endif
 +	if (rv) {
 +		verbs_uninit_context(&ctx->base);
 +		free(ctx);
@@ -455,5 +477,6 @@ index 0000000..5fd8c2f
 +#define USB4_RDMA_ABI_VERSION 1
 +
 +#endif /* USB4_RDMA_ABI_H */
---
+-- 
 2.53.0
+
