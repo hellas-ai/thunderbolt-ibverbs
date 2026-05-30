@@ -35,9 +35,33 @@ tell your agent- check out github.com/hellas-ai/thunderbolt-ibverbs and find out
 ## no, really, how do i use it?
 at a high level:
 
-load this kernel module- instructions differ by OS- this will create IB devices in `/dev/sys/class/infiniband` for each visible HCA:
-connect usb4 cables
-pass them and your gpu(s) to the ibverbs-enabled docker images from `nix-strix-halo`
+1. load the kernel module on the host (instructions per OS in [Install From GitHub Releases](#install-from-github-releases) below) — creates an IB device in `/sys/class/infiniband` per visible HCA
+2. connect usb4 cables between hosts
+3. run your workload against the device
+
+## run inside a stock pytorch / vllm / llama.cpp container
+
+the kernel module stays on the host. inside the container you just need our libibverbs provider so the stock `libibverbs.so` enumerates the device. drop the .deb in for your container's ubuntu codename:
+
+```sh
+docker run --rm -it \
+    --device=/dev/infiniband \
+    --cap-add=IPC_LOCK --ulimit memlock=-1 \
+    pytorch/pytorch:latest bash
+
+# inside the container — pick ~jammy for ubuntu 22.04, ~noble for 24.04:
+apt install -y ibverbs-utils \
+    https://github.com/hellas-ai/thunderbolt-ibverbs/releases/latest/download/usb4-rdma-provider_0.2.0~jammy_amd64.deb
+
+ibv_devices
+# device          	   node GUID
+# ------          	----------------
+# usb4_rdma0      	...
+```
+
+NCCL / UCX / perftest inside the container then see `usb4_rdma*` as a normal IB device.
+
+if you want a batteries-included image with vllm / llama.cpp / rdma-core-usb4 / perftest already baked in (heavier — a few GB), use the ibverbs-enabled docker images from [github.com/hellas-ai/nix-strix-halo](https://github.com/hellas-ai/nix-strix-halo).
 
 ## that sounds complicated, is there any easier way?
 sure, download and write the usb-bootable image from here, insert it into your machines, hit f11 while its booting to select the usb stick

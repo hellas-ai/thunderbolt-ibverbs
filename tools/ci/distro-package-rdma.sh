@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
-# Build the usb4_rdma libibverbs userspace provider by applying our patches to
-# rdma-core upstream, building with CMake/Ninja inside the target distro
-# container, then packaging the resulting .so + driver hint as a native
-# .deb/.rpm/.pkg.tar.zst. Building inside each distro's container gives a
-# provider .so whose libibverbs PABI version matches that distro's libibverbs.
+# Build the usb4_rdma libibverbs userspace provider and package it as a native
+# .deb / .rpm / .pkg.tar.zst. The provider .so is built against the same
+# rdma-core source as the target distro's libibverbs so the PABI version
+# matches and apt/dnf/pacman can install the package as a drop-in.
+#
+#   debian      → upstream rdma-core v62.0 (Debian sid ships current)
+#   ubuntu      → distro's own rdma-core via apt-get source (handles 22.04+
+#                 where stock libibverbs PABI is older than v62.0)
+#   fedora|arch → upstream rdma-core v62.0
 
 set -euo pipefail
 
 usage() {
 	cat <<'EOF'
 Usage:
-  tools/ci/distro-package-rdma.sh debian|fedora|arch
+  tools/ci/distro-package-rdma.sh debian|ubuntu|fedora|arch
 
-Outputs the produced .deb / .rpm / .pkg.tar.zst into OUT_DIR.
+Outputs the produced .deb / .rpm / .pkg.tar.zst into OUT_DIR. For ubuntu the
+filename includes the distro codename (e.g. usb4-rdma-provider_0.2.0~jammy_amd64.deb).
 
 Environment:
-  TBV_VERSION       Override version (default reads PACKAGE_VERSION from dkms.conf).
+  TBV_VERSION       Override base version (default reads PACKAGE_VERSION from dkms.conf).
   OUT_DIR           Output directory (default $PWD/dist).
   WORK_DIR          Scratch directory (default mktemp).
-  RDMA_CORE_TAG     rdma-core git tag to build against (default v62.0).
+  RDMA_CORE_TAG     rdma-core git tag for the upstream-source distros (default v62.0).
+                    Ignored for ubuntu (uses apt-get source).
   TBV_SKIP_DEPS     Skip distro deps install (default 0).
   TBV_SKIP_BUILD    Skip the rdma-core build step (used by the arch builder
                     re-exec; default 0).
@@ -28,14 +34,27 @@ EOF
 distro="${1:-}"
 case "${distro:-}" in
 	-h|--help) usage; exit 0 ;;
-	debian|fedora|arch) ;;
+	debian|ubuntu|fedora|arch) ;;
 	"") usage >&2; exit 1 ;;
 	*) printf 'error: unsupported distro: %s\n' "$distro" >&2; exit 1 ;;
 esac
 
 repo_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-version="${TBV_VERSION:-$(awk -F'"' '/^PACKAGE_VERSION=/ { print $2; exit }' "$repo_root/dkms.conf")}"
-[[ -n "$version" ]] || { printf 'error: could not determine version\n' >&2; exit 1; }
+base_version="${TBV_VERSION:-$(awk -F'"' '/^PACKAGE_VERSION=/ { print $2; exit }' "$repo_root/dkms.conf")}"
+[[ -n "$base_version" ]] || { printf 'error: could not determine version\n' >&2; exit 1; }
+
+# Ubuntu builds encode the codename in the version so different ubuntu releases'
+# .debs don't collide on the GitHub Releases page and apt picks the right one.
+codename=""
+if [[ "$distro" == "ubuntu" && -r /etc/os-release ]]; then
+	codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-${UBUNTU_CODENAME:-unknown}}")"
+fi
+if [[ -n "$codename" ]]; then
+	version="${base_version}~${codename}"
+else
+	version="$base_version"
+fi
+
 out_dir="${OUT_DIR:-$repo_root/dist}"
 work_dir="${WORK_DIR:-$(mktemp -d)}"
 rdma_core_tag="${RDMA_CORE_TAG:-v62.0}"
@@ -57,6 +76,22 @@ install_deps() {
 				libudev-dev libssl-dev ninja-build patch patchelf pkg-config \
 				python3-docutils python3-pyelftools
 			;;
+		ubuntu)
+			export DEBIAN_FRONTEND=noninteractive
+			# Enable deb-src so apt-get source can fetch rdma-core. Ubuntu 22.04
+			# uses /etc/apt/sources.list; 24.04 uses /etc/apt/sources.list.d/ubuntu.sources.
+			if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+				sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+			else
+				sed -i 's/^# deb-src/deb-src/' /etc/apt/sources.list
+			fi
+			apt-get update -qq
+			apt-get install -y -qq --no-install-recommends \
+				build-essential ca-certificates cmake dpkg-dev \
+				libcap-dev libnl-3-dev libnl-route-3-dev libsystemd-dev \
+				libudev-dev libssl-dev ninja-build patch patchelf pkg-config \
+				python3-docutils python3-pyelftools
+			;;
 		fedora)
 			dnf install -y -q --setopt=install_weak_deps=False \
 				cmake gcc gcc-c++ git libcap-devel libnl3-devel libudev-devel \
@@ -71,23 +106,49 @@ install_deps() {
 	esac
 }
 
+# Populate $src with the rdma-core source tree, patched. Strategy depends on
+# distro: ubuntu uses its own packaged source so PABI matches stock libibverbs;
+# everything else uses upstream v62.0.
+fetch_rdma_core_source() {
+	local src="$1"
+	rm -rf "$src"
+	if [[ "$distro" == "ubuntu" ]]; then
+		mkdir -p "$src"
+		( cd "$src" && apt-get source rdma-core >/dev/null )
+		# apt-get source extracts to ./rdma-core-<ver>/; move it up so $src
+		# itself is the source root.
+		local extracted
+		extracted="$(find "$src" -maxdepth 1 -type d -name 'rdma-core-*' -print -quit)"
+		[[ -n "$extracted" ]] ||
+			{ printf 'error: apt-get source did not extract rdma-core\n' >&2; exit 1; }
+		mv "$extracted"/* "$extracted"/.[!.]* "$src"/ 2>/dev/null || true
+		rmdir "$extracted"
+	else
+		git clone --depth 1 --branch "$rdma_core_tag" \
+			https://github.com/linux-rdma/rdma-core "$src"
+	fi
+}
+
 build_provider() {
 	[[ "$skip_build" == "1" ]] && return 0
 	local src="$work_dir/rdma-core"
 	local build="$src/build"
 
-	if [[ ! -d "$src" ]]; then
-		git clone --depth 1 --branch "$rdma_core_tag" \
-			https://github.com/linux-rdma/rdma-core "$src"
-	fi
+	fetch_rdma_core_source "$src"
 
+	# Our patches were generated against v62.0 but apply (with offset/fuzz) to
+	# older rdma-core down to at least v39 (Ubuntu 22.04). Patch 1 only adds
+	# new files; 2 and 3 absorb hunk drift automatically.
 	for p in "$repo_root/packaging/rdma-core-patches"/*.patch; do
 		( cd "$src" && patch --silent -p1 < "$p" )
 	done
 
 	rm -rf "$build"
 	mkdir "$build"
-	( cd "$build" && cmake -GNinja -DNO_PYVERBS=1 .. >/dev/null && ninja )
+	# NO_MAN_PAGES because Ubuntu's apt-get source tree ships a pandoc cache
+	# that doesn't match all manpage inputs after our patches; we don't need
+	# manpages in the artefact anyway.
+	( cd "$build" && cmake -GNinja -DNO_PYVERBS=1 -DNO_MAN_PAGES=1 .. >/dev/null && ninja )
 
 	local so
 	so="$(find "$build/lib" -maxdepth 1 -name 'libusb4_rdma-rdmav*.so' -print -quit)"
@@ -211,7 +272,7 @@ install_deps
 build_provider
 
 case "$distro" in
-	debian) build_deb ;;
+	debian|ubuntu) build_deb ;;
 	fedora) build_rpm ;;
 	arch)   build_arch ;;
 esac
