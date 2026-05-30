@@ -82,6 +82,87 @@ static int query_caps(struct ibv_context *ctx,
 	return 0;
 }
 
+static int create_queue(struct ibv_qp *qp,
+			const struct usb4_rdma_dv_queue_create *req,
+			struct usb4_rdma_dv_queue_resp *resp)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[3];
+	} cmd = {
+		.hdr = {
+			.length = sizeof(cmd),
+			.object_id = USB4_RDMA_DV_OBJECT_DEVICE,
+			.method_id = USB4_RDMA_DV_METHOD_CREATE_QUEUE,
+			.num_attrs = 3,
+			.driver_id = RDMA_DRIVER_UNKNOWN,
+		},
+		.attrs = {
+			{
+				.attr_id = USB4_RDMA_DV_ATTR_CREATE_QUEUE_QP,
+				.flags = UVERBS_ATTR_F_MANDATORY,
+				.data = qp->handle,
+			},
+			{
+				.attr_id = USB4_RDMA_DV_ATTR_CREATE_QUEUE_REQ,
+				.len = sizeof(*req),
+				.flags = UVERBS_ATTR_F_MANDATORY,
+				.data = (uintptr_t)req,
+			},
+			{
+				.attr_id = USB4_RDMA_DV_ATTR_CREATE_QUEUE_RESP,
+				.len = sizeof(*resp),
+				.flags = UVERBS_ATTR_F_MANDATORY,
+				.data = (uintptr_t)resp,
+			},
+		},
+	};
+
+	memset(resp, 0, sizeof(*resp));
+	if (ioctl(qp->context->cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return errno;
+	return 0;
+}
+
+static int destroy_queue(struct ibv_qp *qp)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[1];
+	} cmd = {
+		.hdr = {
+			.length = sizeof(cmd),
+			.object_id = USB4_RDMA_DV_OBJECT_DEVICE,
+			.method_id = USB4_RDMA_DV_METHOD_DESTROY_QUEUE,
+			.num_attrs = 1,
+			.driver_id = RDMA_DRIVER_UNKNOWN,
+		},
+		.attrs = {
+			{
+				.attr_id = USB4_RDMA_DV_ATTR_DESTROY_QUEUE_QP,
+				.flags = UVERBS_ATTR_F_MANDATORY,
+				.data = qp->handle,
+			},
+		},
+	};
+
+	if (ioctl(qp->context->cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return errno;
+	return 0;
+}
+
+static int alloc_aligned(size_t alignment, size_t size, void **ptr)
+{
+	int ret;
+
+	*ptr = NULL;
+	ret = posix_memalign(ptr, alignment, size);
+	if (ret)
+		return ret;
+	memset(*ptr, 0, size);
+	return 0;
+}
+
 static void print_caps_bitmap(uint32_t caps)
 {
 	const struct {
@@ -172,16 +253,223 @@ static void print_doorbell_layout(void)
 	       sizeof(((struct usb4_rdma_dv_wqe *)0)->generation));
 }
 
+static int run_queue_test(struct ibv_context *ctx,
+			  const struct usb4_rdma_dv_query_caps_resp *caps)
+{
+	struct usb4_rdma_dv_queue_create req = {};
+	struct usb4_rdma_dv_queue_resp resp = {};
+	struct ibv_qp_init_attr qp_attr = {};
+	struct ibv_mr *doorbell_mr = NULL;
+	struct ibv_mr *cq_mr = NULL;
+	struct ibv_mr *sq_mr = NULL;
+	struct ibv_qp *qp = NULL;
+	struct ibv_cq *cq = NULL;
+	struct ibv_pd *pd = NULL;
+	size_t doorbell_bytes = caps->doorbell_page_size;
+	size_t cq_bytes = (size_t)caps->default_cq_entries * caps->cqe_size;
+	size_t sq_bytes = (size_t)caps->default_sq_entries * caps->wqe_size;
+	void *doorbell = NULL;
+	void *cq_buf = NULL;
+	void *sq_buf = NULL;
+	int access = IBV_ACCESS_LOCAL_WRITE;
+	int ret = 1;
+	int err;
+
+	if (caps->abi_version != USB4_RDMA_DV_ABI_VERSION) {
+		fprintf(stderr, "queue test skipped: unsupported ABI %u\n",
+			caps->abi_version);
+		return 2;
+	}
+
+	err = alloc_aligned(caps->wqe_size, sq_bytes, &sq_buf);
+	if (err) {
+		fprintf(stderr, "alloc SQ: %s\n", strerror(err));
+		goto out;
+	}
+	err = alloc_aligned(caps->cqe_size, cq_bytes, &cq_buf);
+	if (err) {
+		fprintf(stderr, "alloc CQ: %s\n", strerror(err));
+		goto out;
+	}
+	err = alloc_aligned(caps->doorbell_page_size, doorbell_bytes, &doorbell);
+	if (err) {
+		fprintf(stderr, "alloc doorbell: %s\n", strerror(err));
+		goto out;
+	}
+
+	pd = ibv_alloc_pd(ctx);
+	if (!pd) {
+		fprintf(stderr, "ibv_alloc_pd: %s\n", strerror(errno));
+		goto out;
+	}
+	sq_mr = ibv_reg_mr(pd, sq_buf, sq_bytes, access);
+	if (!sq_mr) {
+		fprintf(stderr, "ibv_reg_mr(SQ): %s\n", strerror(errno));
+		goto out;
+	}
+	cq_mr = ibv_reg_mr(pd, cq_buf, cq_bytes, access);
+	if (!cq_mr) {
+		fprintf(stderr, "ibv_reg_mr(CQ): %s\n", strerror(errno));
+		goto out;
+	}
+	doorbell_mr = ibv_reg_mr(pd, doorbell, doorbell_bytes, access);
+	if (!doorbell_mr) {
+		fprintf(stderr, "ibv_reg_mr(doorbell): %s\n", strerror(errno));
+		goto out;
+	}
+
+	cq = ibv_create_cq(ctx, caps->default_cq_entries, NULL, NULL, 0);
+	if (!cq) {
+		fprintf(stderr, "ibv_create_cq: %s\n", strerror(errno));
+		goto out;
+	}
+
+	qp_attr.send_cq = cq;
+	qp_attr.recv_cq = cq;
+	qp_attr.qp_type = IBV_QPT_RC;
+	qp_attr.cap.max_send_wr = caps->default_sq_entries;
+	qp_attr.cap.max_recv_wr = 1;
+	qp_attr.cap.max_send_sge = 1;
+	qp_attr.cap.max_recv_sge = 1;
+	qp = ibv_create_qp(pd, &qp_attr);
+	if (!qp) {
+		fprintf(stderr, "ibv_create_qp: %s\n", strerror(errno));
+		goto out;
+	}
+
+	req.abi_version = USB4_RDMA_DV_ABI_VERSION;
+	req.sq_addr = (uintptr_t)sq_buf;
+	req.cq_addr = (uintptr_t)cq_buf;
+	req.doorbell_addr = (uintptr_t)doorbell;
+	req.sq_entries = caps->default_sq_entries;
+	req.cq_entries = caps->default_cq_entries;
+	req.sq_stride = caps->wqe_size;
+	req.cq_stride = caps->cqe_size;
+
+	err = create_queue(qp, &req, &resp);
+	if (err) {
+		fprintf(stderr, "CREATE_QUEUE failed: %s (%d)\n",
+			strerror(err), err);
+		goto out;
+	}
+
+	printf("create_queue qp_num=%u generation=%u sq_entries=%u cq_entries=%u\n",
+	       resp.qp_num, resp.generation, req.sq_entries, req.cq_entries);
+
+	if (resp.qp_num != qp->qp_num) {
+		fprintf(stderr,
+			"CREATE_QUEUE returned qp_num=%u (expected %u)\n",
+			resp.qp_num, qp->qp_num);
+		(void)destroy_queue(qp);
+		goto out;
+	}
+	if (!resp.generation) {
+		fprintf(stderr, "CREATE_QUEUE returned generation=0 (must be nonzero)\n");
+		(void)destroy_queue(qp);
+		goto out;
+	}
+
+	{
+		/*
+		 * The kernel publishes the LIVE state into the consumer line
+		 * of the doorbell. Verify the GPU side would read what the
+		 * contract promises: packed (index=0, generation=X) tails
+		 * and qp_state=LIVE. Without a fence the test buffer is
+		 * already coherent on the CPU side after the ioctl returns.
+		 */
+		const struct usb4_rdma_dv_doorbell *db = doorbell;
+
+		printf("doorbell_after_create sq_head=0x%08x cq_tail=0x%08x qp_state=%u generation=%u\n",
+		       db->consumer.sq_head, db->consumer.cq_tail,
+		       db->consumer.qp_state, db->consumer.generation);
+
+		if (db->consumer.generation != resp.generation ||
+		    db->consumer.qp_state != USB4_RDMA_DV_QP_LIVE ||
+		    usb4_rdma_dv_tail_generation(db->consumer.sq_head) != resp.generation ||
+		    usb4_rdma_dv_tail_generation(db->consumer.cq_tail) != resp.generation ||
+		    usb4_rdma_dv_tail_index(db->consumer.sq_head) != 0 ||
+		    usb4_rdma_dv_tail_index(db->consumer.cq_tail) != 0) {
+			fprintf(stderr,
+				"doorbell consumer line did not match LIVE state\n");
+			(void)destroy_queue(qp);
+			goto out;
+		}
+	}
+
+	/* Second CREATE_QUEUE must be rejected with -EBUSY while the
+	 * first is still attached. */
+	err = create_queue(qp, &req, &resp);
+	if (err != EBUSY) {
+		fprintf(stderr,
+			"second CREATE_QUEUE should have failed with EBUSY, got %s (%d)\n",
+			err ? strerror(err) : "success", err);
+		(void)destroy_queue(qp);
+		goto out;
+	}
+	printf("create_queue_again rejected ebusy=ok\n");
+
+	err = destroy_queue(qp);
+	if (err) {
+		fprintf(stderr, "DESTROY_QUEUE failed: %s (%d)\n",
+			strerror(err), err);
+		goto out;
+	}
+	{
+		const struct usb4_rdma_dv_doorbell *db = doorbell;
+
+		printf("doorbell_after_destroy qp_state=%u generation=%u\n",
+		       db->consumer.qp_state, db->consumer.generation);
+		if (db->consumer.qp_state != USB4_RDMA_DV_QP_DEAD ||
+		    db->consumer.generation == resp.generation ||
+		    !db->consumer.generation) {
+			fprintf(stderr,
+				"doorbell consumer line did not reach DEAD with bumped generation\n");
+			goto out;
+		}
+	}
+	printf("destroy_queue ok\n");
+
+	/* DESTROY_QUEUE on an already-destroyed queue must return ENOENT. */
+	err = destroy_queue(qp);
+	if (err != ENOENT) {
+		fprintf(stderr,
+			"second DESTROY_QUEUE should have failed with ENOENT, got %s (%d)\n",
+			err ? strerror(err) : "success", err);
+		goto out;
+	}
+	printf("destroy_queue_again rejected enoent=ok\n");
+
+	ret = 0;
+out:
+	if (qp && ibv_destroy_qp(qp))
+		fprintf(stderr, "ibv_destroy_qp: %s\n", strerror(errno));
+	if (cq && ibv_destroy_cq(cq))
+		fprintf(stderr, "ibv_destroy_cq: %s\n", strerror(errno));
+	if (doorbell_mr && ibv_dereg_mr(doorbell_mr))
+		fprintf(stderr, "ibv_dereg_mr(doorbell): %s\n", strerror(errno));
+	if (cq_mr && ibv_dereg_mr(cq_mr))
+		fprintf(stderr, "ibv_dereg_mr(CQ): %s\n", strerror(errno));
+	if (sq_mr && ibv_dereg_mr(sq_mr))
+		fprintf(stderr, "ibv_dereg_mr(SQ): %s\n", strerror(errno));
+	if (pd && ibv_dealloc_pd(pd))
+		fprintf(stderr, "ibv_dealloc_pd: %s\n", strerror(errno));
+	free(doorbell);
+	free(cq_buf);
+	free(sq_buf);
+	return ret;
+}
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"usage: %s [-d <device>] [-l]\n"
+		"usage: %s [-d <device>] [-l] [-q]\n"
 		"\n"
 		"Probe USB4 RDMA Direct Verbs QUERY_CAPS on a usb4_rdma* device.\n"
 		"\n"
 		"Options:\n"
 		"  -d <device>   Match device by name (default: first usb4_rdma* / usb4_apple*)\n"
 		"  -l            Print doorbell/WQE layout only; do not open a device\n"
+		"  -q            After QUERY_CAPS, exercise CREATE_QUEUE/DESTROY_QUEUE on a fresh QP\n"
 		"  -h            Print this help\n",
 		argv0);
 }
@@ -194,17 +482,21 @@ int main(int argc, char **argv)
 	struct ibv_context *ctx;
 	const char *wanted = NULL;
 	bool layout_only = false;
+	bool queue_test = false;
 	int num_devices = 0;
 	int opt;
 	int err;
 
-	while ((opt = getopt(argc, argv, "d:lh")) != -1) {
+	while ((opt = getopt(argc, argv, "d:lqh")) != -1) {
 		switch (opt) {
 		case 'd':
 			wanted = optarg;
 			break;
 		case 'l':
 			layout_only = true;
+			break;
+		case 'q':
+			queue_test = true;
 			break;
 		case 'h':
 			usage(argv[0]);
@@ -267,6 +559,14 @@ int main(int argc, char **argv)
 	printf("tail_index_bits=%" PRIu32 " tail_generation_bits=%" PRIu32 "\n",
 	       resp.tail_index_bits, resp.tail_generation_bits);
 	print_doorbell_layout();
+
+	if (queue_test) {
+		int rc = run_queue_test(ctx, &resp);
+
+		ibv_close_device(ctx);
+		ibv_free_device_list(list);
+		return rc;
+	}
 
 	ibv_close_device(ctx);
 	ibv_free_device_list(list);

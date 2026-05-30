@@ -572,7 +572,42 @@ const char *tbv_backend_name(enum tbv_backend_type type);
 int tbv_ibdev_start(struct tbv_state *state, bool register_verbs);
 void tbv_ibdev_stop(struct tbv_state *state);
 struct ib_device;
+struct ib_qp;
+struct ib_umem;
+struct tbv_qp;
 struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev);
+
+/*
+ * USB4 RDMA Direct Verbs (DV) per-QP state.
+ *
+ * Each QP owns one of these. CREATE_QUEUE attaches userspace-provided
+ * SQ/CQ/doorbell memory; DESTROY_QUEUE (or QP destroy) bumps the
+ * generation and releases it. mutex serializes attach/detach against
+ * each other and against QP teardown; nothing in here is on the WQE
+ * fast path yet — that lives in subsequent commits.
+ */
+struct tbv_dv_qp_state {
+	struct mutex mutex;
+	bool active;
+	u8 generation;
+	u32 sq_entries;
+	u32 cq_entries;
+	u64 sq_addr;
+	u64 cq_addr;
+	u64 doorbell_addr;
+	struct ib_umem *sq_umem;
+	struct ib_umem *cq_umem;
+	struct ib_umem *doorbell_umem;
+};
+
+void tbv_dv_qp_state_init(struct tbv_dv_qp_state *dv);
+void tbv_dv_qp_state_teardown(struct tbv_dv_qp_state *dv);
+bool tbv_dv_qp_state_active(struct tbv_dv_qp_state *dv);
+
+/* Helpers used by dv.c to reach the per-QP state without exposing the
+ * full tbv_qp layout outside ibdev.c. */
+struct tbv_qp *tbv_qp_from_ibqp(struct ib_qp *ibqp);
+struct tbv_dv_qp_state *tbv_qp_dv_state(struct tbv_qp *tqp);
 const char *tbv_ibdev_roce_netdev_name(void);
 /*
  * Notify the verbs layer that rail's data path has come up (joined=true) or

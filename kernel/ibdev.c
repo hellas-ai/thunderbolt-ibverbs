@@ -308,7 +308,18 @@ struct tbv_qp {
 	bool dest_qp_known;
 	bool closing;
 	bool timeout_work_armed;
+	struct tbv_dv_qp_state dv;
 };
+
+struct tbv_qp *tbv_qp_from_ibqp(struct ib_qp *ibqp)
+{
+	return container_of(ibqp, struct tbv_qp, base);
+}
+
+struct tbv_dv_qp_state *tbv_qp_dv_state(struct tbv_qp *tqp)
+{
+	return &tqp->dv;
+}
 
 struct tbv_mr {
 	struct ib_mr base;
@@ -1484,6 +1495,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	tqp->owner = state;
 	spin_lock_init(&tqp->lock);
 	mutex_init(&tqp->rx_lock);
+	tbv_dv_qp_state_init(&tqp->dv);
 	init_waitqueue_head(&tqp->credit_wait);
 	init_waitqueue_head(&tqp->apple_tx_wait);
 	init_waitqueue_head(&tqp->refs_wait);
@@ -1534,6 +1546,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	spin_lock_irqsave(&tqp->lock, flags);
 	tqp->closing = true;
 	spin_unlock_irqrestore(&tqp->lock, flags);
+	tbv_dv_qp_state_teardown(&tqp->dv);
 	wake_up_all(&tqp->credit_wait);
 	wake_up_all(&tqp->apple_tx_wait);
 	cancel_work_sync(&tqp->apple_sq_work);
@@ -3293,6 +3306,18 @@ static int tbv_post_send(struct ib_qp *qp, const struct ib_send_wr *wr,
 	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
 	const struct ib_send_wr *cur;
 	int ret;
+
+	/*
+	 * GDA-exclusive QP semantics: once a DV queue is attached, the
+	 * GPU owns the send queue and standard ibv_post_send is rejected.
+	 * post_recv is intentionally unaffected — the receive queue stays
+	 * kernel-owned in v1.
+	 */
+	if (tbv_dv_qp_state_active(&tqp->dv)) {
+		if (bad_wr)
+			*bad_wr = wr;
+		return -EBUSY;
+	}
 
 	for (cur = wr; cur; cur = cur->next) {
 		ret = tbv_post_send_one(tqp, cur);
