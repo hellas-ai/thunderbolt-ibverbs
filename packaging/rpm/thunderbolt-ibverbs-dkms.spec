@@ -51,6 +51,11 @@ fi
 /usr/src/%{modname}-%{version}/*
 
 %changelog
+* Sat May 30 2026 George Whewell <george@hellas.ai> - 0.2.1-1
+- v0.2.1: no DKMS-side changes; release cut alongside Ubuntu 22.04 and
+  24.04 usb4-rdma-provider .debs so PyTorch / vllm / llama.cpp users can
+  apt-install the provider directly inside stock containers.
+
 * Thu May 28 2026 George Whewell <george@hellas.ai> - 0.2.0-1
 - v0.2.0: aarch64-darwin perftest and bench-tools, IOMMU-off transport
   sweep results, Mac↔Linux UC SEND harness, additional kernel and
