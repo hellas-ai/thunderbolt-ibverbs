@@ -61,6 +61,8 @@ ibv_devices
 
 NCCL / UCX / perftest inside the container then see `usb4_rdma*` as a normal IB device.
 
+if you want a batteries-included image with vllm / llama.cpp / rdma-core-usb4 / perftest already baked in (heavier — a few GB), use the ibverbs-enabled docker images from [github.com/hellas-ai/nix-strix-halo](https://github.com/hellas-ai/nix-strix-halo).
+
 ## that sounds complicated, is there any easier way?
 sure, download and write the usb-bootable image from here, insert it into your machines, hit f11 while its booting to select the usb stick
 
