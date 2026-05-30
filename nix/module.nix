@@ -23,7 +23,13 @@ stdenv.mkDerivation {
         || rel == "kernel"
         || lib.hasPrefix "kernel/" rel
         || rel == "proto"
-        || lib.hasPrefix "proto/" rel;
+        || lib.hasPrefix "proto/" rel
+        || rel == "userspace"
+        || rel == "userspace/usb4_rdma"
+        # The DV ABI header is shared between kernel and userspace consumers.
+        # Pull just the header into the kernel build; the rest of
+        # userspace/ remains out of scope for the module derivation.
+        || rel == "userspace/usb4_rdma/usb4_rdma_dv.h";
   };
 
   nativeBuildInputs = kernel.moduleBuildDependencies;

@@ -31,11 +31,19 @@
 #include <rdma/ib_umem.h>
 #include <rdma/ib_user_verbs.h>
 #include <rdma/ib_verbs.h>
+#include <rdma/uverbs_ioctl.h>
 
 #include "../proto/apple_tx.h"
 #include "../proto/native_data.h"
 #include "../proto/reliability.h"
 #include "tbv.h"
+
+/*
+ * Defined in kernel/dv.c. The DV uapi definition table is wired into the
+ * ib_device at register time so userspace can issue the USB4_RDMA_DV_*
+ * private uverbs methods. See userspace/usb4_rdma/usb4_rdma_dv.h.
+ */
+extern const struct uapi_definition tbv_uapi_defs[];
 
 #define TBV_IBDEV_ABI_VERSION 1
 #define TBV_IBDEV_PORTS 1
@@ -804,7 +812,7 @@ static struct tbv_ibdev *tbv_to_ibdev(struct ib_device *ibdev)
 	return container_of(ibdev, struct tbv_ibdev, base);
 }
 
-static struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev)
+struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev)
 {
 	struct tbv_ibdev *dev = tbv_to_ibdev(ibdev);
 
@@ -9289,6 +9297,8 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
 		BIT_ULL(IB_USER_VERBS_CMD_POST_RECV) |
 		BIT_ULL(IB_USER_VERBS_CMD_POLL_CQ) |
 		BIT_ULL(IB_USER_VERBS_CMD_REQ_NOTIFY_CQ);
+	if (IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS))
+		dev->base.driver_def = tbv_uapi_defs;
 
 	ib_set_device_ops(&dev->base, &tbv_ibdev_ops);
 

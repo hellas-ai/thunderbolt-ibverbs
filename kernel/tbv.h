@@ -663,6 +663,8 @@ const char *tbv_backend_name(enum tbv_backend_type type);
 
 int tbv_ibdev_start(struct tbv_state *state, bool register_verbs);
 void tbv_ibdev_stop(struct tbv_state *state);
+struct ib_device;
+struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev);
 const char *tbv_ibdev_roce_netdev_name(void);
 /*
  * Notify the verbs layer that rail's data path has come up (joined=true) or
