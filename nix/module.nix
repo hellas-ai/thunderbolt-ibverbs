@@ -51,6 +51,7 @@ stdenv.mkDerivation {
   meta = {
     description = "Thunderbolt/USB4 host-to-host RDMA verbs kernel module";
     license = lib.licenses.gpl2Only;
+    maintainers = with lib.maintainers; [ georgewhewell ];
     platforms = [ "x86_64-linux" ];
   };
 }

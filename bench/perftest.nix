@@ -201,6 +201,7 @@ let
     '';
     meta = {
       description = plan.description;
+      maintainers = with lib.maintainers; [ georgewhewell ];
       platforms = lib.platforms.linux;
     };
   };
