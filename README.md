@@ -1,5 +1,9 @@
 # thunderbolt-ibverbs
 
+[![Hydra module][hydra-module-badge]][hydra-module]
+[hydra-module-badge]: https://img.shields.io/endpoint?label=hydra%20module&url=https%3A%2F%2Fhydra.hellas.ai%2Fjob%2Fhellas%2Fthunderbolt-ibverbs%2Fx86_64-linux.thunderbolt-ibverbs%2Fshield
+[hydra-module]: https://hydra.hellas.ai/job/hellas/thunderbolt-ibverbs/x86_64-linux.thunderbolt-ibverbs
+
 *** WARNING ***
 
 this is a research driver. It is buggy, it is insecure, it is not for production.
@@ -8,6 +12,8 @@ https://blog.hellas.ai/blog/thunderbolt-ibverbs/
 
 ## what is it?
 a linux kernel module + userspace shim to emulate an InfiniBand RDMA verb device across generic usb4/thunderbolt4 DMA rings
+
+![strix-1 and strix-2 connected directly over Thunderbolt 5](docs/img/strix-strix.jpeg)
 
 ## does it work?
 yes! obviously not as well as real hardware, but better than onboard ethernet and lower latency than RXE-over-`thunderbolt-net`
