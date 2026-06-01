@@ -1,8 +1,6 @@
 # thunderbolt-ibverbs
 
-[![Hydra module][hydra-module-badge]][hydra-module]
-[hydra-module-badge]: https://img.shields.io/endpoint?label=hydra%20module&url=https%3A%2F%2Fhydra.hellas.ai%2Fjob%2Fhellas%2Fthunderbolt-ibverbs%2Fx86_64-linux.thunderbolt-ibverbs%2Fshield
-[hydra-module]: https://hydra.hellas.ai/job/hellas/thunderbolt-ibverbs/x86_64-linux.thunderbolt-ibverbs
+[![Hydra module](https://img.shields.io/endpoint?label=hydra%20module&url=https%3A%2F%2Fhydra.hellas.ai%2Fjob%2Fhellas%2Fthunderbolt-ibverbs%2Fx86_64-linux.thunderbolt-ibverbs%2Fshield)](https://hydra.hellas.ai/job/hellas/thunderbolt-ibverbs/x86_64-linux.thunderbolt-ibverbs)
 
 *** WARNING ***
 
