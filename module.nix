@@ -169,6 +169,9 @@
 
       echo "thunderbolt-ibverbs-check: ok"
     '';
+    meta = {
+      maintainers = with lib.maintainers; [ georgewhewell ];
+    };
   };
 
   reloadHelper = pkgs.writeShellApplication {
@@ -281,6 +284,9 @@
         ${checkHelper}/bin/thunderbolt-ibverbs-check
       fi
     '';
+    meta = {
+      maintainers = with lib.maintainers; [ georgewhewell ];
+    };
   };
 in {
   options.hardware."thunderbolt-ibverbs" = {

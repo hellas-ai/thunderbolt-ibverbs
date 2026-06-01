@@ -54,7 +54,7 @@
           testingKernel = pkgs.linuxPackages_testing.kernel;
           kernelPatches = (testingKernel.passthru.kernelPatches or [ ]) ++ thunderboltKernelPatches;
         in
-        testingKernel.override {
+        (testingKernel.override {
           argsOverride = {
             pname = "linux-thunderbolt";
             version = linuxSrcVersion;
@@ -62,7 +62,11 @@
             src = linux-src;
             inherit kernelPatches;
           };
-        };
+        }).overrideAttrs (old: {
+          meta = (old.meta or { }) // {
+            maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+          };
+        });
       mkThunderboltLinuxPackages = pkgs: pkgs.linuxPackagesFor (mkThunderboltKernel pkgs);
       rdmaCoreUsb4Patches = [
         ./packaging/rdma-core-patches/0001-providers-usb4_rdma-add-USB4-soft-RDMA-provider.patch
@@ -74,6 +78,9 @@
         pkgs.rdma-core.overrideAttrs (old: {
           pname = "rdma-core-usb4";
           patches = (old.patches or [ ]) ++ rdmaCoreUsb4Patches;
+          meta = (old.meta or { }) // {
+            maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+          };
         });
       mkScriptSyntaxCheck =
         pkgs:
@@ -105,6 +112,10 @@
             mkdir -p "$out"
             runHook postInstall
           '';
+
+          meta = {
+            maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+          };
         };
       mkProtoSmoke =
         pkgs:
@@ -129,6 +140,10 @@
             mkdir -p "$out"
             runHook postInstall
           '';
+
+          meta = {
+            maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+          };
         };
       mkNixosVmSmoke =
         pkgs:
@@ -138,6 +153,9 @@
         in
         pkgs.testers.runNixOSTest {
           name = "thunderbolt-ibverbs-vm-smoke";
+          meta = {
+            maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+          };
 
           nodes.machine =
             { pkgs, ... }:
@@ -186,6 +204,10 @@
             mkdir -p "$out"
             runHook postInstall
           '';
+
+          meta = {
+            maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+          };
         };
     in
     {
@@ -248,6 +270,10 @@
           tbv-perftest = {
             type = "app";
             program = lib.getExe pkgsAt.tbv-perftest;
+            meta = {
+              description = "Run the Thunderbolt/USB4 RDMA perftest benchmark matrix";
+              maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+            };
           };
         }
       );
@@ -311,6 +337,9 @@
               pkgs.kmod
               pkgsAt.rdma-core-usb4
             ];
+            meta = {
+              maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+            };
           };
         }
       );

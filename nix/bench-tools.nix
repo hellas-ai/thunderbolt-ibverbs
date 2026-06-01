@@ -117,6 +117,7 @@ stdenv.mkDerivation {
   meta = with lib; {
     description = "Thunderbolt/USB4 RDMA bench programs (libibverbs C tools + perftest helper scripts)";
     license = licenses.mit;
+    maintainers = with maintainers; [ georgewhewell ];
     platforms = if isDarwin then platforms.darwin else platforms.linux;
   };
 }
