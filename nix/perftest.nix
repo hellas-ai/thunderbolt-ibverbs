@@ -13,8 +13,8 @@ let
   perftest-src = fetchFromGitHub {
     owner = "linux-rdma";
     repo = "perftest";
-    rev = "perftest-26.01.5";
-    hash = "sha256-WcFOaG5Lzn87EZCZ8w6UTI6qtfX1wOtvF/lxSDwjEq4=";
+    rev = "26.04.17";
+    hash = "sha256-oNvzQubmslZ4JUNww/wvWd54JDsDLamCDlorHWlNtaY=";
   };
 in
 if stdenv.hostPlatform.isDarwin then
@@ -27,7 +27,7 @@ if stdenv.hostPlatform.isDarwin then
   # dyld pick up Apple's RDMA stack at runtime.
   stdenv.mkDerivation {
     pname = "perftest-apple-rdma";
-    version = "26.01.5";
+    version = "26.04.17";
     src = perftest-src;
 
     nativeBuildInputs = [ autoreconfHook ];
@@ -60,7 +60,7 @@ if stdenv.hostPlatform.isDarwin then
         --replace-fail 'case IBV_LINK_LAYER_ETHERNET:' 'case IBV_LINK_LAYER_ETHERNET: case IBV_LINK_LAYER_THUNDERBOLT:' \
         --replace-fail 'params->link_type = port_attr.link_layer;' 'params->link_type = (port_attr.link_layer == IBV_LINK_LAYER_THUNDERBOLT) ? IBV_LINK_LAYER_ETHERNET : port_attr.link_layer;'
       substituteInPlace Makefile.am \
-        --replace-fail 'src/host_memory.c src/mmap_memory.c' 'src/host_memory.c src/mmap_memory.c src/apple_raw_ethernet_stubs.c'
+        --replace-fail 'src/host_memory.c src/host_validation.c src/mmap_memory.c' 'src/host_memory.c src/host_validation.c src/mmap_memory.c src/apple_raw_ethernet_stubs.c'
     '';
 
     # apple-compat shim still supplies a few helper headers (byteswap.h etc.)
@@ -74,10 +74,11 @@ if stdenv.hostPlatform.isDarwin then
     env.LDFLAGS = "-lrdma -Wl,-undefined,dynamic_lookup";
 
     configureFlags = [
-      "--disable-cuda"
+      "--disable-cudart"
       "--disable-rocm"
       "--disable-neuron"
       "--disable-ibv_wr_api"
+      "--disable-cq_ex"
     ];
 
     meta = with lib; {
@@ -91,7 +92,7 @@ else
   # Linux build against our rdma-core-usb4 provider.
   stdenv.mkDerivation {
     pname = "perftest";
-    version = "26.01.5";
+    version = "26.04.17";
     src = perftest-src;
 
     nativeBuildInputs = [ autoreconfHook pkg-config ];
@@ -107,9 +108,10 @@ else
     '';
 
     configureFlags = [
-      "--disable-cuda"
+      "--disable-cudart"
       "--disable-rocm"
       "--disable-neuron"
+      "--disable-cq_ex"
     ];
 
     meta = with lib; {

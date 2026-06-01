@@ -3,6 +3,8 @@
 
 #include_next <infiniband/verbs.h>
 
+#include <errno.h>
+
 #ifndef __always_inline
 #define __always_inline __attribute__((__always_inline__)) inline
 #endif
@@ -67,6 +69,25 @@ struct ibv_srq_init_attr_ex {
 
 struct ibv_flow;
 struct ibv_flow_attr;
+
+#ifndef IBV_PARENT_DOMAIN_INIT_ATTR_PD
+#define IBV_PARENT_DOMAIN_INIT_ATTR_PD (1 << 0)
+struct ibv_parent_domain_init_attr {
+	struct ibv_pd *pd;
+	struct ibv_td *td;
+	uint32_t comp_mask;
+};
+
+static inline struct ibv_pd *
+ibv_alloc_parent_domain(struct ibv_context *context,
+			struct ibv_parent_domain_init_attr *attr)
+{
+	(void)context;
+	(void)attr;
+	errno = ENOTSUP;
+	return NULL;
+}
+#endif
 
 #ifndef HAVE_EX_ODP
 #define check_odp_support(ctx, user_param) 0
