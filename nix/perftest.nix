@@ -85,6 +85,7 @@ if stdenv.hostPlatform.isDarwin then
       description = "OFED InfiniBand performance tests (linked against macOS 26 SDK librdma)";
       homepage = "https://github.com/linux-rdma/perftest";
       license = licenses.bsd2;
+      maintainers = with maintainers; [ georgewhewell ];
       platforms = platforms.darwin;
     };
   }
@@ -118,6 +119,7 @@ else
       description = "OFED InfiniBand performance tests (linked against rdma-core-usb4)";
       homepage = "https://github.com/linux-rdma/perftest";
       license = licenses.bsd2;
+      maintainers = with maintainers; [ georgewhewell ];
       platforms = platforms.linux;
     };
   }
