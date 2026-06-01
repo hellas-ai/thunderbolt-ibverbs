@@ -9,6 +9,8 @@ https://blog.hellas.ai/blog/thunderbolt-ibverbs/
 ## what is it?
 a linux kernel module + userspace shim to emulate an InfiniBand RDMA verb device across generic usb4/thunderbolt4 DMA rings
 
+![strix-1 and strix-2 connected directly over Thunderbolt 5](docs/img/strix-strix.jpeg)
+
 ## does it work?
 yes! obviously not as well as real hardware, but better than onboard ethernet and lower latency than RXE-over-`thunderbolt-net`
 
