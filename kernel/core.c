@@ -62,6 +62,13 @@ int tbv_core_init(struct tbv_state *state,
 		goto err_destroy_wq;
 	}
 
+	ret = tbv_configfs_start(state);
+	if (ret) {
+		tbv_debugfs_exit(state);
+		tbv_tbnet_identity_stop(&state->tbnet_identity);
+		goto err_destroy_wq;
+	}
+
 	if (cfg->native_enabled)
 		tbv_core_log_backend(TBV_BACKEND_NATIVE);
 
@@ -92,6 +99,7 @@ void tbv_core_exit(struct tbv_state *state)
 		state->workqueue = NULL;
 	}
 
+	tbv_configfs_stop(state);
 	tbv_debugfs_exit(state);
 	if (!xa_empty(&state->verbs_mrs_xa))
 		pr_warn("unloading with live MR registry entries\n");

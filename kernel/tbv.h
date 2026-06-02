@@ -717,6 +717,8 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd);
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);
 int tbv_debugfs_init(struct tbv_state *state);
 void tbv_debugfs_exit(struct tbv_state *state);
+int tbv_configfs_start(struct tbv_state *state);
+void tbv_configfs_stop(struct tbv_state *state);
 
 int tbv_core_init(struct tbv_state *state,
 		  const struct tbv_resolved_config *cfg,

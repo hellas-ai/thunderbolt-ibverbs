@@ -2,7 +2,7 @@
 
 config THUNDERBOLT_IBVERBS
 	tristate "Thunderbolt/USB4 host-to-host RDMA verbs"
-	depends on INFINIBAND && THUNDERBOLT
+	depends on CONFIGFS_FS && INFINIBAND && THUNDERBOLT
 	help
 	  Expose Thunderbolt/USB4 host-to-host DMA paths as an RDMA verbs
 	  device. The driver has separate native Linux and Apple-compatible

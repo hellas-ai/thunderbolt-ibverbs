@@ -4,31 +4,27 @@
 
 #include <linux/errno.h>
 
-#include "tbv.h"
-
-static const struct tbv_backend_ops tbv_native_backend = {
-	.type = TBV_BACKEND_NATIVE,
-	.name = "native-linux",
-	.supports_rc = true,
-	.supports_uc = true,
-	.needs_tbnet_identity = false,
-};
-
-static const struct tbv_backend_ops tbv_apple_backend = {
-	.type = TBV_BACKEND_APPLE,
-	.name = "apple-fa57",
-	.supports_rc = false,
-	.supports_uc = true,
-	.needs_tbnet_identity = true,
-};
+#include "transport.h"
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type)
 {
 	switch (type) {
 	case TBV_BACKEND_NATIVE:
-		return &tbv_native_backend;
+		return &tbv_native_backend_ops;
 	case TBV_BACKEND_APPLE:
-		return &tbv_apple_backend;
+		return &tbv_apple_backend_ops;
+	default:
+		return NULL;
+	}
+}
+
+const struct tbv_transport_ops *tbv_transport_get(enum tbv_backend_type type)
+{
+	switch (type) {
+	case TBV_BACKEND_NATIVE:
+		return &tbv_native_transport_ops;
+	case TBV_BACKEND_APPLE:
+		return &tbv_apple_transport_ops;
 	default:
 		return NULL;
 	}
