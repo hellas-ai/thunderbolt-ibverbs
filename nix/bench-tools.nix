@@ -26,6 +26,7 @@ let
   # mac_tb_rdma_probe (Linux-side prober of Mac peers) are Linux-only.
   linuxPrograms = darwinPrograms ++ [
     "mac_tb_rdma_probe"
+    "rc_qpn_churn"
     "rdma_gid_probe"
   ];
 

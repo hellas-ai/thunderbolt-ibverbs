@@ -365,6 +365,7 @@ static bool tbv_native_data_consumes_rx_credit(u8 opcode)
 	case TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM:
 	case TBV_NATIVE_DATA_OP_RDMA_READ_REQ:
 	case TBV_NATIVE_DATA_OP_RDMA_READ_RESP:
+	case TBV_NATIVE_DATA_OP_MAD:
 		return true;
 	default:
 		return false;

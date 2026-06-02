@@ -431,6 +431,7 @@ struct tbv_state {
 	bool apple_tunnels_pending;
 	struct work_struct apple_tunnel_work;
 	struct workqueue_struct *workqueue;
+	struct notifier_block ibdev_netdev_nb;
 	atomic_t verbs_ucontexts;
 	atomic_t verbs_pds;
 	atomic_t verbs_cqs;
@@ -454,6 +455,9 @@ struct tbv_state {
 	atomic64_t data_wr_copy_error;
 	atomic64_t data_wr_path_send;
 	atomic64_t data_wr_path_send_error;
+	atomic64_t data_wr_retransmit;
+	atomic64_t data_wr_retry_enqueue_error;
+	atomic64_t data_wr_retry_exhausted;
 	atomic64_t data_wr_timeout;
 	atomic64_t apple_sq_queued;
 	atomic64_t apple_sq_dequeued;
@@ -478,6 +482,13 @@ struct tbv_state {
 	atomic64_t data_rx_op_write;
 	atomic64_t data_rx_op_write_imm;
 	atomic64_t data_rx_ack;
+	atomic64_t data_rx_ack_miss;
+	atomic64_t data_rx_ack_cumulative;
+	atomic64_t data_tx_ack_ok;
+	atomic64_t data_tx_ack_error;
+	atomic64_t data_tx_ack_send_error;
+	atomic64_t data_rx_duplicate_ack;
+	atomic64_t data_rx_ack_history_miss;
 	atomic64_t data_tx_read_ack_ok;
 	atomic64_t data_tx_read_ack_retry;
 	atomic64_t data_tx_read_ack_error;
@@ -541,6 +552,7 @@ struct tbv_state {
 	 * flag so existing devices can always be torn down.
 	 */
 	bool register_enabled;
+	bool ibdev_netdev_nb_registered;
 };
 
 struct dentry;

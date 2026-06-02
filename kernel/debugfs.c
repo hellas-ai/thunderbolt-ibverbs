@@ -157,6 +157,12 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_path_send));
 	seq_printf(s, "data_wr_path_send_error: %lld\n",
 		   atomic64_read(&state->data_wr_path_send_error));
+	seq_printf(s, "data_wr_retransmit: %lld\n",
+		   atomic64_read(&state->data_wr_retransmit));
+	seq_printf(s, "data_wr_retry_enqueue_error: %lld\n",
+		   atomic64_read(&state->data_wr_retry_enqueue_error));
+	seq_printf(s, "data_wr_retry_exhausted: %lld\n",
+		   atomic64_read(&state->data_wr_retry_exhausted));
 	seq_printf(s, "data_wr_timeout: %lld\n",
 		   atomic64_read(&state->data_wr_timeout));
 	seq_printf(s, "apple_sq_queued: %lld\n",
@@ -205,6 +211,20 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_op_write_imm));
 	seq_printf(s, "data_rx_ack: %lld\n",
 		   atomic64_read(&state->data_rx_ack));
+	seq_printf(s, "data_rx_ack_miss: %lld\n",
+		   atomic64_read(&state->data_rx_ack_miss));
+	seq_printf(s, "data_rx_ack_cumulative: %lld\n",
+		   atomic64_read(&state->data_rx_ack_cumulative));
+	seq_printf(s, "data_tx_ack_ok: %lld\n",
+		   atomic64_read(&state->data_tx_ack_ok));
+	seq_printf(s, "data_tx_ack_error: %lld\n",
+		   atomic64_read(&state->data_tx_ack_error));
+	seq_printf(s, "data_tx_ack_send_error: %lld\n",
+		   atomic64_read(&state->data_tx_ack_send_error));
+	seq_printf(s, "data_rx_duplicate_ack: %lld\n",
+		   atomic64_read(&state->data_rx_duplicate_ack));
+	seq_printf(s, "data_rx_ack_history_miss: %lld\n",
+		   atomic64_read(&state->data_rx_ack_history_miss));
 	seq_printf(s, "data_tx_read_ack_ok: %lld\n",
 		   atomic64_read(&state->data_tx_read_ack_ok));
 	seq_printf(s, "data_tx_read_ack_retry: %lld\n",
