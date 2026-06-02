@@ -193,6 +193,11 @@
               proto/reliability.c \
               -o tbv-reliability-smoke
             ./tbv-reliability-smoke
+            $CC -std=c11 -Wall -Wextra -Werror -I. \
+              tools/ci/identity-smoke.c \
+              proto/identity.c \
+              -o tbv-identity-smoke
+            ./tbv-identity-smoke
             runHook postBuild
           '';
 
