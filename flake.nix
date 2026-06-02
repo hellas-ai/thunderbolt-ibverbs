@@ -188,6 +188,11 @@
               tools/ci/proto-smoke.c \
               -o tbv-proto-smoke
             ./tbv-proto-smoke
+            $CC -std=c11 -Wall -Wextra -Werror -I. \
+              tools/ci/reliability-smoke.c \
+              proto/reliability.c \
+              -o tbv-reliability-smoke
+            ./tbv-reliability-smoke
             runHook postBuild
           '';
 

@@ -120,6 +120,11 @@ build_userspace_smoke() {
 		/work/src/tools/ci/proto-smoke.c \
 		-o /tmp/tbv-proto-smoke
 	/tmp/tbv-proto-smoke
+	gcc -std=c11 -Wall -Wextra -Werror -I/work/src \
+		/work/src/tools/ci/reliability-smoke.c \
+		/work/src/proto/reliability.c \
+		-o /tmp/tbv-reliability-smoke
+	/tmp/tbv-reliability-smoke
 }
 
 build_with_dkms() {
