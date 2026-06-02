@@ -5,6 +5,8 @@
 #include "proto/identity.h"
 
 #define TBV_CFG_MAX_APP_GIDS 8u
+#define TBV_CFG_LINK_NAME_PREFIX "usb4_rdma"
+#define TBV_CFG_LINK_NAME_MAX 15u
 
 enum tbv_cfg_backend {
 	TBV_CFG_BACKEND_NONE = 0,
@@ -32,6 +34,7 @@ struct tbv_cfg_link {
 	struct tbv_id_selection app_selection;
 };
 
+int tbv_cfg_link_validate_name(const char *name);
 void tbv_cfg_link_init(struct tbv_cfg_link *link, tbv_id_u32 link_id);
 int tbv_cfg_link_set_backend(struct tbv_cfg_link *link, tbv_id_u8 backend);
 int tbv_cfg_link_set_route(struct tbv_cfg_link *link,

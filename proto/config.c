@@ -12,6 +12,39 @@ static bool tbv_cfg_link_mutable(const struct tbv_cfg_link *link)
 	return link->state == TBV_CFG_EMPTY || link->state == TBV_CFG_DRAFT;
 }
 
+static bool tbv_cfg_link_name_char_allowed(char c)
+{
+	return (c >= 'a' && c <= 'z') ||
+	       (c >= 'A' && c <= 'Z') ||
+	       (c >= '0' && c <= '9') ||
+	       c == '_' || c == '-';
+}
+
+int tbv_cfg_link_validate_name(const char *name)
+{
+	const char *prefix = TBV_CFG_LINK_NAME_PREFIX;
+	tbv_id_u32 i;
+
+	if (!name)
+		return -EINVAL;
+
+	for (i = 0; prefix[i]; i++) {
+		if (name[i] != prefix[i])
+			return -EINVAL;
+	}
+	if (!name[i])
+		return -EINVAL;
+
+	for (; name[i]; i++) {
+		if (i >= TBV_CFG_LINK_NAME_MAX)
+			return -ENAMETOOLONG;
+		if (!tbv_cfg_link_name_char_allowed(name[i]))
+			return -EINVAL;
+	}
+
+	return 0;
+}
+
 void tbv_cfg_link_init(struct tbv_cfg_link *link, tbv_id_u32 link_id)
 {
 	memset(link, 0, sizeof(*link));

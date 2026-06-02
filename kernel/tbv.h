@@ -20,7 +20,7 @@
 #include <linux/workqueue.h>
 #include <linux/xarray.h>
 
-#include "proto/identity.h"
+#include "proto/config.h"
 
 #define TBV_DRV_NAME "thunderbolt_ibverbs"
 #define TBV_ETH_ALEN 6
@@ -392,7 +392,7 @@ struct tbv_tbnet_identity_config {
 	bool minimal_apple_only;
 };
 
-#define TBV_CONFIGURED_LINK_NAME_LEN 32
+#define TBV_CONFIGURED_LINK_NAME_LEN (TBV_CFG_LINK_NAME_MAX + 1u)
 
 struct tbv_configured_link {
 	struct list_head node;
@@ -554,7 +554,6 @@ struct tbv_service_config {
 };
 
 struct tb_property_dir;
-struct tbv_cfg_link;
 struct tbv_data_frame;
 struct tbv_native_data_header;
 struct tbv_tx_packet;

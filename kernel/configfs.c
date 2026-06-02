@@ -538,6 +538,11 @@ static struct config_item *tbv_cfgfs_make_link(struct config_group *group,
 {
 	struct tbv_cfgfs_link *link;
 	int link_id;
+	int ret;
+
+	ret = tbv_cfg_link_validate_name(name);
+	if (ret)
+		return ERR_PTR(ret);
 
 	link = kzalloc(sizeof(*link), GFP_KERNEL);
 	if (!link)

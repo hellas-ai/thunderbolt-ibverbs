@@ -157,6 +157,18 @@ static int test_sealed_links_are_immutable(void)
 	return 0;
 }
 
+static int test_external_names_are_canonical(void)
+{
+	CHECK(tbv_cfg_link_validate_name("usb4_rdma0") == 0);
+	CHECK(tbv_cfg_link_validate_name("usb4_rdma_strix") == 0);
+	CHECK(tbv_cfg_link_validate_name("vm-link") == -EINVAL);
+	CHECK(tbv_cfg_link_validate_name("usb4_apple0") == -EINVAL);
+	CHECK(tbv_cfg_link_validate_name("usb4_rdma") == -EINVAL);
+	CHECK(tbv_cfg_link_validate_name("usb4_rdma_abcdef") == -ENAMETOOLONG);
+
+	return 0;
+}
+
 int main(void)
 {
 	CHECK(test_canonical_native_activates() == 0);
@@ -165,6 +177,7 @@ int main(void)
 	CHECK(test_current_bridge_shape_cannot_seal() == 0);
 	CHECK(test_nccl_workaround_mismatch_cannot_seal() == 0);
 	CHECK(test_sealed_links_are_immutable() == 0);
+	CHECK(test_external_names_are_canonical() == 0);
 
 	puts("config smoke OK");
 	return 0;
