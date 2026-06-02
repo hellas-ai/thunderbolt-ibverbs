@@ -198,6 +198,12 @@
               proto/identity.c \
               -o tbv-identity-smoke
             ./tbv-identity-smoke
+            $CC -std=c11 -Wall -Wextra -Werror -I. \
+              tools/ci/config-smoke.c \
+              proto/config.c \
+              proto/identity.c \
+              -o tbv-config-smoke
+            ./tbv-config-smoke
             runHook postBuild
           '';
 
