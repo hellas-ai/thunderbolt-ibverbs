@@ -166,6 +166,128 @@ static int test_wrap_safe_sequence_helpers(void)
 	return 0;
 }
 
+static unsigned int next_rand(unsigned int *state)
+{
+	unsigned int x = *state;
+
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	*state = x;
+	return x;
+}
+
+static void shuffle_frames(struct tbv_rel_data_frame *frames,
+			   unsigned int count, unsigned int *rng)
+{
+	unsigned int i;
+
+	for (i = count; i > 1; i--) {
+		unsigned int j = next_rand(rng) % i;
+		struct tbv_rel_data_frame tmp = frames[i - 1];
+
+		frames[i - 1] = frames[j];
+		frames[j] = tmp;
+	}
+}
+
+static int deliver_one(struct tbv_rel_tx_op *tx, struct tbv_rel_rx_op *rx,
+		       const struct tbv_rel_data_frame *frame,
+		       bool recv_available, bool *rx_completed)
+{
+	struct tbv_rel_rx_event event;
+	struct tbv_rel_completion comp;
+
+	CHECK(tbv_rel_rx_on_data(rx, frame, recv_available, &event) == 0);
+	CHECK(rx->completion_count <= 1);
+	if (event.completion_valid) {
+		CHECK(!*rx_completed);
+		*rx_completed = true;
+		CHECK(event.completion.status == TBV_REL_COMP_OK);
+	}
+	if (event.ack_valid) {
+		CHECK(tbv_rel_tx_on_ack(tx, &event.ack, &comp) == 0);
+		if (comp.valid) {
+			CHECK(*rx_completed);
+			CHECK(comp.status == TBV_REL_COMP_OK ||
+			      comp.status == TBV_REL_COMP_RNR_RETRY_EXHAUSTED);
+		}
+	}
+
+	return 0;
+}
+
+static int test_generated_loss_duplicate_reorder_schedules(void)
+{
+	unsigned int seed;
+
+	for (seed = 1; seed <= 128; seed++) {
+		struct tbv_rel_tx_op tx;
+		struct tbv_rel_rx_op rx;
+		struct tbv_rel_data_frame frames[TBV_REL_MAX_FRAGS];
+		struct tbv_rel_completion comp;
+		unsigned int rng = seed * 0x9e3779b9u;
+		unsigned int total_len = 1 + (next_rand(&rng) % 96u);
+		unsigned int attempts = 0;
+		bool rx_completed = false;
+
+		CHECK(tbv_rel_tx_start(&tx, 0x6000u + seed, seed,
+				       TBV_REL_OP_SEND, total_len, 16, 128,
+				       8) == 0);
+		tbv_rel_rx_init(&rx, 0x6000u + seed, 16);
+
+		while (tx.state != TBV_REL_TX_COMPLETE && attempts < 128) {
+			unsigned int count = 0;
+			unsigned int i;
+			bool force_deliver = attempts > 24;
+			bool rnr_first = !rx.active && !rx.accepted &&
+					 attempts < 4 &&
+					 (next_rand(&rng) & 7u) == 0;
+
+			while (tbv_rel_tx_next_frame(&tx, &frames[count]) == 0)
+				count++;
+			CHECK(count == tx.frame_count);
+			shuffle_frames(frames, count, &rng);
+
+			for (i = 0; i < count; i++) {
+				bool drop = !force_deliver &&
+					    (next_rand(&rng) & 3u) == 0;
+				bool dup = (next_rand(&rng) & 3u) == 0;
+				bool recv_available = !rnr_first || i != 0;
+
+				if (drop)
+					continue;
+
+				CHECK(deliver_one(&tx, &rx, &frames[i],
+						  recv_available,
+						  &rx_completed) == 0);
+				if (dup)
+					CHECK(deliver_one(&tx, &rx, &frames[i],
+							  true,
+							  &rx_completed) == 0);
+			}
+
+			if (tx.state == TBV_REL_TX_COMPLETE)
+				break;
+			if (tx.state == TBV_REL_TX_READY) {
+				attempts++;
+				continue;
+			}
+
+			CHECK(tbv_rel_tx_on_timeout(&tx, &comp) == 0);
+			CHECK(!comp.valid);
+			attempts++;
+		}
+
+		CHECK(tx.state == TBV_REL_TX_COMPLETE);
+		CHECK(tx.completion_count == 1);
+		CHECK(rx.completion_count == 1);
+		CHECK(rx_completed);
+	}
+
+	return 0;
+}
+
 int main(void)
 {
 	CHECK(test_no_success_before_ack() == 0);
@@ -173,6 +295,7 @@ int main(void)
 	CHECK(test_stale_connection_id_ignored() == 0);
 	CHECK(test_rnr_is_not_success() == 0);
 	CHECK(test_wrap_safe_sequence_helpers() == 0);
+	CHECK(test_generated_loss_duplicate_reorder_schedules() == 0);
 
 	puts("reliability smoke OK");
 	return 0;
