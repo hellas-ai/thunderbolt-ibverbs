@@ -3,7 +3,7 @@
 ## How it works
 
 Each suite (currently just `perftest`) is a Nix-defined case list — for
-`tbv-perftest` see `perftest.nix`. `nix run .#tbv-perftest` copies the matching
+`tbv-perftest` see `lib/bench/perftest.nix`. `nix run .#tbv-perftest` copies the matching
 `rdma-core-usb4` and `perftest` builds to both hosts, runs every case over SSH,
 and writes a `--csv` summary plus a `--jsonl` per-case telemetry log. Run-time
 state (kernel, loaded module sha256, IOMMU setting, rail counts) is captured
@@ -34,8 +34,8 @@ Future suites (`jaccl.md` + `jaccl-<transport>.csv`) slot in as siblings without
 changing the shape. The runner also writes `kernel` / `module_sha256` / `iommu`
 columns into every row, so a stray CSV self-describes even if the dir name lies.
 
-The plan is built in `perftest.nix` as five blocks of cases, each prefixed by
-kind so `--only` patterns can target a slice cleanly:
+The plan is built in `lib/bench/perftest.nix` as five blocks of cases, each
+prefixed by kind so `--only` patterns can target a slice cleanly:
 
 - `bw.*` — bandwidth sweep (`ib_{write,read,send}_bw` × sizes × QPs, both directions)
 - `bidi.*` — bidirectional bandwidth

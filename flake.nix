@@ -224,7 +224,7 @@
           benchTools = pkgs.callPackage ./nix/bench-tools.nix packageArgs;
           perftestBench =
             if isLinux then
-              import ./bench/perftest.nix {
+              import ./lib/bench/perftest.nix {
                 inherit lib pkgs perftest;
                 # cross-system reference: the wrapper bakes the darwin
                 # perftest store path so the runner can pick the right
@@ -232,7 +232,7 @@
                 perftestDarwin = self.packages.aarch64-darwin.perftest or null;
                 rdma-core-usb4 = rdmaCoreUsb4;
                 runnerSrc = ./userspace/bench/tbv_perftest_runner.py;
-                benchConfig = import ./bench/common.nix { inherit lib; };
+                benchConfig = import ./lib/bench { inherit lib; };
               }
             else
               null;
