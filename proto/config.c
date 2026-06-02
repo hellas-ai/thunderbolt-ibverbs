@@ -107,3 +107,12 @@ int tbv_cfg_link_activate(struct tbv_cfg_link *link)
 	link->state = TBV_CFG_ACTIVE;
 	return 0;
 }
+
+int tbv_cfg_link_deactivate(struct tbv_cfg_link *link)
+{
+	if (link->state != TBV_CFG_ACTIVE)
+		return -EINVAL;
+
+	link->state = TBV_CFG_SEALED;
+	return 0;
+}

@@ -37,6 +37,7 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 						       "limited");
 	seq_printf(s, "native_legacy_ambiguous_limited: %lld\n",
 		   atomic64_read(&state->native_legacy_ambiguous_limited));
+	seq_printf(s, "configured_links: %u\n", tbv_link_count(state));
 	seq_printf(s, "tbnet_identity: %s\n",
 		   tbv_tbnet_identity_name(state->cfg.tbnet_identity));
 	mutex_lock(&state->tbnet_identity.lock);
@@ -374,6 +375,16 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 
 DEFINE_SHOW_ATTRIBUTE(tbv_debugfs_peers);
 
+static int tbv_debugfs_configured_links_show(struct seq_file *s, void *unused)
+{
+	struct tbv_state *state = s->private;
+
+	tbv_link_debugfs_show(s, state);
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(tbv_debugfs_configured_links);
+
 int tbv_debugfs_init(struct tbv_state *state)
 {
 	state->debugfs_dir = debugfs_create_dir(TBV_DRV_NAME, NULL);
@@ -386,6 +397,8 @@ int tbv_debugfs_init(struct tbv_state *state)
 			    &tbv_debugfs_summary_fops);
 	debugfs_create_file("peers", 0444, state->debugfs_dir, state,
 			    &tbv_debugfs_peers_fops);
+	debugfs_create_file("configured_links", 0444, state->debugfs_dir,
+			    state, &tbv_debugfs_configured_links_fops);
 	return 0;
 }
 

@@ -43,5 +43,6 @@ int tbv_cfg_link_set_app_gids(struct tbv_cfg_link *link,
 			      tbv_id_u32 gid_count);
 int tbv_cfg_link_seal(struct tbv_cfg_link *link);
 int tbv_cfg_link_activate(struct tbv_cfg_link *link);
+int tbv_cfg_link_deactivate(struct tbv_cfg_link *link);
 
 #endif /* TBV_CONFIG_H */

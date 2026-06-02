@@ -406,11 +406,29 @@ static ssize_t activate_store(struct config_item *item, const char *buf,
 		goto unlock;
 	}
 
-	ret = tbv_cfg_link_activate(&link->cfg);
+	if (link->cfg.state != TBV_CFG_SEALED) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	ret = ops->activate(link->state, &link->cfg);
 	if (ret)
 		goto unlock;
 
-	ret = ops->activate(link->state, &link->cfg);
+	ret = tbv_cfg_link_activate(&link->cfg);
+	if (ret) {
+		if (ops->deactivate)
+			ops->deactivate(link->state, &link->cfg);
+		goto unlock;
+	}
+
+	ret = tbv_link_activate_config(link->state, config_item_name(item),
+				       backend, &link->cfg);
+	if (ret) {
+		tbv_cfg_link_deactivate(&link->cfg);
+		if (ops->deactivate)
+			ops->deactivate(link->state, &link->cfg);
+	}
 unlock:
 	mutex_unlock(&link->lock);
 	return ret ? ret : count;
@@ -496,8 +514,10 @@ static void tbv_cfgfs_link_release(struct config_item *item)
 	if (link->cfg.state == TBV_CFG_ACTIVE) {
 		ops = tbv_transport_get(link->cfg.backend == TBV_CFG_BACKEND_NATIVE ?
 					TBV_BACKEND_NATIVE : TBV_BACKEND_APPLE);
+		tbv_link_deactivate_config(link->state, link->cfg.link_id);
 		if (ops && ops->deactivate)
 			ops->deactivate(link->state, &link->cfg);
+		tbv_cfg_link_deactivate(&link->cfg);
 	}
 	mutex_destroy(&link->lock);
 	kfree(link);

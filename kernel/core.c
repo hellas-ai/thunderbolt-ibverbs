@@ -35,6 +35,7 @@ int tbv_core_init(struct tbv_state *state,
 	mutex_init(&state->lock);
 	mutex_init(&state->rail_register_lock);
 	INIT_LIST_HEAD(&state->peers);
+	INIT_LIST_HEAD(&state->configured_links);
 	xa_init(&state->verbs_mrs_xa);
 	xa_init(&state->verbs_qps_xa);
 	state->next_peer_id = 1;
@@ -90,8 +91,16 @@ err_destroy_wq:
 
 void tbv_core_exit(struct tbv_state *state)
 {
+	u32 configured_link_count;
+
 	if (!list_empty(&state->peers))
 		pr_warn("unloading with live peers after service teardown\n");
+
+	tbv_configfs_stop(state);
+	configured_link_count = tbv_link_count(state);
+	if (configured_link_count)
+		pr_warn("unloading with %u configured links after configfs teardown\n",
+			configured_link_count);
 
 	if (state->workqueue) {
 		flush_workqueue(state->workqueue);
@@ -99,7 +108,6 @@ void tbv_core_exit(struct tbv_state *state)
 		state->workqueue = NULL;
 	}
 
-	tbv_configfs_stop(state);
 	tbv_debugfs_exit(state);
 	if (!xa_empty(&state->verbs_mrs_xa))
 		pr_warn("unloading with live MR registry entries\n");

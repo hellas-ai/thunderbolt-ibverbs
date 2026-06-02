@@ -20,6 +20,8 @@
 #include <linux/workqueue.h>
 #include <linux/xarray.h>
 
+#include "proto/identity.h"
+
 #define TBV_DRV_NAME "thunderbolt_ibverbs"
 #define TBV_ETH_ALEN 6
 #define TBV_NATIVE_PROTOCOL_KEY "tbverbs"
@@ -390,11 +392,23 @@ struct tbv_tbnet_identity_config {
 	bool minimal_apple_only;
 };
 
+#define TBV_CONFIGURED_LINK_NAME_LEN 32
+
+struct tbv_configured_link {
+	struct list_head node;
+	u32 link_id;
+	enum tbv_backend_type backend;
+	struct tbv_id_selection app_selection;
+	char name[TBV_CONFIGURED_LINK_NAME_LEN];
+};
+
 struct tbv_state {
 	struct tbv_resolved_config cfg;
 	struct mutex lock;
 	struct list_head peers;
+	struct list_head configured_links;
 	u32 next_peer_id;
+	u32 configured_link_count;
 	struct tbv_tbnet_identity tbnet_identity;
 	struct tb_property_dir *native_dirs[TBV_NATIVE_MAX_LANES];
 	u32 native_dir_count;
@@ -540,6 +554,7 @@ struct tbv_service_config {
 };
 
 struct tb_property_dir;
+struct tbv_cfg_link;
 struct tbv_data_frame;
 struct tbv_native_data_header;
 struct tbv_tx_packet;
@@ -715,6 +730,12 @@ void tbv_path_cancel_data_owner_ctx(struct tbv_path *path, void *owner_ctx);
 void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd);
 
 const struct tbv_backend_ops *tbv_backend_get(enum tbv_backend_type type);
+int tbv_link_activate_config(struct tbv_state *state, const char *name,
+			     enum tbv_backend_type backend,
+			     const struct tbv_cfg_link *cfg);
+void tbv_link_deactivate_config(struct tbv_state *state, u32 link_id);
+u32 tbv_link_count(struct tbv_state *state);
+void tbv_link_debugfs_show(struct seq_file *s, struct tbv_state *state);
 int tbv_debugfs_init(struct tbv_state *state);
 void tbv_debugfs_exit(struct tbv_state *state);
 int tbv_configfs_start(struct tbv_state *state);
