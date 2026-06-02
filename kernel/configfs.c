@@ -11,6 +11,7 @@
 #include <linux/string.h>
 
 #include "transport.h"
+#include "trace.h"
 
 struct tbv_cfgfs_link {
 	struct config_item item;
@@ -383,6 +384,7 @@ static ssize_t seal_store(struct config_item *item, const char *buf,
 	ret = ops->validate_config(&link->cfg);
 unlock:
 	mutex_unlock(&link->lock);
+	trace_tbv_cfgfs_link_op(config_item_name(item), "seal", ret);
 	return ret ? ret : count;
 }
 
@@ -431,6 +433,7 @@ static ssize_t activate_store(struct config_item *item, const char *buf,
 	}
 unlock:
 	mutex_unlock(&link->lock);
+	trace_tbv_cfgfs_link_op(config_item_name(item), "activate", ret);
 	return ret ? ret : count;
 }
 
@@ -541,18 +544,23 @@ static struct config_item *tbv_cfgfs_make_link(struct config_group *group,
 	int ret;
 
 	ret = tbv_cfg_link_validate_name(name);
-	if (ret)
+	if (ret) {
+		trace_tbv_cfgfs_link_op(name, "create", ret);
 		return ERR_PTR(ret);
+	}
 
 	link = kzalloc(sizeof(*link), GFP_KERNEL);
-	if (!link)
+	if (!link) {
+		trace_tbv_cfgfs_link_op(name, "create", -ENOMEM);
 		return ERR_PTR(-ENOMEM);
+	}
 
 	mutex_init(&link->lock);
 	link->state = tbv_cfgfs_state;
 	link_id = atomic_inc_return(&tbv_cfgfs_next_link_id);
 	tbv_cfg_link_init(&link->cfg, link_id);
 	config_item_init_type_name(&link->item, name, &tbv_cfgfs_link_type);
+	trace_tbv_cfgfs_link_op(name, "create", 0);
 	return &link->item;
 }
 

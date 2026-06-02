@@ -248,6 +248,8 @@
             machine.succeed("mkdir -p /sys/kernel/config")
             machine.succeed("mountpoint -q /sys/kernel/config || mount -t configfs configfs /sys/kernel/config")
             machine.succeed("test -d /sys/kernel/config/thunderbolt_ibverbs")
+            machine.succeed("trace_dir=/sys/kernel/tracing; test -d $trace_dir/events || trace_dir=/sys/kernel/debug/tracing; test -f $trace_dir/events/thunderbolt_ibverbs/tbv_cfgfs_link_op/format")
+            machine.succeed("trace_dir=/sys/kernel/tracing; test -d $trace_dir/events || trace_dir=/sys/kernel/debug/tracing; test -f $trace_dir/events/thunderbolt_ibverbs/tbv_active_link/format")
             machine.fail("mkdir /sys/kernel/config/thunderbolt_ibverbs/vm-link")
             machine.succeed("mkdir /sys/kernel/config/thunderbolt_ibverbs/usb4_rdma0")
             machine.succeed("echo native > /sys/kernel/config/thunderbolt_ibverbs/usb4_rdma0/backend")

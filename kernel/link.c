@@ -9,6 +9,7 @@
 
 #include "tbv.h"
 #include "proto/config.h"
+#include "trace.h"
 
 static struct tbv_configured_link *
 tbv_link_find_locked(struct tbv_state *state, u32 link_id)
@@ -54,6 +55,12 @@ int tbv_link_activate_config(struct tbv_state *state, const char *name,
 	pr_info("published %s link=%u backend=%s dev=%u gid=%u\n",
 		link->name, link->link_id, tbv_backend_name(link->backend),
 		link->app_selection.device_id, link->app_selection.gid_index);
+	trace_tbv_active_link(link->name, link->link_id,
+			      tbv_backend_name(link->backend), true,
+			      link->app_selection.device_id,
+			      link->app_selection.port,
+			      link->app_selection.gid_index,
+			      link->app_selection.gid_type);
 	return 0;
 }
 
@@ -74,6 +81,12 @@ void tbv_link_deactivate_config(struct tbv_state *state, u32 link_id)
 
 	pr_info("unpublished %s link=%u backend=%s\n",
 		link->name, link->link_id, tbv_backend_name(link->backend));
+	trace_tbv_active_link(link->name, link->link_id,
+			      tbv_backend_name(link->backend), false,
+			      link->app_selection.device_id,
+			      link->app_selection.port,
+			      link->app_selection.gid_index,
+			      link->app_selection.gid_type);
 	kfree(link);
 }
 
