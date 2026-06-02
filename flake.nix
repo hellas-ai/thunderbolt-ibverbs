@@ -428,7 +428,10 @@
               pkgsAt.bench-tools
             ]
             ++ lib.optionals isLinux [
+              pkgs.bpftrace
               pkgs.kmod
+              pkgs.perf
+              pkgs.trace-cmd
               pkgsAt.rdma-core-usb4
             ];
             meta = {
