@@ -266,12 +266,29 @@
         fi
       fi
 
+      softdeps="$(modinfo -F softdep "$module" || true)"
+      load_softdeps=1
+      for dep in $softdeps; do
+        case "$dep" in
+          pre:)
+            load_softdeps=1
+            continue
+            ;;
+          post:)
+            load_softdeps=0
+            continue
+            ;;
+        esac
+        [ "$load_softdeps" = "1" ] || continue
+        [ -n "$dep" ] || continue
+        modprobe "$dep" || true
+      done
+
       deps=$(modinfo -F depends "$module" | tr ',' ' ' || true)
       for dep in $deps; do
         [ -n "$dep" ] || continue
         modprobe "$dep"
       done
-      modprobe ib_uverbs || true
 
       read -r -a opt_args <<< "$options"
       insmod "$module" "''${opt_args[@]}"
