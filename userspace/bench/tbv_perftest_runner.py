@@ -29,7 +29,12 @@ IMPORTANT_COUNTERS = [
     "verbs_recv_wqes",
     "data_wr_send",
     "data_wr_op_send",
+    "data_wr_op_send_imm",
     "data_wr_op_write",
+    "data_wr_op_write_imm",
+    "data_wr_op_unsupported",
+    "data_wr_live",
+    "data_wr_no_path",
     "data_wr_copied",
     "data_wr_zcopy",
     "data_wr_zcopy_fallback",
@@ -39,6 +44,11 @@ IMPORTANT_COUNTERS = [
     "data_wr_no_recv_credit",
     "data_wr_path_send",
     "data_wr_path_send_error",
+    "data_wr_retransmit",
+    "data_wr_rnr_retransmit",
+    "data_wr_retry_enqueue_error",
+    "data_wr_retry_exhausted",
+    "data_wr_rnr_retry_exhausted",
     "data_wr_timeout",
     "data_tx_accepted",
     "data_tx_posted",
@@ -55,8 +65,26 @@ IMPORTANT_COUNTERS = [
     "data_rx_bad_header",
     "data_rx_send",
     "data_rx_op_send",
+    "data_rx_op_send_imm",
     "data_rx_op_write",
+    "data_rx_op_write_imm",
     "data_rx_ack",
+    "data_rx_ack_matched",
+    "data_rx_ack_match_retried",
+    "data_rx_ack_match_max_ms",
+    "data_rx_ack_match_current_max_ms",
+    "data_rx_ack_match_over_10ms",
+    "data_rx_ack_match_over_64ms",
+    "data_rx_ack_miss",
+    "data_rx_late_ack",
+    "data_rx_ack_cumulative",
+    "data_tx_ack_ok",
+    "data_tx_ack_rnr",
+    "data_tx_ack_error",
+    "data_tx_ack_send_error",
+    "data_rx_ack_rnr",
+    "data_rx_duplicate_ack",
+    "data_rx_ack_history_miss",
     "data_tx_read_ack_ok",
     "data_tx_read_ack_retry",
     "data_tx_read_ack_error",
@@ -85,6 +113,11 @@ IMPORTANT_COUNTERS = [
     "data_rx_qp_error",
     "data_rx_no_recv",
     "data_rx_copy_error",
+    "data_rx_send_len_error",
+    "data_rx_send_prot_error",
+    "data_rx_send_cq_error",
+    "data_rx_send_bad_fragment",
+    "data_rx_send_sequence_error",
     "data_rx_active_timeout",
     "data_rx_reorder_buffered",
     "data_rx_reorder_delivered",
@@ -106,6 +139,56 @@ PEER_COUNTERS = [
     "data_rx_credit_send_error",
     "data_rx_repost_failed",
     "rx_credit_pending",
+]
+
+FATAL_COUNTERS = [
+    "data_wr_no_path",
+    "data_wr_copy_error",
+    "data_wr_path_send_error",
+    "data_wr_retry_enqueue_error",
+    "data_wr_retry_exhausted",
+    "data_wr_rnr_retry_exhausted",
+    "data_wr_timeout",
+    "data_tx_errors",
+    "data_tx_ack_error",
+    "data_tx_ack_send_error",
+    "data_tx_read_ack_error",
+    "data_rx_credit_send_error",
+    "data_rx_repost_failed",
+    "data_rx_bad_frame",
+    "data_rx_bad_header",
+    "data_rx_ack_miss",
+    "data_rx_ack_history_miss",
+    "data_rx_read_ack_error",
+    "data_rx_read_resp_remote_error",
+    "data_rx_read_resp_bad_header",
+    "data_rx_read_resp_copy_error",
+    "data_rx_read_resp_short",
+    "data_rx_read_req_no_access",
+    "data_rx_read_req_no_mr",
+    "data_rx_read_req_mr_access",
+    "data_rx_read_req_too_large",
+    "data_rx_read_req_bad_iova",
+    "data_rx_read_req_alloc_error",
+    "data_rx_read_req_resp_error",
+    "data_read_resp_drop",
+    "data_rx_no_qp",
+    "data_rx_bad_peer",
+    "data_rx_unconnected_qp",
+    "data_rx_qp_error",
+    "data_rx_no_recv",
+    "data_rx_copy_error",
+    "data_rx_send_len_error",
+    "data_rx_send_prot_error",
+    "data_rx_send_cq_error",
+    "data_rx_send_bad_fragment",
+    "data_rx_send_sequence_error",
+    "data_rx_active_timeout",
+    "data_rx_reorder_dropped",
+    "data_rx_reorder_timeout",
+    "data_rx_reorder_window",
+    "data_rx_pending_discarded",
+    "data_cq_overflow",
 ]
 
 CSV_FIELDS = [
@@ -254,6 +337,24 @@ def parse_key_values(text: str) -> dict[str, int]:
     return out
 
 
+def backend_matches(current: str | None, requested: str | None) -> bool:
+    if not requested:
+        return True
+    if current is None:
+        return False
+    native_aliases = {"native", "native-linux", "tbverbs"}
+    if requested in native_aliases:
+        return current in native_aliases
+    return current == requested
+
+
+def normalize_rail_speed(value: str) -> str:
+    value = value.strip()
+    if re.fullmatch(r"[0-9]+", value):
+        return f"{value}Gb/s"
+    return value
+
+
 def parse_peer_totals(text: str, backend: str | None) -> tuple[int, list[str], dict[str, int]]:
     current_backend = None
     ready_rails = 0
@@ -265,7 +366,7 @@ def parse_peer_totals(text: str, backend: str | None) -> tuple[int, list[str], d
         if peer_match:
             current_backend = peer_match.group(1)
             continue
-        if backend and current_backend != backend:
+        if not backend_matches(current_backend, backend):
             continue
         if line.startswith("rail="):
             attrs = dict(re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=([^ ]+)", line))
@@ -383,6 +484,15 @@ def collect_telemetry(host: str, dev: str, backend: str | None, netdev: str | No
 def delta_ints(after: dict[str, int], before: dict[str, int]) -> dict[str, int]:
     keys = set(before) | set(after)
     return {key: int(after.get(key, 0)) - int(before.get(key, 0)) for key in keys}
+
+
+def fatal_counter_details(label: str, counters: dict[str, int]) -> list[str]:
+    details = []
+    for name in FATAL_COUNTERS:
+        value = counters.get(name, 0)
+        if value:
+            details.append(f"{label}.{name}+{value}")
+    return details
 
 
 def perftest_kind(case: dict[str, Any]) -> str:
@@ -664,8 +774,9 @@ def assert_topology(label: str, telemetry: dict[str, Any], expect_rails: int | N
     if expect_rails is not None and telemetry["ready_rails"] != expect_rails:
         die(f"{label}: expected {expect_rails} ready rails, saw {telemetry['ready_rails']}")
     if expect_speed and expect_speed != "any":
+        expected = normalize_rail_speed(expect_speed)
         speeds = telemetry["rail_speeds"]
-        if not speeds or any(speed != expect_speed for speed in speeds):
+        if not speeds or any(normalize_rail_speed(speed) != expected for speed in speeds):
             die(f"{label}: expected rail speed {expect_speed}, saw {','.join(speeds) or 'none'}")
 
 
@@ -929,28 +1040,13 @@ def main() -> int:
                         server_rail_delta = delta_ints(after_server["rail_totals"], before_server["rail_totals"])
                         client_rail_delta = delta_ints(after_client["rail_totals"], before_client["rail_totals"])
 
-                        error_counters = [
-                            "data_wr_path_send_error",
-                            "data_tx_errors",
-                            "data_rx_bad_frame",
-                            "data_rx_bad_header",
-                            "data_rx_no_qp",
-                            "data_rx_copy_error",
-                            "data_rx_read_resp_remote_error",
-                            "data_rx_read_resp_bad_header",
-                            "data_rx_read_resp_copy_error",
-                            "data_rx_read_resp_short",
-                            "data_rx_read_req_no_access",
-                            "data_rx_read_req_no_mr",
-                            "data_rx_read_req_mr_access",
-                            "data_rx_read_req_too_large",
-                            "data_rx_read_req_bad_iova",
-                            "data_rx_read_req_alloc_error",
-                            "data_rx_read_req_resp_error",
-                            "data_rx_reorder_dropped",
-                            "data_read_resp_drop",
-                            "data_cq_overflow",
-                        ]
+                        fatal_details = (
+                            fatal_counter_details("server", server_delta)
+                            + fatal_counter_details("client", client_delta)
+                        )
+                        if status == "ok" and fatal_details:
+                            status = "fail"
+                            error = "fatal counter delta: " + ", ".join(fatal_details)
                         row.update(metrics)
                         row.update({
                             "status": status,
@@ -960,8 +1056,8 @@ def main() -> int:
                             "client_ready_rails": str(after_client["ready_rails"]),
                             "server_rail_speeds": "|".join(after_server["rail_speeds"]),
                             "client_rail_speeds": "|".join(after_client["rail_speeds"]),
-                            "server_error_delta": str(sum(server_delta.get(name, 0) for name in error_counters)),
-                            "client_error_delta": str(sum(client_delta.get(name, 0) for name in error_counters)),
+                            "server_error_delta": str(sum(server_delta.get(name, 0) for name in FATAL_COUNTERS)),
+                            "client_error_delta": str(sum(client_delta.get(name, 0) for name in FATAL_COUNTERS)),
                             "server_zcopy_delta": str(server_delta.get("data_wr_zcopy", 0)),
                             "server_copy_delta": str(server_delta.get("data_wr_copied", 0)),
                             "client_zcopy_delta": str(client_delta.get("data_wr_zcopy", 0)),

@@ -119,7 +119,7 @@ int tbv_rel_tx_on_timeout(struct tbv_rel_tx_op *tx,
 	if (tx->state != TBV_REL_TX_IN_FLIGHT)
 		return -EINVAL;
 
-	if (!tx->retry_budget) {
+	if (tx->retry_budget != TBV_REL_RETRY_INFINITE && !tx->retry_budget) {
 		tx->state = TBV_REL_TX_FAILED;
 		tx->completion_count++;
 		tbv_rel_complete(completion, tx->op_id,
@@ -127,7 +127,8 @@ int tbv_rel_tx_on_timeout(struct tbv_rel_tx_op *tx,
 		return 0;
 	}
 
-	tx->retry_budget--;
+	if (tx->retry_budget != TBV_REL_RETRY_INFINITE)
+		tx->retry_budget--;
 	tx->retry_generation++;
 	tx->next_frame = 0;
 
@@ -154,14 +155,16 @@ int tbv_rel_tx_on_ack(struct tbv_rel_tx_op *tx,
 		tbv_rel_complete(completion, tx->op_id, TBV_REL_COMP_OK);
 		return 0;
 	case TBV_REL_ACK_RNR:
-		if (!tx->rnr_budget) {
+		if (tx->rnr_budget != TBV_REL_RETRY_INFINITE &&
+		    !tx->rnr_budget) {
 			tx->state = TBV_REL_TX_FAILED;
 			tx->completion_count++;
 			tbv_rel_complete(completion, tx->op_id,
 					 TBV_REL_COMP_RNR_RETRY_EXHAUSTED);
 			return 0;
 		}
-		tx->rnr_budget--;
+		if (tx->rnr_budget != TBV_REL_RETRY_INFINITE)
+			tx->rnr_budget--;
 		tx->retry_generation++;
 		tx->next_frame = 0;
 		tx->state = TBV_REL_TX_READY;
@@ -175,6 +178,30 @@ int tbv_rel_tx_on_ack(struct tbv_rel_tx_op *tx,
 	default:
 		return -EINVAL;
 	}
+}
+
+tbv_rel_u64 tbv_rel_retry_interval(tbv_rel_u64 ack_timeout,
+				   tbv_rel_u32 retry_budget)
+{
+	(void)retry_budget;
+
+	return ack_timeout;
+}
+
+tbv_rel_u64 tbv_rel_ack_timeout_ns(tbv_rel_u8 timeout)
+{
+	tbv_rel_u8 encoded = timeout > 31 ? 31 : timeout;
+
+	return (tbv_rel_u64)4096 << encoded;
+}
+
+tbv_rel_u32 tbv_rel_decode_verbs_rnr_retry(tbv_rel_u8 rnr_retry)
+{
+	tbv_rel_u8 encoded = rnr_retry & 0x7u;
+
+	return encoded == TBV_REL_VERBS_RNR_RETRY_INFINITE ?
+		       TBV_REL_RETRY_INFINITE :
+		       encoded;
 }
 
 void tbv_rel_rx_init(struct tbv_rel_rx_op *rx, tbv_rel_u64 conn_id,

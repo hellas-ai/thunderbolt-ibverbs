@@ -26,6 +26,7 @@ bench/results/**/result/
 bench/results/**/*.json
 bench/results/**/*.jsonl
 bench/results/**/logs/
+thunderbolt-ibverbs/results/
 
 # Python bytecode
 __pycache__/

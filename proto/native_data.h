@@ -11,6 +11,7 @@
 #define TBV_NATIVE_DATA_MAX_PAYLOAD \
 	(TBV_NATIVE_DATA_FRAME_SIZE - TBV_NATIVE_DATA_HDR_SIZE)
 #define TBV_NATIVE_DATA_MAX_MSG_SIZE	(16u * 1024u * 1024u)
+#define TBV_NATIVE_DATA_CREDIT_BATCH	32u
 #define TBV_NATIVE_DATA_MAX_FRAGS \
 	((TBV_NATIVE_DATA_MAX_MSG_SIZE + TBV_NATIVE_DATA_MAX_PAYLOAD - 1u) / \
 	 TBV_NATIVE_DATA_MAX_PAYLOAD)
@@ -42,21 +43,54 @@ enum tbv_native_read_ack_status {
 	TBV_NATIVE_READ_ACK_ERROR = 2,
 };
 
+enum tbv_native_send_ack_status {
+	TBV_NATIVE_SEND_ACK_OK = 0,
+	TBV_NATIVE_SEND_ACK_RNR = 1,
+	TBV_NATIVE_SEND_ACK_ERROR = 2,
+};
+
 struct tbv_native_data_header {
 	tbv_wire_u8 opcode;
 	tbv_wire_u8 flags;
 	tbv_wire_u32 dest_qp;
 	tbv_wire_u32 src_qp;
 	tbv_wire_u32 psn;
-	/* For SEND/SEND_IMM, length is this fragment, imm_data is total
-	 * message bytes, remote_addr is the fragment offset, and rkey carries
-	 * immediate data for SEND_IMM. For ACK, imm_data is status.
+	/*
+	 * length is this fragment's payload bytes. frag_offset is this
+	 * fragment's byte offset within the operation. For SEND/SEND_IMM,
+	 * imm_data is total message bytes, remote_addr is zero, and rkey carries
+	 * immediate data for SEND_IMM. For RDMA_WRITE/RDMA_WRITE_IMM,
+	 * remote_addr is the base remote IOVA, rkey is the remote key, and
+	 * imm_data carries immediate data only for RDMA_WRITE_IMM. For
+	 * SEND_ACK, imm_data is enum tbv_native_send_ack_status.
 	 */
 	tbv_wire_u32 length;
 	tbv_wire_u32 imm_data;
 	tbv_wire_u64 remote_addr;
 	tbv_wire_u32 rkey;
+	tbv_wire_u32 frag_offset;
 };
+
+static inline tbv_wire_u32
+tbv_native_data_credit_return_threshold(tbv_wire_u32 credit_window)
+{
+	if (credit_window && credit_window < TBV_NATIVE_DATA_CREDIT_BATCH)
+		return credit_window;
+	return TBV_NATIVE_DATA_CREDIT_BATCH;
+}
+
+static inline tbv_wire_u32
+tbv_native_data_start_credit_required(tbv_wire_u32 frames,
+				      tbv_wire_u32 credit_window)
+{
+	tbv_wire_u32 threshold;
+
+	if (!frames)
+		return 0;
+
+	threshold = tbv_native_data_credit_return_threshold(credit_window);
+	return frames < threshold ? frames : threshold;
+}
 
 static inline int
 tbv_native_data_build_header(void *buf, size_t size,
@@ -88,6 +122,7 @@ tbv_native_data_build_header(void *buf, size_t size,
 	tbv_wire_put_le32(p + 28, hdr->imm_data);
 	tbv_wire_put_le64(p + 32, hdr->remote_addr);
 	tbv_wire_put_le32(p + 40, hdr->rkey);
+	tbv_wire_put_le32(p + 44, hdr->frag_offset);
 
 	return TBV_NATIVE_DATA_HDR_SIZE;
 }
@@ -123,6 +158,7 @@ tbv_native_data_parse_header(const void *buf, size_t size,
 	hdr->imm_data = tbv_wire_get_le32(p + 28);
 	hdr->remote_addr = tbv_wire_get_le64(p + 32);
 	hdr->rkey = tbv_wire_get_le32(p + 40);
+	hdr->frag_offset = tbv_wire_get_le32(p + 44);
 
 	if (!hdr->opcode || hdr->opcode > TBV_NATIVE_DATA_OP_MAX)
 		return -EINVAL;
@@ -131,6 +167,77 @@ tbv_native_data_parse_header(const void *buf, size_t size,
 			   TBV_NATIVE_DATA_MAX_PAYLOAD))
 		return -EMSGSIZE;
 
+	return 0;
+}
+
+static inline int
+tbv_native_data_raw_payload_header(const struct tbv_native_data_header *stream,
+				   tbv_wire_u32 done,
+				   tbv_wire_u32 remaining,
+				   tbv_wire_u32 payload_len,
+				   struct tbv_native_data_header *payload)
+{
+	if (!stream || !payload)
+		return -EINVAL;
+	if (!(stream->flags & TBV_NATIVE_DATA_F_RAW_STREAM))
+		return -EINVAL;
+	if (!payload_len || payload_len > remaining)
+		return -EINVAL;
+
+	*payload = *stream;
+	payload->flags &= ~(TBV_NATIVE_DATA_F_RAW_STREAM |
+			    TBV_NATIVE_DATA_F_LAST |
+			    TBV_NATIVE_DATA_F_SOLICITED);
+	if (payload_len == remaining)
+		payload->flags |= stream->flags &
+				  (TBV_NATIVE_DATA_F_LAST |
+				   TBV_NATIVE_DATA_F_SOLICITED);
+	payload->length = payload_len;
+	payload->frag_offset = done;
+	return 0;
+}
+
+static inline int
+tbv_native_data_fragment_shape(tbv_wire_u32 total_len,
+			       tbv_wire_u32 max_payload,
+			       tbv_wire_u32 max_frags,
+			       tbv_wire_u32 offset,
+			       tbv_wire_u32 len,
+			       bool last,
+			       tbv_wire_u32 *frag_idx,
+			       tbv_wire_u32 *frag_count)
+{
+	tbv_wire_u32 idx;
+	tbv_wire_u32 count;
+	tbv_wire_u32 expected_len;
+
+	if (!max_payload || !max_frags || !frag_idx || !frag_count)
+		return -EINVAL;
+
+	if (!total_len) {
+		if (offset || len || !last)
+			return -EINVAL;
+		*frag_idx = 0;
+		*frag_count = 1;
+		return 0;
+	}
+
+	if (offset % max_payload)
+		return -EINVAL;
+	idx = offset / max_payload;
+	count = (total_len + max_payload - 1u) / max_payload;
+	if (idx >= count || count > max_frags)
+		return -EINVAL;
+
+	expected_len = idx == count - 1 ?
+			      total_len - idx * max_payload : max_payload;
+	if (len != expected_len)
+		return -EINVAL;
+	if (last != (idx == count - 1))
+		return -EINVAL;
+
+	*frag_idx = idx;
+	*frag_count = count;
 	return 0;
 }
 

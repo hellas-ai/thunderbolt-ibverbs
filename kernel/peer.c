@@ -192,6 +192,7 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 	rail->key = *key;
 	rail->rail_id = rail_id;
 	rail->native_lane = native_lane;
+	atomic_set(&rail->native_qp_bind_count, 0);
 	refcount_set(&rail->refcnt, 1);
 	init_completion(&rail->refs_zero);
 	rail->active = true;

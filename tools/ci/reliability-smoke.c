@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 #include <stdio.h>
+#include <string.h>
 
 #include "proto/reliability.h"
 
@@ -154,6 +155,37 @@ static int test_rnr_is_not_success(void)
 	return 0;
 }
 
+static int test_verbs_rnr_retry_7_is_infinite(void)
+{
+	struct tbv_rel_tx_op tx;
+	struct tbv_rel_ack_frame ack = {
+		.conn_id = 0x5656,
+		.op_id = 10,
+		.status = TBV_REL_ACK_RNR,
+	};
+	struct tbv_rel_completion comp;
+	unsigned int i;
+
+	CHECK(tbv_rel_decode_verbs_rnr_retry(0) == 0);
+	CHECK(tbv_rel_decode_verbs_rnr_retry(6) == 6);
+	CHECK(tbv_rel_decode_verbs_rnr_retry(7) == TBV_REL_RETRY_INFINITE);
+	CHECK(tbv_rel_decode_verbs_rnr_retry(15) == TBV_REL_RETRY_INFINITE);
+
+	CHECK(tbv_rel_tx_start(&tx, ack.conn_id, ack.op_id, TBV_REL_OP_SEND,
+			       8, 16, 1,
+			       tbv_rel_decode_verbs_rnr_retry(7)) == 0);
+
+	for (i = 0; i < 32; i++) {
+		CHECK(tbv_rel_tx_on_ack(&tx, &ack, &comp) == 0);
+		CHECK(!comp.valid);
+		CHECK(tx.state == TBV_REL_TX_READY);
+		CHECK(tx.rnr_budget == TBV_REL_RETRY_INFINITE);
+		CHECK(tx.completion_count == 0);
+	}
+
+	return 0;
+}
+
 static int test_wrap_safe_sequence_helpers(void)
 {
 	CHECK(tbv_rel_u32_before(1, 2));
@@ -162,6 +194,158 @@ static int test_wrap_safe_sequence_helpers(void)
 	CHECK(tbv_rel_u32_after(1, 0xffffffffu));
 	CHECK(!tbv_rel_u32_before(7, 7));
 	CHECK(!tbv_rel_u32_after(7, 7));
+
+	return 0;
+}
+
+static int test_retry_interval_uses_retry_budget(void)
+{
+	CHECK(tbv_rel_retry_interval(0, 7) == 0);
+	CHECK(tbv_rel_retry_interval(5000, 0) == 5000);
+	CHECK(tbv_rel_retry_interval(5000, 7) == 5000);
+	CHECK(tbv_rel_retry_interval(5, 7) == 5);
+
+	return 0;
+}
+
+static int test_ack_timeout_encoding(void)
+{
+	CHECK(tbv_rel_ack_timeout_ns(0) == 4096);
+	CHECK(tbv_rel_ack_timeout_ns(14) == 67108864);
+	CHECK(tbv_rel_ack_timeout_ns(31) == 8796093022208ULL);
+	CHECK(tbv_rel_ack_timeout_ns(32) == 8796093022208ULL);
+
+	return 0;
+}
+
+#define READ_RESP_TEST_TOTAL 48u
+#define READ_RESP_TEST_CHUNK 16u
+#define READ_RESP_TEST_FRAGS \
+	(READ_RESP_TEST_TOTAL / READ_RESP_TEST_CHUNK)
+
+struct read_resp_test_frag {
+	unsigned int offset;
+	unsigned int len;
+	unsigned char data[READ_RESP_TEST_CHUNK];
+	bool valid;
+};
+
+struct read_resp_test_rx {
+	unsigned int received;
+	unsigned int retry_acks;
+	unsigned int ok_acks;
+	unsigned char out[READ_RESP_TEST_TOTAL];
+	struct read_resp_test_frag frags[READ_RESP_TEST_FRAGS];
+};
+
+static struct read_resp_test_frag *
+read_resp_test_find_frag(struct read_resp_test_rx *rx, unsigned int offset)
+{
+	unsigned int i;
+
+	for (i = 0; i < READ_RESP_TEST_FRAGS; i++) {
+		if (rx->frags[i].valid && rx->frags[i].offset == offset)
+			return &rx->frags[i];
+	}
+
+	return NULL;
+}
+
+static int read_resp_test_store_frag(struct read_resp_test_rx *rx,
+				     unsigned int offset,
+				     const unsigned char *payload,
+				     unsigned int len)
+{
+	struct read_resp_test_frag *frag;
+	unsigned int i;
+
+	frag = read_resp_test_find_frag(rx, offset);
+	if (frag) {
+		if (frag->len != len || memcmp(frag->data, payload, len))
+			return -EIO;
+		return 0;
+	}
+
+	for (i = 0; i < READ_RESP_TEST_FRAGS; i++) {
+		frag = &rx->frags[i];
+		if (frag->valid)
+			continue;
+		frag->offset = offset;
+		frag->len = len;
+		memcpy(frag->data, payload, len);
+		frag->valid = true;
+		return 0;
+	}
+
+	return -ENOSPC;
+}
+
+static int read_resp_test_drain(struct read_resp_test_rx *rx)
+{
+	struct read_resp_test_frag *frag;
+
+	for (;;) {
+		frag = read_resp_test_find_frag(rx, rx->received);
+		if (!frag)
+			return 0;
+
+		memcpy(rx->out + frag->offset, frag->data, frag->len);
+		rx->received = frag->offset + frag->len;
+		frag->valid = false;
+	}
+}
+
+static int read_resp_test_deliver(struct read_resp_test_rx *rx,
+				  unsigned int offset,
+				  const unsigned char *payload,
+				  unsigned int len)
+{
+	if (offset + len > READ_RESP_TEST_TOTAL || len > READ_RESP_TEST_CHUNK)
+		return -EINVAL;
+	if (offset < rx->received)
+		return 0;
+	if (offset != rx->received) {
+		int ret = read_resp_test_store_frag(rx, offset, payload, len);
+
+		if (ret)
+			return ret;
+		rx->retry_acks++;
+		return 0;
+	}
+
+	memcpy(rx->out + offset, payload, len);
+	rx->received = offset + len;
+	CHECK(read_resp_test_drain(rx) == 0);
+	if (rx->received == READ_RESP_TEST_TOTAL)
+		rx->ok_acks++;
+	return 0;
+}
+
+static int test_read_response_retry_uses_stable_snapshot(void)
+{
+	unsigned char live[READ_RESP_TEST_TOTAL];
+	unsigned char snapshot[READ_RESP_TEST_TOTAL];
+	struct read_resp_test_rx rx = {};
+	struct read_resp_test_rx inconsistent = {};
+	unsigned int i;
+
+	for (i = 0; i < READ_RESP_TEST_TOTAL; i++)
+		live[i] = (unsigned char)(i + 1);
+	memcpy(snapshot, live, sizeof(snapshot));
+	for (i = 0; i < READ_RESP_TEST_TOTAL; i++)
+		live[i] = (unsigned char)(0xa0u + i);
+
+	CHECK(read_resp_test_deliver(&rx, 32, snapshot + 32, 16) == 0);
+	CHECK(rx.retry_acks == 1 && rx.ok_acks == 0 && rx.received == 0);
+	CHECK(read_resp_test_deliver(&rx, 0, snapshot, 16) == 0);
+	CHECK(rx.received == 16 && rx.ok_acks == 0);
+	CHECK(read_resp_test_deliver(&rx, 16, snapshot + 16, 16) == 0);
+	CHECK(rx.received == READ_RESP_TEST_TOTAL && rx.ok_acks == 1);
+	CHECK(memcmp(rx.out, snapshot, sizeof(snapshot)) == 0);
+	CHECK(memcmp(rx.out, live, sizeof(live)) != 0);
+
+	CHECK(read_resp_test_deliver(&inconsistent, 32, snapshot + 32, 16) == 0);
+	CHECK(read_resp_test_deliver(&inconsistent, 32, live + 32, 16) == -EIO);
 
 	return 0;
 }
@@ -217,7 +401,8 @@ static int deliver_one(struct tbv_rel_tx_op *tx, struct tbv_rel_rx_op *rx,
 	return 0;
 }
 
-static int test_generated_loss_duplicate_reorder_schedules(void)
+static int test_generated_loss_duplicate_reorder_schedules_for_op(
+	tbv_rel_u8 op, unsigned int seed_base, bool may_rnr)
 {
 	unsigned int seed;
 
@@ -231,16 +416,16 @@ static int test_generated_loss_duplicate_reorder_schedules(void)
 		unsigned int attempts = 0;
 		bool rx_completed = false;
 
-		CHECK(tbv_rel_tx_start(&tx, 0x6000u + seed, seed,
-				       TBV_REL_OP_SEND, total_len, 16, 128,
+		CHECK(tbv_rel_tx_start(&tx, 0x6000u + seed_base + seed,
+				       seed_base + seed, op, total_len, 16, 128,
 				       8) == 0);
-		tbv_rel_rx_init(&rx, 0x6000u + seed, 16);
+		tbv_rel_rx_init(&rx, 0x6000u + seed_base + seed, 16);
 
 		while (tx.state != TBV_REL_TX_COMPLETE && attempts < 128) {
 			unsigned int count = 0;
 			unsigned int i;
 			bool force_deliver = attempts > 24;
-			bool rnr_first = !rx.active && !rx.accepted &&
+			bool rnr_first = may_rnr && !rx.active && !rx.accepted &&
 					 attempts < 4 &&
 					 (next_rand(&rng) & 7u) == 0;
 
@@ -288,13 +473,29 @@ static int test_generated_loss_duplicate_reorder_schedules(void)
 	return 0;
 }
 
+static int test_generated_loss_duplicate_reorder_schedules(void)
+{
+	CHECK(test_generated_loss_duplicate_reorder_schedules_for_op(
+		      TBV_REL_OP_SEND, 0x1000u, true) == 0);
+	CHECK(test_generated_loss_duplicate_reorder_schedules_for_op(
+		      TBV_REL_OP_RDMA_WRITE, 0x2000u, false) == 0);
+	CHECK(test_generated_loss_duplicate_reorder_schedules_for_op(
+		      TBV_REL_OP_RDMA_READ_RESP, 0x3000u, false) == 0);
+
+	return 0;
+}
+
 int main(void)
 {
 	CHECK(test_no_success_before_ack() == 0);
 	CHECK(test_lost_middle_fragment_retry_exactly_once() == 0);
 	CHECK(test_stale_connection_id_ignored() == 0);
 	CHECK(test_rnr_is_not_success() == 0);
+	CHECK(test_verbs_rnr_retry_7_is_infinite() == 0);
 	CHECK(test_wrap_safe_sequence_helpers() == 0);
+	CHECK(test_retry_interval_uses_retry_budget() == 0);
+	CHECK(test_ack_timeout_encoding() == 0);
+	CHECK(test_read_response_retry_uses_stable_snapshot() == 0);
 	CHECK(test_generated_loss_duplicate_reorder_schedules() == 0);
 
 	puts("reliability smoke OK");

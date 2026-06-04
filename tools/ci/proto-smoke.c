@@ -29,7 +29,113 @@ static int data_header_equal(const struct tbv_native_data_header *a,
 	       a->length == b->length &&
 	       a->imm_data == b->imm_data &&
 	       a->remote_addr == b->remote_addr &&
-	       a->rkey == b->rkey;
+	       a->rkey == b->rkey &&
+	       a->frag_offset == b->frag_offset;
+}
+
+static unsigned int native_data_frags(unsigned int len)
+{
+	return (len + TBV_NATIVE_DATA_MAX_PAYLOAD - 1u) /
+	       TBV_NATIVE_DATA_MAX_PAYLOAD;
+}
+
+static int test_raw_stream_payload_header(void)
+{
+	struct tbv_native_data_header stream = {
+		.opcode = TBV_NATIVE_DATA_OP_RDMA_WRITE,
+		.flags = TBV_NATIVE_DATA_F_LAST |
+			 TBV_NATIVE_DATA_F_SOLICITED |
+			 TBV_NATIVE_DATA_F_RAW_STREAM,
+		.dest_qp = 0x900,
+		.src_qp = 0x901,
+		.psn = 42,
+		.length = 8192,
+		.imm_data = 8192,
+		.remote_addr = 0x100000000ull,
+		.rkey = 0x1234,
+	};
+	struct tbv_native_data_header frag;
+	int ret;
+
+	ret = tbv_native_data_raw_payload_header(&stream, 0, 8192, 4096,
+						 &frag);
+	if (ret)
+		return 1;
+	if (frag.remote_addr != stream.remote_addr || frag.frag_offset != 0 ||
+	    frag.length != 4096 || frag.flags)
+		return 2;
+
+	ret = tbv_native_data_raw_payload_header(&stream, 4096, 4096, 4096,
+						 &frag);
+	if (ret)
+		return 3;
+	if (frag.remote_addr != stream.remote_addr ||
+	    frag.frag_offset != 4096 ||
+	    frag.length != 4096 ||
+	    frag.flags != (TBV_NATIVE_DATA_F_LAST |
+			   TBV_NATIVE_DATA_F_SOLICITED))
+		return 4;
+
+	if (tbv_native_data_raw_payload_header(&stream, 4096, 4096, 4097,
+					       &frag) != -EINVAL)
+		return 5;
+
+	stream.flags &= ~TBV_NATIVE_DATA_F_RAW_STREAM;
+	if (tbv_native_data_raw_payload_header(&stream, 0, 4096, 4096,
+					       &frag) != -EINVAL)
+		return 6;
+
+	return 0;
+}
+
+static int test_fragment_shapes(void)
+{
+	unsigned int idx;
+	unsigned int count;
+
+	if (tbv_native_data_fragment_shape(8192, TBV_NATIVE_DATA_MAX_PAYLOAD,
+					   TBV_NATIVE_DATA_MAX_FRAGS, 0,
+					   TBV_NATIVE_DATA_MAX_PAYLOAD, false,
+					   &idx, &count))
+		return 1;
+	if (idx != 0 || count != 3)
+		return 2;
+	if (tbv_native_data_fragment_shape(8192, TBV_NATIVE_DATA_MAX_PAYLOAD,
+					   TBV_NATIVE_DATA_MAX_FRAGS,
+					   TBV_NATIVE_DATA_MAX_PAYLOAD,
+					   TBV_NATIVE_DATA_MAX_PAYLOAD, false,
+					   &idx, &count))
+		return 3;
+	if (idx != 1 || count != 3)
+		return 4;
+	if (tbv_native_data_fragment_shape(8192, TBV_NATIVE_DATA_MAX_PAYLOAD,
+					   TBV_NATIVE_DATA_MAX_FRAGS, 8096,
+					   96, true, &idx, &count))
+		return 5;
+	if (idx != 2 || count != 3)
+		return 6;
+
+	if (tbv_native_data_fragment_shape(8192, TBV_NATIVE_DATA_FRAME_SIZE,
+					   TBV_NATIVE_DATA_MAX_FRAGS, 0,
+					   TBV_NATIVE_DATA_FRAME_SIZE, false,
+					   &idx, &count))
+		return 7;
+	if (idx != 0 || count != 2)
+		return 8;
+	if (tbv_native_data_fragment_shape(8192, TBV_NATIVE_DATA_FRAME_SIZE,
+					   TBV_NATIVE_DATA_MAX_FRAGS, 4096,
+					   TBV_NATIVE_DATA_FRAME_SIZE, true,
+					   &idx, &count))
+		return 9;
+	if (idx != 1 || count != 2)
+		return 10;
+	if (tbv_native_data_fragment_shape(8192, TBV_NATIVE_DATA_MAX_PAYLOAD,
+					   TBV_NATIVE_DATA_MAX_FRAGS, 4096,
+					   TBV_NATIVE_DATA_FRAME_SIZE, true,
+					   &idx, &count) != -EINVAL)
+		return 11;
+
+	return 0;
 }
 
 int main(void)
@@ -62,6 +168,7 @@ int main(void)
 		.imm_data = 0x58494f01u,
 		.remote_addr = 0x8877665544332211ull,
 		.rkey = 14,
+		.frag_offset = 4096,
 	};
 	struct tbv_native_data_header parsed_hdr;
 	int ret;
@@ -95,6 +202,27 @@ int main(void)
 		return 6;
 	if (!data_header_equal(&hdr, &parsed_hdr))
 		return 7;
+
+	if (tbv_native_data_credit_return_threshold(768) !=
+	    TBV_NATIVE_DATA_CREDIT_BATCH)
+		return 8;
+	if (tbv_native_data_credit_return_threshold(16) != 16)
+		return 9;
+	if (tbv_native_data_start_credit_required(
+		    native_data_frags(65536), 768) <= 15)
+		return 10;
+	if (tbv_native_data_start_credit_required(
+		    native_data_frags(32768), 768) <= 7)
+		return 11;
+	if (tbv_native_data_start_credit_required(65, 768) !=
+	    TBV_NATIVE_DATA_CREDIT_BATCH)
+		return 12;
+	if (tbv_native_data_start_credit_required(65, 16) != 16)
+		return 13;
+	if (test_raw_stream_payload_header())
+		return 14;
+	if (test_fragment_shapes())
+		return 15;
 
 	puts("protocol header smoke OK");
 	return 0;

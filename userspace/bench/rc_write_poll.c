@@ -48,6 +48,8 @@ struct opts {
 	int signaled;
 	int signal_first;
 	int imm;
+	int no_recv;
+	int expect_no_write;
 	int recv_sge;
 	int fifo;
 	int count;
@@ -162,7 +164,8 @@ static void usage(const char *argv0)
 	fprintf(stderr,
 		"usage: %s --role target|writer --dev DEV [--connect HOST]\n"
 		"          [--tcp-port N] [--gid-index N] [--ib-port N]\n"
-		"          [--timeout-ms N] [--unsignaled] [--imm] [--recv-sge]\n"
+		"          [--timeout-ms N] [--unsignaled] [--imm] [--no-recv]\n"
+		"          [--expect-no-write] [--recv-sge]\n"
 		"          [--fifo] [--count N] [--stride BYTES] [--signal-first]\n"
 		"          [--iova2]\n",
 		argv0);
@@ -201,6 +204,10 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 			o->signal_first = 1;
 		else if (!strcmp(argv[i], "--imm"))
 			o->imm = 1;
+		else if (!strcmp(argv[i], "--no-recv"))
+			o->no_recv = 1;
+		else if (!strcmp(argv[i], "--expect-no-write"))
+			o->expect_no_write = 1;
 		else if (!strcmp(argv[i], "--recv-sge"))
 			o->recv_sge = 1;
 		else if (!strcmp(argv[i], "--fifo"))
@@ -225,7 +232,11 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	if (o->count <= 0 || o->count > 32 || !o->stride)
 		return -1;
 	if (o->fifo && ((size_t)(o->count - 1) * o->stride +
-		       sizeof(struct test_fifo) > 4096))
+			sizeof(struct test_fifo) > 4096))
+		return -1;
+	if (o->no_recv && !o->imm)
+		return -1;
+	if (o->expect_no_write && (!o->imm || !o->no_recv))
 		return -1;
 	return 0;
 }
@@ -323,7 +334,7 @@ static int poll_recv_imm(struct ibv_cq *cq, uint64_t wr_id, uint32_t expected,
 	return 1;
 }
 
-static int poll_send(struct ibv_cq *cq, uint64_t wr_id)
+static int poll_send(struct ibv_cq *cq, uint64_t wr_id, int expect_error)
 {
 	uint64_t deadline = now_ns() + 5ull * 1000 * 1000 * 1000;
 
@@ -335,10 +346,12 @@ static int poll_send(struct ibv_cq *cq, uint64_t wr_id)
 			return -1;
 		if (!n)
 			continue;
-		if (wc.wr_id != wr_id || wc.status != IBV_WC_SUCCESS) {
+		if (wc.wr_id != wr_id ||
+		    (!expect_error && wc.status != IBV_WC_SUCCESS) ||
+		    (expect_error && wc.status == IBV_WC_SUCCESS)) {
 			fprintf(stderr,
-				"bad wc wr_id=%" PRIu64 " status=%d opcode=%d\n",
-				wc.wr_id, wc.status, wc.opcode);
+				"bad wc wr_id=%" PRIu64 " status=%d opcode=%d expect_error=%d\n",
+				wc.wr_id, wc.status, wc.opcode, expect_error);
 			return -1;
 		}
 		return 0;
@@ -468,9 +481,11 @@ int main(int argc, char **argv)
 				rr.sg_list = &rsge;
 				rr.num_sge = 1;
 			}
-			if (ibv_post_recv(qp, &rr, &bad_recv)) {
-				perror("ibv_post_recv");
-				goto out;
+			if (!o.no_recv) {
+				if (ibv_post_recv(qp, &rr, &bad_recv)) {
+					perror("ibv_post_recv");
+					goto out;
+				}
 			}
 			ready = 1;
 			if (send_all(fd, &ready, sizeof(ready)))
@@ -531,13 +546,14 @@ int main(int argc, char **argv)
 			}
 		}
 		if (first_signaled) {
-			if (poll_send(cq, 0x99)) {
+			if (poll_send(cq, 0x99, o.expect_no_write)) {
 				perror("rdma write");
 				goto out;
 			}
 		} else if (o.signaled) {
 			for (int i = 0; i < o.count; i++) {
-				if (poll_send(cq, 0x99 + (uint64_t)i)) {
+				if (poll_send(cq, 0x99 + (uint64_t)i,
+					      o.expect_no_write)) {
 					perror("rdma write");
 					goto out;
 				}
@@ -545,9 +561,9 @@ int main(int argc, char **argv)
 		}
 		if (recv_all(fd, &result, sizeof(result)))
 			goto out;
-		printf("writer result=%d signaled=%d signal_first=%d imm=%d fifo=%d count=%d stride=%zu\n",
-		       result, o.signaled, o.signal_first, o.imm, o.fifo,
-		       o.count, o.stride);
+		printf("writer result=%d signaled=%d signal_first=%d imm=%d no_recv=%d expect_no_write=%d fifo=%d count=%d stride=%zu\n",
+		       result, o.signaled, o.signal_first, o.imm, o.no_recv,
+		       o.expect_no_write, o.fifo, o.count, o.stride);
 	} else {
 		uint64_t deadline = now_ns() + (uint64_t)o.timeout_ms * 1000000ull;
 		struct ibv_wc wc = {};
@@ -587,22 +603,24 @@ int main(int argc, char **argv)
 				if (n > 0)
 					saw_imm = 1;
 			}
-			if (saw_value && saw_imm) {
+			if (!o.expect_no_write && saw_value && saw_imm) {
 				result = 0;
 				break;
 			}
 		}
+		if (o.expect_no_write && !saw_value && !saw_imm)
+			result = 0;
 		if (send_all(fd, &result, sizeof(result)))
 			goto out;
 		printf("target result=%d value=0x%016" PRIx64
 		       " saw_value=%d saw_imm=%d imm=0x%08x opcode=%d byte_len=%u"
 		       " fifo_idx=%" PRIu64 " fifo_size=%" PRIu64
 		       " fifo_nreqs=%u fifo_tag=0x%08x fifo_rkey0=0x%08x"
-		       " count=%d stride=%zu\n",
+		       " no_recv=%d expect_no_write=%d count=%d stride=%zu\n",
 		       result, *buf, saw_value, saw_imm, ntohl(wc.imm_data),
 		       wc.opcode, wc.byte_len, fifo->idx, fifo->size,
-		       fifo->nreqs, fifo->tag, fifo->rkeys[0], o.count,
-		       o.stride);
+		       fifo->nreqs, fifo->tag, fifo->rkeys[0], o.no_recv,
+		       o.expect_no_write, o.count, o.stride);
 	}
 
 out:

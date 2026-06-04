@@ -12,6 +12,7 @@ typedef u32 tbv_wire_u32;
 typedef u64 tbv_wire_u64;
 #else
 #include <errno.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>

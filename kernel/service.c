@@ -301,6 +301,14 @@ static u32 tbv_service_native_lane(const struct tb_service_id *id)
 	return (u32)id->driver_data;
 }
 
+static u32 tbv_config_native_lane_count(const struct tbv_state *state)
+{
+	if (state->cfg.requested.lanes_auto)
+		return min_t(u32, 2, TBV_NATIVE_MAX_LANES);
+
+	return state->cfg.requested.lanes_max;
+}
+
 static u32 tbv_service_path_id(const struct tb_service *svc,
 			       const struct tb_service_id *id,
 			       enum tbv_backend_type backend)
@@ -338,6 +346,10 @@ static int tbv_service_probe(struct tb_service *svc,
 
 	if (backend == TBV_BACKEND_APPLE &&
 	    !tbv_service_apple_xdomain_allowed(tbv_service_state, xd))
+		return -ENODEV;
+
+	if (backend == TBV_BACKEND_NATIVE &&
+	    native_lane >= tbv_config_native_lane_count(tbv_service_state))
 		return -ENODEV;
 
 	binding = kzalloc(sizeof(*binding), GFP_KERNEL);
@@ -538,10 +550,7 @@ static int tbv_register_native_dirs(struct tbv_state *state, u32 prtcstns)
 	if (!state->cfg.native_enabled || !state->native_data)
 		return 0;
 
-	if (state->cfg.requested.lanes_auto)
-		count = 1;
-	else
-		count = state->cfg.requested.lanes_max;
+	count = tbv_config_native_lane_count(state);
 
 	if (!count || count > TBV_NATIVE_MAX_LANES) {
 		pr_err("native lanes request %u exceeds supported maximum %u\n",

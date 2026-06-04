@@ -20,6 +20,8 @@ typedef uint64_t tbv_rel_u64;
 #endif
 
 #define TBV_REL_MAX_FRAGS 64u
+#define TBV_REL_RETRY_INFINITE ((tbv_rel_u32)~0u)
+#define TBV_REL_VERBS_RNR_RETRY_INFINITE 7u
 
 enum tbv_rel_op_kind {
 	TBV_REL_OP_SEND = 1,
@@ -137,6 +139,10 @@ int tbv_rel_tx_on_timeout(struct tbv_rel_tx_op *tx,
 int tbv_rel_tx_on_ack(struct tbv_rel_tx_op *tx,
 		      const struct tbv_rel_ack_frame *ack,
 		      struct tbv_rel_completion *completion);
+tbv_rel_u64 tbv_rel_retry_interval(tbv_rel_u64 ack_timeout,
+				   tbv_rel_u32 retry_budget);
+tbv_rel_u64 tbv_rel_ack_timeout_ns(tbv_rel_u8 timeout);
+tbv_rel_u32 tbv_rel_decode_verbs_rnr_retry(tbv_rel_u8 rnr_retry);
 
 void tbv_rel_rx_init(struct tbv_rel_rx_op *rx, tbv_rel_u64 conn_id,
 		     tbv_rel_u32 max_payload);

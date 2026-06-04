@@ -40,7 +40,9 @@ int tbv_core_init(struct tbv_state *state,
 	xa_init(&state->verbs_qps_xa);
 	state->next_peer_id = 1;
 	state->workqueue = alloc_workqueue("tbv_ibdev",
-					   WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+					   WQ_UNBOUND | WQ_MEM_RECLAIM |
+						   WQ_HIGHPRI,
+					   0);
 	if (!state->workqueue) {
 		mutex_destroy(&state->rail_register_lock);
 		mutex_destroy(&state->lock);

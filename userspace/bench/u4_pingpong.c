@@ -13,6 +13,8 @@
  * Usage:
  *   u4_pingpong server <iters> <size>
  *   u4_pingpong client <iters> <size>
+ *   u4_pingpong sink <iters> <size>
+ *   u4_pingpong source <iters> <size>
  *
  * Both sides must be launched before traffic begins.
  */
@@ -22,6 +24,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdint.h>
 #include <infiniband/verbs.h>
 
 static struct ibv_context *open_dev(void)
@@ -29,10 +32,14 @@ static struct ibv_context *open_dev(void)
 	int n, i;
 	struct ibv_device **list = ibv_get_device_list(&n);
 	struct ibv_context *ctx = NULL;
-	for (i = 0; i < n; i++)
-		if (strcmp(ibv_get_device_name(list[i]), "usb4_rdma0") == 0) {
-			ctx = ibv_open_device(list[i]); break;
-		}
+	for (i = 0; i < n; i++) {
+		const char *name = ibv_get_device_name(list[i]);
+
+		if (strncmp(name, "usb4_rdma", strlen("usb4_rdma")))
+			continue;
+		ctx = ibv_open_device(list[i]);
+		break;
+	}
 	if (list) ibv_free_device_list(list);
 	return ctx;
 }
@@ -86,12 +93,31 @@ static int cmp_long(const void *a, const void *b)
 	return (da > db) - (da < db);
 }
 
+static int verify_pattern(const char *buf, size_t len, unsigned char expected)
+{
+	for (size_t i = 0; i < len; i++) {
+		if ((unsigned char)buf[i] == expected)
+			continue;
+		fprintf(stderr, "payload mismatch at byte %zu: got=0x%02x expected=0x%02x\n",
+			i, (unsigned char)buf[i], expected);
+		return -1;
+	}
+	return 0;
+}
+
 int main(int argc, char **argv) {
 	if (argc < 4) {
-		fprintf(stderr, "usage: %s {server|client} <iters> <size>\n", argv[0]);
+		fprintf(stderr, "usage: %s {server|client|sink|source} <iters> <size>\n", argv[0]);
 		return 1;
 	}
 	int is_client = strcmp(argv[1], "client") == 0;
+	int is_server = strcmp(argv[1], "server") == 0;
+	int is_source = strcmp(argv[1], "source") == 0;
+	int is_sink = strcmp(argv[1], "sink") == 0;
+	if (!is_client && !is_server && !is_source && !is_sink) {
+		fprintf(stderr, "unknown mode: %s\n", argv[1]);
+		return 1;
+	}
 	int iters = atoi(argv[2]);
 	size_t size = atol(argv[3]);
 	if (size > 1u << 24) { fprintf(stderr, "max size 16 MiB\n"); return 1; }
@@ -106,7 +132,8 @@ int main(int argc, char **argv) {
 	size_t bufsz = ((send_off + size + 4095) & ~4095UL);
 	if (bufsz < 65536) bufsz = 65536;
 	char *buf = aligned_alloc(4096, bufsz);
-	memset(buf, 0xa5, bufsz);
+	memset(buf, 0, bufsz);
+	memset(buf + send_off, (is_client || is_source) ? 0xc3 : 0x5a, size);
 	struct ibv_mr *mr = ibv_reg_mr(pd, buf, bufsz,
 				       IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE);
 	struct ibv_cq *cq = ibv_create_cq(ctx, 64, NULL, NULL, 0);
@@ -131,7 +158,7 @@ int main(int argc, char **argv) {
 		ibv_post_recv(qp, &rwr, &bad);
 	}
 
-	long *latencies = is_client ? calloc(iters, sizeof(*latencies)) : NULL;
+	long *latencies = (is_client || is_source) ? calloc(iters, sizeof(*latencies)) : NULL;
 
 	struct ibv_send_wr swr;
 	struct ibv_send_wr *bad_swr;
@@ -157,16 +184,29 @@ int main(int argc, char **argv) {
 			while (!got_send || !got_recv) {
 				int n = ibv_poll_cq(cq, 16, wcs);
 				for (int j = 0; j < n; j++) {
+					if (wcs[j].status != IBV_WC_SUCCESS) {
+						fprintf(stderr, "client wc status=%u opcode=%u wr_id=%lu\n",
+							wcs[j].status,
+							wcs[j].opcode,
+							(unsigned long)wcs[j].wr_id);
+						return 3;
+					}
 					if (wcs[j].opcode == IBV_WC_SEND) got_send = 1;
 					if (wcs[j].opcode == IBV_WC_RECV) {
+						size_t slot = (wcs[j].wr_id - 0x1000) % POSTED;
+						char *recv = buf + slot * size;
+
+						if (verify_pattern(recv, size, 0x5a))
+							return 4;
 						got_recv = 1;
 						/* Repost the recv slot. */
 						struct ibv_recv_wr rwr = rwr_template;
 						struct ibv_recv_wr *bad;
 						rwr.wr_id = wcs[j].wr_id;
 						rsge.addr = (uintptr_t)buf
-							+ ((wcs[j].wr_id - 0x1000) % POSTED) * size;
+							+ slot * size;
 						rwr.sg_list = &rsge;
+						memset(recv, 0, size);
 						ibv_post_recv(qp, &rwr, &bad);
 					}
 				}
@@ -184,15 +224,78 @@ int main(int argc, char **argv) {
 		       latencies[(iters * 99) / 100] / 1000.0,
 		       (total / (double)iters) / 1000.0,
 		       latencies[iters-1] / 1000.0);
-	} else {
+	} else if (is_source) {
+		printf("source: %d one-way sends of %zu bytes\n", iters, size);
+		struct timespec t0, t1;
+		for (int i = 0; i < iters; i++) {
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			memset(&swr, 0, sizeof(swr));
+			ssge = (struct ibv_sge){
+				.addr=(uintptr_t)buf + send_off, .length=size, .lkey=mr->lkey };
+			swr.sg_list=&ssge; swr.num_sge=1;
+			swr.opcode=IBV_WR_SEND; swr.send_flags=IBV_SEND_SIGNALED;
+			swr.wr_id = i;
+			rv = ibv_post_send(qp, &swr, &bad_swr);
+			if (rv) { fprintf(stderr, "post_send i=%d: %d\n", i, rv); break; }
+
+			int got_send = 0;
+			while (!got_send) {
+				int n = ibv_poll_cq(cq, 16, wcs);
+				for (int j = 0; j < n; j++) {
+					if (wcs[j].status != IBV_WC_SUCCESS) {
+						fprintf(stderr, "source wc status=%u opcode=%u wr_id=%lu\n",
+							wcs[j].status,
+							wcs[j].opcode,
+							(unsigned long)wcs[j].wr_id);
+						return 3;
+					}
+					if (wcs[j].opcode == IBV_WC_SEND) got_send = 1;
+				}
+			}
+			clock_gettime(CLOCK_MONOTONIC, &t1);
+			latencies[i] = ns_diff(&t0, &t1);
+		}
+		qsort(latencies, iters, sizeof(*latencies), cmp_long);
+		long total = 0;
+		for (int i = 0; i < iters; i++) total += latencies[i];
+		printf("size=%zu iters=%d  min=%.2f us  p50=%.2f us  p99=%.2f us  avg=%.2f us  max=%.2f us\n",
+		       size, iters,
+		       latencies[0] / 1000.0,
+		       latencies[iters/2] / 1000.0,
+		       latencies[(iters * 99) / 100] / 1000.0,
+		       (total / (double)iters) / 1000.0,
+		       latencies[iters-1] / 1000.0);
+	} else if (is_server) {
 		printf("server: replying to %d pings of %zu bytes\n", iters, size);
+		int pending_recv = 0;
+		uint64_t pending_recv_wr_id = 0;
 		for (int i = 0; i < iters; i++) {
 			/* Wait for ping recv. */
-			int got_recv = 0;
+			int got_recv = pending_recv;
+			uint64_t recv_wr_id = 0;
+			if (pending_recv) {
+				recv_wr_id = pending_recv_wr_id;
+				pending_recv = 0;
+			}
 			while (!got_recv) {
 				int n = ibv_poll_cq(cq, 16, wcs);
 				for (int j = 0; j < n; j++) {
-					if (wcs[j].opcode == IBV_WC_RECV) got_recv = 1;
+					if (wcs[j].status != IBV_WC_SUCCESS) {
+						fprintf(stderr, "server wc status=%u opcode=%u wr_id=%lu\n",
+							wcs[j].status,
+							wcs[j].opcode,
+							(unsigned long)wcs[j].wr_id);
+						return 3;
+					}
+					if (wcs[j].opcode == IBV_WC_RECV) {
+						size_t slot = (wcs[j].wr_id - 0x1000) % POSTED;
+						char *recv = buf + slot * size;
+
+						if (verify_pattern(recv, size, 0xc3))
+							return 4;
+						recv_wr_id = wcs[j].wr_id;
+						got_recv = 1;
+					}
 				}
 			}
 			/* Echo back. */
@@ -207,17 +310,76 @@ int main(int argc, char **argv) {
 			int got_send = 0;
 			while (!got_send) {
 				int n = ibv_poll_cq(cq, 16, wcs);
-				for (int j = 0; j < n; j++)
+				for (int j = 0; j < n; j++) {
+					if (wcs[j].status != IBV_WC_SUCCESS) {
+						fprintf(stderr, "server send wc status=%u opcode=%u wr_id=%lu\n",
+							wcs[j].status,
+							wcs[j].opcode,
+							(unsigned long)wcs[j].wr_id);
+						return 3;
+					}
 					if (wcs[j].opcode == IBV_WC_SEND) got_send = 1;
+					if (wcs[j].opcode == IBV_WC_RECV) {
+						size_t slot = (wcs[j].wr_id - 0x1000) % POSTED;
+						char *recv = buf + slot * size;
+
+						if (pending_recv) {
+							fprintf(stderr, "server received multiple early RECV completions\n");
+							return 5;
+						}
+						if (verify_pattern(recv, size, 0xc3))
+							return 4;
+						pending_recv_wr_id = wcs[j].wr_id;
+						pending_recv = 1;
+					}
+				}
 			}
 			struct ibv_recv_wr rwr = rwr_template;
 			struct ibv_recv_wr *bad;
-			rwr.wr_id = 0x1000 + (i % POSTED);
-			rsge.addr = (uintptr_t)buf + (i % POSTED) * size;
+			rwr.wr_id = recv_wr_id;
+			rsge.addr = (uintptr_t)buf
+				+ ((recv_wr_id - 0x1000) % POSTED) * size;
 			rwr.sg_list = &rsge;
+			memset((void *)(uintptr_t)rsge.addr, 0, size);
 			ibv_post_recv(qp, &rwr, &bad);
 		}
 		printf("server: done\n");
+	} else {
+		printf("sink: receiving %d one-way sends of %zu bytes\n", iters, size);
+		for (int i = 0; i < iters; i++) {
+			int got_recv = 0;
+			uint64_t recv_wr_id = 0;
+			while (!got_recv) {
+				int n = ibv_poll_cq(cq, 16, wcs);
+				for (int j = 0; j < n; j++) {
+					if (wcs[j].status != IBV_WC_SUCCESS) {
+						fprintf(stderr, "sink wc status=%u opcode=%u wr_id=%lu\n",
+							wcs[j].status,
+							wcs[j].opcode,
+							(unsigned long)wcs[j].wr_id);
+						return 3;
+					}
+					if (wcs[j].opcode == IBV_WC_RECV) {
+						size_t slot = (wcs[j].wr_id - 0x1000) % POSTED;
+						char *recv = buf + slot * size;
+
+						if (verify_pattern(recv, size, 0xc3))
+							return 4;
+						recv_wr_id = wcs[j].wr_id;
+						got_recv = 1;
+					}
+				}
+			}
+			struct ibv_recv_wr rwr = rwr_template;
+			struct ibv_recv_wr *bad;
+			rwr.wr_id = recv_wr_id;
+			rsge.addr = (uintptr_t)buf
+				+ ((recv_wr_id - 0x1000) % POSTED) * size;
+			rwr.sg_list = &rsge;
+			memset((void *)(uintptr_t)rsge.addr, 0, size);
+			ibv_post_recv(qp, &rwr, &bad);
+		}
+		printf("sink: done\n");
 	}
 
 	ibv_destroy_qp(qp); ibv_destroy_cq(cq);

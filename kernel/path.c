@@ -2,6 +2,7 @@
 
 #include <linux/errno.h>
 #include <linux/dma-mapping.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -20,7 +21,10 @@
 #define TBV_CONTROL_FRAME_SIZE 256
 #define TBV_CONTROL_QUEUE_MULTIPLIER 4
 #define TBV_DATA_CREDIT_CONTROL_RESERVE 256
-#define TBV_DATA_CREDIT_BATCH 32
+#define TBV_DATA_TX_MAX_INFLIGHT 32
+#define TBV_TX_POLL_DELAY_MS 1
+#define TBV_RX_SUPP_POLL_DELAY_MS 1
+#define TBV_RX_SUPP_POLL_WINDOW_MS 16
 /*
  * Raw-stream zcopy serializes each DMA path, so several QPs sharing a rail can
  * briefly queue a full TX-depth worth of packetized WRs behind one active
@@ -100,6 +104,8 @@ struct tbv_tx_packet {
 	void *owner_ctx;
 	u8 sof;
 	u8 eof;
+	u32 start_credit_group_frames;
+	unsigned long queued_jiffies;
 	bool control;
 	bool pooled;
 	bool queued;
@@ -108,6 +114,7 @@ struct tbv_tx_packet {
 	bool unmap_dma;
 	bool raw_stream_start;
 	bool raw_stream_end;
+	bool raw_stream_counted;
 	u8 control_buf[TBV_CONTROL_FRAME_SIZE];
 };
 
@@ -133,6 +140,17 @@ static u32 tbv_path_data_packet_count(const struct tbv_path *path)
 	u32 count = path->cfg.tx_ring_size * TBV_DATA_QUEUE_MULTIPLIER;
 
 	return min_t(u32, count, TBV_DATA_PACKET_POOL_LIMIT);
+}
+
+static u32 tbv_path_tx_control_frame_reserve(const struct tbv_path *path)
+{
+	u32 reserve;
+
+	if (path->tx_frame_count <= 1)
+		return 0;
+
+	reserve = path->tx_frame_count / 4;
+	return clamp_t(u32, reserve, 1, TBV_DATA_CREDIT_CONTROL_RESERVE);
 }
 
 static int tbv_path_configure_ring_throttling(struct tbv_path *path)
@@ -186,6 +204,8 @@ static void tbv_path_tx_packet_release(struct tbv_tx_packet *packet, int status)
 	packet->done_ctx = NULL;
 	packet->owner_ctx = NULL;
 	packet->len = 0;
+	packet->start_credit_group_frames = 0;
+	packet->queued_jiffies = 0;
 	packet->queued = false;
 	packet->inflight = false;
 
@@ -218,6 +238,61 @@ static void tbv_path_tx_packet_release(struct tbv_tx_packet *packet, int status)
 }
 
 static void tbv_path_schedule_tx(struct tbv_path *path);
+static void tbv_path_tx_poll_work(struct work_struct *work);
+static void tbv_path_rx_supp_poll_work(struct work_struct *work);
+
+static bool tbv_path_native_progress_enabled(const struct tbv_path *path)
+{
+	return path->rail && path->rail->peer &&
+	       path->rail->peer->backend == TBV_BACKEND_NATIVE;
+}
+
+static void tbv_path_queue_delayed_work(struct tbv_path *path,
+					struct delayed_work *work,
+					unsigned long delay)
+{
+	struct tbv_state *state = tbv_path_state(path);
+
+	if (state && state->workqueue)
+		queue_delayed_work(state->workqueue, work, delay);
+	else
+		schedule_delayed_work(work, delay);
+}
+
+static void tbv_path_queue_tx_poll(struct tbv_path *path, unsigned long delay)
+{
+	if (!path->tx_poll_enabled || !path->tx_ring)
+		return;
+
+	tbv_path_queue_delayed_work(path, &path->tx_poll_work, delay);
+}
+
+static void tbv_path_queue_rx_supp_poll(struct tbv_path *path,
+					unsigned long delay)
+{
+	if (!path->rx_supp_poll_enabled || !path->rx_ring)
+		return;
+
+	WRITE_ONCE(path->rx_supp_poll_until,
+		   jiffies + msecs_to_jiffies(TBV_RX_SUPP_POLL_WINDOW_MS));
+	tbv_path_queue_delayed_work(path, &path->rx_supp_poll_work, delay);
+}
+
+static void tbv_path_atomic64_max_ms(atomic64_t *counter, u64 value)
+{
+	s64 old;
+
+	if (value > S64_MAX)
+		value = S64_MAX;
+
+	for (;;) {
+		old = atomic64_read(counter);
+		if (old >= (s64)value)
+			return;
+		if (atomic64_cmpxchg(counter, old, (s64)value) == old)
+			return;
+	}
+}
 
 static u32 tbv_path_data_credit_window(u32 rx_ring_size)
 {
@@ -231,8 +306,8 @@ static u32 tbv_path_data_credit_window(u32 rx_ring_size)
 	else
 		credits = rx_ring_size - TBV_DATA_CREDIT_CONTROL_RESERVE;
 
-	if (credits > TBV_DATA_CREDIT_BATCH)
-		credits -= credits % TBV_DATA_CREDIT_BATCH;
+	if (credits > TBV_NATIVE_DATA_CREDIT_BATCH)
+		credits -= credits % TBV_NATIVE_DATA_CREDIT_BATCH;
 	if (!credits)
 		credits = 1;
 
@@ -312,6 +387,7 @@ static void tbv_path_return_rx_data_credit(struct tbv_path *path, u32 credits)
 {
 	struct tbv_state *state;
 	unsigned long flags;
+	u32 threshold;
 	u32 pending;
 	u32 send = 0;
 	int ret;
@@ -320,13 +396,15 @@ static void tbv_path_return_rx_data_credit(struct tbv_path *path, u32 credits)
 		return;
 
 	state = tbv_path_state(path);
+	threshold = tbv_native_data_credit_return_threshold(
+		tbv_path_data_credit_window(path->cfg.rx_ring_size));
 	spin_lock_irqsave(&path->tx_lock, flags);
 	pending = path->rx_data_credit_pending;
 	if (credits > U32_MAX - pending)
 		pending = U32_MAX;
 	else
 		pending += credits;
-	if (pending >= TBV_DATA_CREDIT_BATCH) {
+	if (pending >= threshold) {
 		send = pending;
 		pending = 0;
 	}
@@ -386,19 +464,49 @@ tbv_native_data_valid_path_credit(const struct tbv_native_data_header *hdr)
 	       !hdr->rkey;
 }
 
+static void tbv_path_count_raw_stream_locked(struct tbv_path *path,
+					     struct tbv_tx_packet *packet)
+{
+	if (packet->raw_stream_start) {
+		path->tx_raw_stream_active = true;
+		path->tx_raw_stream_owner = packet->owner_ctx;
+		path->tx_raw_stream_inflight = 0;
+		path->tx_raw_stream_end_seen = false;
+	}
+	if (path->tx_raw_stream_active &&
+	    packet->owner_ctx == path->tx_raw_stream_owner) {
+		path->tx_raw_stream_inflight++;
+		packet->raw_stream_counted = true;
+	}
+}
+
 static void tbv_path_finish_raw_stream_if_needed(struct tbv_path *path,
-						 const struct tbv_tx_packet *packet)
+						 struct tbv_tx_packet *packet)
 {
 	unsigned long flags;
 
-	if (!packet || !packet->raw_stream_end)
+	if (!packet || !packet->raw_stream_counted)
 		return;
 
 	spin_lock_irqsave(&path->tx_lock, flags);
-	if (!path->tx_raw_stream_owner ||
-	    path->tx_raw_stream_owner == packet->owner_ctx) {
+	if (path->tx_raw_stream_owner == packet->owner_ctx) {
+		if (packet->raw_stream_end)
+			path->tx_raw_stream_end_seen = true;
+		if (path->tx_raw_stream_inflight)
+			path->tx_raw_stream_inflight--;
+		if (path->tx_raw_stream_end_seen &&
+		    !path->tx_raw_stream_inflight) {
+			path->tx_raw_stream_active = false;
+			path->tx_raw_stream_owner = NULL;
+			path->tx_raw_stream_end_seen = false;
+		}
+	}
+	packet->raw_stream_counted = false;
+	if (!path->tx_raw_stream_active) {
 		path->tx_raw_stream_active = false;
 		path->tx_raw_stream_owner = NULL;
+		path->tx_raw_stream_end_seen = false;
+		path->tx_raw_stream_inflight = 0;
 	}
 	spin_unlock_irqrestore(&path->tx_lock, flags);
 }
@@ -475,6 +583,9 @@ void tbv_path_init(struct tbv_path *path,
 	INIT_LIST_HEAD(&path->tx_control_queue);
 	INIT_LIST_HEAD(&path->tx_data_queue);
 	INIT_LIST_HEAD(&path->tx_zcopy_inflight);
+	INIT_DELAYED_WORK(&path->tx_poll_work, tbv_path_tx_poll_work);
+	INIT_DELAYED_WORK(&path->rx_supp_poll_work,
+			  tbv_path_rx_supp_poll_work);
 	atomic_set(&path->tx_inflight, 0);
 	path->local_transmit_path = -1;
 	path->local_tx_hop = -1;
@@ -495,6 +606,9 @@ void tbv_path_reset(struct tbv_path *path)
 	INIT_LIST_HEAD(&path->tx_control_queue);
 	INIT_LIST_HEAD(&path->tx_data_queue);
 	INIT_LIST_HEAD(&path->tx_zcopy_inflight);
+	INIT_DELAYED_WORK(&path->tx_poll_work, tbv_path_tx_poll_work);
+	INIT_DELAYED_WORK(&path->rx_supp_poll_work,
+			  tbv_path_rx_supp_poll_work);
 	atomic_set(&path->tx_inflight, 0);
 	path->local_transmit_path = -1;
 	path->local_tx_hop = -1;
@@ -527,14 +641,25 @@ static void tbv_path_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	list_add_tail(&f->free_node, &path->tx_free);
 	spin_unlock_irqrestore(&path->tx_lock, flags);
 
-	if (state) {
-		if (canceled)
-			atomic64_inc(&state->data_tx_canceled);
-		else
-			atomic64_inc(&state->data_tx_completed);
-	}
-	if (packet && !packet->control && !canceled)
-		atomic64_inc(&path->data_tx_completed);
+		if (state) {
+			if (canceled)
+				atomic64_inc(&state->data_tx_canceled);
+			else
+				atomic64_inc(&state->data_tx_completed);
+		}
+		if (packet && !canceled) {
+			if (packet->control) {
+				u64 age_ms = packet->queued_jiffies ?
+					jiffies_to_msecs(jiffies -
+							 packet->queued_jiffies) : 0;
+
+				atomic64_inc(&path->control_tx_completed);
+				tbv_path_atomic64_max_ms(
+					&path->control_tx_queue_max_ms, age_ms);
+			} else {
+				atomic64_inc(&path->data_tx_completed);
+			}
+		}
 	if (packet) {
 		tbv_path_finish_raw_stream_if_needed(path, packet);
 		tbv_path_tx_packet_release(packet,
@@ -545,13 +670,66 @@ static void tbv_path_tx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	tbv_path_schedule_tx(path);
 }
 
+static void tbv_path_tx_poll_work(struct work_struct *work)
+{
+	struct tbv_path *path = container_of(to_delayed_work(work),
+					     struct tbv_path, tx_poll_work);
+	struct tb_ring *ring = READ_ONCE(path->tx_ring);
+	struct ring_frame *frame;
+	u64 completed = 0;
+
+	if (!ring)
+		return;
+
+	atomic64_inc(&path->tx_poll_calls);
+	while ((frame = tb_ring_poll(ring))) {
+		if (frame->callback)
+			frame->callback(ring, frame, false);
+		completed++;
+	}
+	if (completed)
+		atomic64_add(completed, &path->tx_poll_completed);
+
+	if (atomic_read(&path->tx_inflight) > 0 || completed)
+		tbv_path_queue_tx_poll(path,
+				       msecs_to_jiffies(TBV_TX_POLL_DELAY_MS));
+}
+
+static void tbv_path_rx_supp_poll_work(struct work_struct *work)
+{
+	struct tbv_path *path = container_of(to_delayed_work(work),
+					     struct tbv_path,
+					     rx_supp_poll_work);
+	struct tb_ring *ring = READ_ONCE(path->rx_ring);
+	struct ring_frame *frame;
+	u64 completed = 0;
+
+	if (!ring)
+		return;
+
+	atomic64_inc(&path->rx_supp_poll_calls);
+	while ((frame = tb_ring_poll(ring))) {
+		if (frame->callback)
+			frame->callback(ring, frame, false);
+		completed++;
+	}
+	if (completed)
+		atomic64_add(completed, &path->rx_supp_poll_completed);
+
+	if (completed || time_before(jiffies,
+				     READ_ONCE(path->rx_supp_poll_until)))
+		tbv_path_queue_delayed_work(
+			path, &path->rx_supp_poll_work,
+			msecs_to_jiffies(TBV_RX_SUPP_POLL_DELAY_MS));
+}
+
 static int tbv_path_post_rx_frame(struct tbv_data_frame *f);
 
 static void tbv_path_rx_start_raw(struct tbv_path *path,
 				  const struct tbv_native_data_header *hdr)
 {
 	path->rx_raw_opcode = hdr->opcode;
-	path->rx_raw_flags = hdr->flags & ~TBV_NATIVE_DATA_F_RAW_STREAM;
+	path->rx_raw_flags = hdr->flags;
 	path->rx_raw_dest_qp = hdr->dest_qp;
 	path->rx_raw_src_qp = hdr->src_qp;
 	path->rx_raw_psn = hdr->psn;
@@ -567,7 +745,9 @@ static void tbv_path_rx_raw_payload(struct tbv_path *path,
 				    struct tbv_state *state,
 				    const void *payload, u32 len)
 {
+	struct tbv_native_data_header stream = {};
 	struct tbv_native_data_header hdr = {};
+	int ret;
 
 	if (!path->rx_raw_pending || !len || len > path->rx_raw_remaining) {
 		if (state)
@@ -577,23 +757,29 @@ static void tbv_path_rx_raw_payload(struct tbv_path *path,
 		return;
 	}
 
-	hdr.opcode = path->rx_raw_opcode;
-	hdr.flags = path->rx_raw_flags &
-		    ~(TBV_NATIVE_DATA_F_LAST | TBV_NATIVE_DATA_F_SOLICITED);
-	if (len == path->rx_raw_remaining) {
-		path->rx_raw_pending = false;
-		hdr.flags |= path->rx_raw_flags &
-			     (TBV_NATIVE_DATA_F_LAST |
-			      TBV_NATIVE_DATA_F_SOLICITED);
-	}
-	hdr.dest_qp = path->rx_raw_dest_qp;
-	hdr.src_qp = path->rx_raw_src_qp;
-	hdr.psn = path->rx_raw_psn;
-	hdr.length = len;
-	hdr.imm_data = path->rx_raw_imm_data;
-	hdr.remote_addr = path->rx_raw_base + path->rx_raw_done;
-	hdr.rkey = path->rx_raw_rkey;
+	stream.opcode = path->rx_raw_opcode;
+	stream.flags = path->rx_raw_flags;
+	stream.dest_qp = path->rx_raw_dest_qp;
+	stream.src_qp = path->rx_raw_src_qp;
+	stream.psn = path->rx_raw_psn;
+	stream.length = path->rx_raw_done + path->rx_raw_remaining;
+	stream.imm_data = path->rx_raw_imm_data;
+	stream.remote_addr = path->rx_raw_base;
+	stream.rkey = path->rx_raw_rkey;
 
+	ret = tbv_native_data_raw_payload_header(&stream, path->rx_raw_done,
+						 path->rx_raw_remaining, len,
+						 &hdr);
+	if (ret) {
+		if (state)
+			atomic64_inc(&state->data_rx_bad_frame);
+		path->rx_raw_pending = false;
+		path->rx_raw_remaining = 0;
+		return;
+	}
+
+	if (len == path->rx_raw_remaining)
+		path->rx_raw_pending = false;
 	path->rx_raw_done += len;
 	path->rx_raw_remaining -= len;
 	if (state)
@@ -987,6 +1173,8 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 	if (path->cfg.e2e)
 		e2e_tx_hop = path->tx_ring->hop;
 
+	path->tx_poll_enabled = tbv_path_native_progress_enabled(path);
+	path->rx_supp_poll_enabled = path->tx_poll_enabled;
 	path->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, rx_hop,
 					 path->cfg.rx_ring_size,
 					 path->cfg.rx_flags, e2e_tx_hop,
@@ -1174,6 +1362,8 @@ static struct tbv_tx_packet *tbv_path_alloc_pooled_data_packet(
 	packet->unmap_dma = false;
 	packet->raw_stream_start = false;
 	packet->raw_stream_end = false;
+	packet->raw_stream_counted = false;
+	packet->start_credit_group_frames = 0;
 	return packet;
 }
 
@@ -1200,11 +1390,13 @@ tbv_path_alloc_zcopy_packet(struct tbv_path *path, dma_addr_t dma, u32 len,
 	packet->eof = TBV_DATA_PDF_FRAME_END;
 	packet->zcopy = true;
 	packet->unmap_dma = unmap_dma;
+	packet->raw_stream_counted = false;
 	return packet;
 }
 
 static int tbv_path_enqueue_control(struct tbv_path *path, const void *data,
-				    u32 len)
+				    u32 len, tbv_path_tx_done_fn done,
+				    void *done_ctx)
 {
 	struct tbv_tx_packet *packet;
 	unsigned long flags;
@@ -1241,16 +1433,18 @@ static int tbv_path_enqueue_control(struct tbv_path *path, const void *data,
 	}
 
 	packet->len = len;
-	packet->done = NULL;
-	packet->done_ctx = NULL;
-	packet->owner_ctx = NULL;
+	packet->done = done;
+	packet->done_ctx = done_ctx;
+	packet->owner_ctx = done_ctx;
 	packet->sof = TBV_DATA_PDF_FRAME_START;
 	packet->eof = TBV_DATA_PDF_FRAME_END;
 	packet->pooled = pooled;
+	packet->queued_jiffies = jiffies;
 	packet->queued = true;
 	memcpy(packet->buf, data, len);
 	list_add_tail(&packet->node, &path->tx_control_queue);
 	path->tx_control_queued++;
+	atomic64_inc(&path->control_tx_enqueued);
 	spin_unlock_irqrestore(&path->tx_lock, flags);
 
 	tbv_path_schedule_tx(path);
@@ -1275,6 +1469,7 @@ static int tbv_path_enqueue_data(struct tbv_path *path,
 		return -ENOMEM;
 	}
 
+	packet->start_credit_group_frames = 1;
 	packet->queued = true;
 	list_add_tail(&packet->node, &path->tx_data_queue);
 	path->tx_data_queued++;
@@ -1292,6 +1487,7 @@ static int tbv_path_enqueue_data_list(struct tbv_path *path,
 {
 	struct tbv_tx_packet *packet;
 	unsigned long flags;
+	bool first = true;
 	u32 used;
 
 	if (!count)
@@ -1311,9 +1507,11 @@ static int tbv_path_enqueue_data_list(struct tbv_path *path,
 	}
 
 	list_for_each_entry(packet, packets, node) {
+		packet->start_credit_group_frames = first ? count : 0;
 		packet->queued = true;
 		path->tx_data_queued++;
 		atomic64_inc(&path->data_tx_enqueued);
+		first = false;
 	}
 	list_splice_tail_init(packets, &path->tx_data_queue);
 	spin_unlock_irqrestore(&path->tx_lock, flags);
@@ -1329,6 +1527,7 @@ static int tbv_path_enqueue_reserved_data_list(struct tbv_path *path,
 {
 	struct tbv_tx_packet *packet;
 	unsigned long flags;
+	bool first = true;
 
 	if (!count)
 		return 0;
@@ -1345,9 +1544,11 @@ static int tbv_path_enqueue_reserved_data_list(struct tbv_path *path,
 
 	path->tx_data_reserved -= count;
 	list_for_each_entry(packet, packets, node) {
+		packet->start_credit_group_frames = first ? count : 0;
 		packet->queued = true;
 		path->tx_data_queued++;
 		atomic64_inc(&path->data_tx_enqueued);
+		first = false;
 	}
 	list_splice_tail_init(packets, &path->tx_data_queue);
 	spin_unlock_irqrestore(&path->tx_lock, flags);
@@ -1416,9 +1617,12 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		struct tbv_data_frame *f;
 		bool needs_staging;
 		bool old_raw_stream_active;
+		bool old_raw_stream_end_seen;
 		void *old_raw_stream_owner;
+		u32 old_raw_stream_inflight;
 		bool charged_data_credit;
 		bool from_control_queue;
+		u32 old_start_credit_group_frames;
 		int ret;
 
 		spin_lock_irqsave(&path->tx_lock, flags);
@@ -1463,15 +1667,42 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 			needs_staging = !packet->zcopy;
 		}
 
-		if (needs_staging && list_empty(&path->tx_free)) {
+		if (!from_control_queue &&
+		    atomic_read(&path->tx_inflight) >=
+			    TBV_DATA_TX_MAX_INFLIGHT) {
 			path->tx_scheduling = false;
 			spin_unlock_irqrestore(&path->tx_lock, flags);
 			return;
 		}
 
+		if (needs_staging && list_empty(&path->tx_free)) {
+			path->tx_scheduling = false;
+			spin_unlock_irqrestore(&path->tx_lock, flags);
+			return;
+		}
+		if (needs_staging && !from_control_queue) {
+			u32 reserve = tbv_path_tx_control_frame_reserve(path);
+			u32 inflight = atomic_read(&path->tx_inflight);
+			u32 available = path->tx_frame_count > inflight ?
+					path->tx_frame_count - inflight : 0;
+
+			if (available <= reserve) {
+				path->tx_scheduling = false;
+				spin_unlock_irqrestore(&path->tx_lock, flags);
+				return;
+			}
+		}
+
 		charged_data_credit = false;
+		old_start_credit_group_frames = packet->start_credit_group_frames;
 		if (!packet->control && path->tx_remote_data_credit_max) {
-			if (!path->tx_remote_data_credits) {
+			u32 start_credit_required =
+				tbv_native_data_start_credit_required(
+					packet->start_credit_group_frames,
+					path->tx_remote_data_credit_max);
+
+			if (path->tx_remote_data_credits <
+			    max_t(u32, 1, start_credit_required)) {
 				if (state)
 					atomic64_inc(&state->data_tx_credit_stalls);
 				atomic64_inc(&path->data_tx_credit_stalls);
@@ -1482,6 +1713,7 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 			path->tx_remote_data_credits--;
 			charged_data_credit = true;
 		}
+		packet->start_credit_group_frames = 0;
 
 		if (from_control_queue)
 			path->tx_control_queued--;
@@ -1491,10 +1723,9 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		packet->queued = false;
 		old_raw_stream_active = path->tx_raw_stream_active;
 		old_raw_stream_owner = path->tx_raw_stream_owner;
-		if (packet->raw_stream_start) {
-			path->tx_raw_stream_active = true;
-			path->tx_raw_stream_owner = packet->owner_ctx;
-		}
+		old_raw_stream_end_seen = path->tx_raw_stream_end_seen;
+		old_raw_stream_inflight = path->tx_raw_stream_inflight;
+		tbv_path_count_raw_stream_locked(path, packet);
 
 		if (needs_staging) {
 			f = list_first_entry(&path->tx_free,
@@ -1525,6 +1756,11 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 				if (state)
 					atomic64_inc(&state->data_tx_posted);
 				atomic64_inc(&path->data_tx_posted);
+				tbv_path_queue_tx_poll(path, 0);
+				tbv_path_queue_rx_supp_poll(
+					path,
+					msecs_to_jiffies(
+						TBV_RX_SUPP_POLL_DELAY_MS));
 				continue;
 			}
 
@@ -1537,6 +1773,9 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 			}
 			path->tx_raw_stream_active = old_raw_stream_active;
 			path->tx_raw_stream_owner = old_raw_stream_owner;
+			path->tx_raw_stream_end_seen = old_raw_stream_end_seen;
+			path->tx_raw_stream_inflight = old_raw_stream_inflight;
+			packet->raw_stream_counted = false;
 			if (charged_data_credit) {
 				if (path->tx_remote_data_credits <
 				    path->tx_remote_data_credit_max)
@@ -1548,6 +1787,8 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 				list_add(&packet->node, &path->tx_data_queue);
 				path->tx_data_queued++;
 				packet->queued = true;
+				packet->start_credit_group_frames =
+					old_start_credit_group_frames;
 				path->tx_scheduling = false;
 				spin_unlock_irqrestore(&path->tx_lock, flags);
 				atomic_dec(&path->tx_inflight);
@@ -1581,44 +1822,53 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		if (!ret) {
 			if (state)
 				atomic64_inc(&state->data_tx_posted);
-			if (!packet->control)
+			if (packet->control)
+				atomic64_inc(&path->control_tx_posted);
+			else
 				atomic64_inc(&path->data_tx_posted);
+			tbv_path_queue_tx_poll(path, 0);
+			tbv_path_queue_rx_supp_poll(
+				path,
+				msecs_to_jiffies(TBV_RX_SUPP_POLL_DELAY_MS));
 			continue;
 		}
 
-			if (state)
-				atomic64_inc(&state->data_tx_errors);
-			f->packet = NULL;
-			f->done = NULL;
-			f->done_ctx = NULL;
-			f->frame.callback = NULL;
-			spin_lock_irqsave(&path->tx_lock, flags);
-			list_add_tail(&f->free_node, &path->tx_free);
-			path->tx_raw_stream_active = old_raw_stream_active;
-			path->tx_raw_stream_owner = old_raw_stream_owner;
-			if (charged_data_credit) {
-				if (path->tx_remote_data_credits <
-				    path->tx_remote_data_credit_max)
-					path->tx_remote_data_credits++;
+		if (state)
+			atomic64_inc(&state->data_tx_errors);
+		f->packet = NULL;
+		f->done = NULL;
+		f->done_ctx = NULL;
+		f->frame.callback = NULL;
+		spin_lock_irqsave(&path->tx_lock, flags);
+		list_add_tail(&f->free_node, &path->tx_free);
+		path->tx_raw_stream_active = old_raw_stream_active;
+		path->tx_raw_stream_owner = old_raw_stream_owner;
+		path->tx_raw_stream_end_seen = old_raw_stream_end_seen;
+		path->tx_raw_stream_inflight = old_raw_stream_inflight;
+		packet->raw_stream_counted = false;
+		if (charged_data_credit) {
+			if (path->tx_remote_data_credits <
+			    path->tx_remote_data_credit_max)
+				path->tx_remote_data_credits++;
+		}
+		if (ret == -ENOMEM &&
+		    path->state == TBV_PATH_TUNNEL_ENABLED &&
+		    (packet->control || packet->done || packet->owner_ctx)) {
+			if (packet->control) {
+				list_add(&packet->node, &path->tx_control_queue);
+				path->tx_control_queued++;
+			} else {
+				list_add(&packet->node, &path->tx_data_queue);
+				path->tx_data_queued++;
+				packet->start_credit_group_frames =
+					old_start_credit_group_frames;
 			}
-			if (ret == -ENOMEM &&
-			    path->state == TBV_PATH_TUNNEL_ENABLED &&
-			    (packet->control || packet->done || packet->owner_ctx)) {
-				if (packet->control) {
-					list_add(&packet->node,
-						 &path->tx_control_queue);
-					path->tx_control_queued++;
-				} else {
-					list_add(&packet->node,
-						 &path->tx_data_queue);
-					path->tx_data_queued++;
-				}
-				packet->queued = true;
-				path->tx_scheduling = false;
-				spin_unlock_irqrestore(&path->tx_lock, flags);
-				atomic_dec(&path->tx_inflight);
-				return;
-			}
+			packet->queued = true;
+			path->tx_scheduling = false;
+			spin_unlock_irqrestore(&path->tx_lock, flags);
+			atomic_dec(&path->tx_inflight);
+			return;
+		}
 		spin_unlock_irqrestore(&path->tx_lock, flags);
 		atomic_dec(&path->tx_inflight);
 		tbv_path_tx_packet_release(packet, ret);
@@ -1649,7 +1899,7 @@ int tbv_path_send(struct tbv_path *path, const void *data, u32 len,
 	if (send_flags & TBV_PATH_SEND_CONTROL) {
 		if (send_flags & TBV_PATH_SEND_DEFER)
 			return -EINVAL;
-		return tbv_path_enqueue_control(path, data, len);
+		return tbv_path_enqueue_control(path, data, len, done, done_ctx);
 	}
 
 	packet = tbv_path_alloc_data_packet(path, data, len, done, done_ctx);
@@ -1791,6 +2041,12 @@ static void tbv_path_release_packet_list_silent(struct list_head *packets,
 	}
 }
 
+void tbv_path_release_prepared_list_silent(struct list_head *packets,
+					   int status)
+{
+	tbv_path_release_packet_list_silent(packets, status);
+}
+
 struct tbv_path_cancel_done {
 	tbv_path_tx_done_fn done;
 	void *ctx;
@@ -1826,20 +2082,23 @@ static void tbv_path_release_owned_frame_list(struct list_head *frames)
 	}
 }
 
-int tbv_path_send_owned_list_reserved(struct tbv_path *path,
-				      struct list_head *frames,
-				      unsigned int send_flags,
-				      tbv_path_tx_done_fn done,
-				      void *done_ctx)
+int tbv_path_prepare_owned_list(struct tbv_path *path,
+				struct list_head *frames,
+				struct list_head *packets,
+				u32 *packet_count_out,
+				unsigned int send_flags,
+				tbv_path_tx_done_fn done,
+				void *done_ctx)
 {
 	struct tbv_path_owned_frame *owned;
 	struct tbv_tx_packet *packet;
-	LIST_HEAD(packets);
+	LIST_HEAD(prepared);
 	u32 packet_count = 0;
 	int ret;
 
-	if (!path || !frames)
+	if (!path || !frames || !packets || !packet_count_out)
 		return -EINVAL;
+	*packet_count_out = 0;
 	if (send_flags & ~(TBV_PATH_SEND_DEFER)) {
 		tbv_path_release_owned_frame_list(frames);
 		return -EINVAL;
@@ -1870,21 +2129,60 @@ int tbv_path_send_owned_list_reserved(struct tbv_path *path,
 		owned->data = NULL;
 		packet->sof = owned->sof;
 		packet->eof = owned->eof;
-		list_add_tail(&packet->node, &packets);
+		list_add_tail(&packet->node, &prepared);
 		packet_count++;
 		kfree(owned);
 	}
 
-	ret = tbv_path_enqueue_reserved_data_list(
-		path, &packets, packet_count, send_flags & TBV_PATH_SEND_DEFER);
-	if (ret)
-		goto err_release;
+	list_splice_tail_init(&prepared, packets);
+	*packet_count_out = packet_count;
 	return 0;
 
 err_release:
-	tbv_path_release_packet_list_silent(&packets, ret);
+	tbv_path_release_packet_list_silent(&prepared, ret);
 	tbv_path_release_owned_frame_list(frames);
 	return ret;
+}
+
+int tbv_path_enqueue_prepared_reserved(struct tbv_path *path,
+				       struct list_head *packets,
+				       u32 packet_count,
+				       unsigned int send_flags)
+{
+	int ret;
+
+	if (!path || !packets)
+		return -EINVAL;
+	if (send_flags & ~(TBV_PATH_SEND_DEFER)) {
+		tbv_path_release_packet_list_silent(packets, -EINVAL);
+		return -EINVAL;
+	}
+
+	ret = tbv_path_enqueue_reserved_data_list(
+		path, packets, packet_count, send_flags & TBV_PATH_SEND_DEFER);
+	if (ret)
+		tbv_path_release_packet_list_silent(packets, ret);
+	return ret;
+}
+
+int tbv_path_send_owned_list_reserved(struct tbv_path *path,
+				      struct list_head *frames,
+				      unsigned int send_flags,
+				      tbv_path_tx_done_fn done,
+				      void *done_ctx)
+{
+	LIST_HEAD(packets);
+	u32 packet_count;
+	int ret;
+
+	ret = tbv_path_prepare_owned_list(path, frames, &packets,
+					  &packet_count, send_flags, done,
+					  done_ctx);
+	if (ret)
+		return ret;
+
+	return tbv_path_enqueue_prepared_reserved(path, &packets,
+						  packet_count, send_flags);
 }
 
 int tbv_path_send_page_stream(struct tbv_path *path,
@@ -2016,6 +2314,8 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 	return 0;
 
 err_release:
+	if (!packet_count && meta_done)
+		meta_done(meta_done_ctx, ret);
 	tbv_path_release_packet_list(&packets, ret);
 	return ret;
 
@@ -2062,6 +2362,8 @@ static void tbv_path_cancel_data_match(struct tbv_path *path,
 	    path->tx_raw_stream_owner == owner_ctx) {
 		path->tx_raw_stream_active = false;
 		path->tx_raw_stream_owner = NULL;
+		path->tx_raw_stream_end_seen = false;
+		path->tx_raw_stream_inflight = 0;
 		raw_stream_canceled = true;
 	}
 	list_for_each_entry_safe(packet, tmp, &path->tx_data_queue, node) {
@@ -2140,6 +2442,10 @@ static void tbv_path_flush_tx_queue(struct tbv_path *path, int status)
 	path->tx_data_queued = 0;
 	path->tx_data_reserved = 0;
 	path->tx_scheduling = false;
+	path->tx_raw_stream_active = false;
+	path->tx_raw_stream_owner = NULL;
+	path->tx_raw_stream_end_seen = false;
+	path->tx_raw_stream_inflight = 0;
 	spin_unlock_irqrestore(&path->tx_lock, flags);
 
 	while (!list_empty(&control)) {
@@ -2172,6 +2478,8 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 			tb_ring_stop(path->tx_ring);
 		path->state = TBV_PATH_RING_ALLOCATED;
 	}
+	cancel_delayed_work_sync(&path->tx_poll_work);
+	cancel_delayed_work_sync(&path->rx_supp_poll_work);
 
 	if (tunnel_enabled) {
 		tb_xdomain_disable_paths(xd, path->local_transmit_path,
