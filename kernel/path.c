@@ -241,10 +241,13 @@ static void tbv_path_schedule_tx(struct tbv_path *path);
 static void tbv_path_tx_poll_work(struct work_struct *work);
 static void tbv_path_rx_supp_poll_work(struct work_struct *work);
 
-static bool tbv_path_native_progress_enabled(const struct tbv_path *path)
+static bool tbv_path_progress_poll_enabled(const struct tbv_path *path)
 {
-	return path->rail && path->rail->peer &&
-	       path->rail->peer->backend == TBV_BACKEND_NATIVE;
+	if (!path->rail || !path->rail->peer)
+		return false;
+
+	return path->rail->peer->backend == TBV_BACKEND_NATIVE ||
+	       path->rail->peer->backend == TBV_BACKEND_APPLE;
 }
 
 static void tbv_path_queue_delayed_work(struct tbv_path *path,
@@ -1173,7 +1176,7 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 	if (path->cfg.e2e)
 		e2e_tx_hop = path->tx_ring->hop;
 
-	path->tx_poll_enabled = tbv_path_native_progress_enabled(path);
+	path->tx_poll_enabled = tbv_path_progress_poll_enabled(path);
 	path->rx_supp_poll_enabled = path->tx_poll_enabled;
 	path->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, rx_hop,
 					 path->cfg.rx_ring_size,

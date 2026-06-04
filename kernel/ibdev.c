@@ -2597,6 +2597,9 @@ static int tbv_modify_qp(struct ib_qp *qp, struct ib_qp_attr *attr,
 		goto out_unlock;
 	}
 	if (!ib_modify_qp_is_ok(cur_state, next_state, tqp->type, attr_mask)) {
+		pr_warn_ratelimited("modify_qp invalid transition qpn=%u backend=%u type=%u cur=%u next=%u mask=0x%x\n",
+				    qp->qp_num, tqp->backend, tqp->type,
+				    cur_state, next_state, attr_mask);
 		ret = -EINVAL;
 		goto out_unlock;
 	}

@@ -86,6 +86,72 @@ static void debug_step(const char *step)
 	}
 }
 
+static void print_gid(FILE *f, const union ibv_gid *gid)
+{
+	for (int i = 0; i < 16; i += 2)
+		fprintf(f, "%02x%02x%s", gid->raw[i], gid->raw[i + 1],
+			i == 14 ? "" : ":");
+}
+
+static int gid_is_zero(const union ibv_gid *gid)
+{
+	static const union ibv_gid zero;
+
+	return !memcmp(gid, &zero, sizeof(*gid));
+}
+
+static int gid_is_ipv4_mapped(const union ibv_gid *gid)
+{
+	static const uint8_t prefix[12] = {
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff,
+	};
+
+	return !memcmp(gid->raw, prefix, sizeof(prefix));
+}
+
+static int select_gid(struct ibv_context *ctx, int port, int requested_index,
+		      int gid_tbl_len, union ibv_gid *gid, int *selected_index)
+{
+	if (requested_index >= 0) {
+		if (requested_index >= gid_tbl_len) {
+			fprintf(stderr, "gid index %d exceeds gid table length %d\n",
+				requested_index, gid_tbl_len);
+			return -1;
+		}
+		memset(gid, 0, sizeof(*gid));
+		if (ibv_query_gid(ctx, port, requested_index, gid)) {
+			perror("ibv_query_gid");
+			return -1;
+		}
+		if (gid_is_zero(gid)) {
+			fprintf(stderr, "gid index %d is empty\n",
+				requested_index);
+			return -1;
+		}
+		*selected_index = requested_index;
+		return 0;
+	}
+
+	for (int i = 0; i < gid_tbl_len; i++) {
+		memset(gid, 0, sizeof(*gid));
+		if (ibv_query_gid(ctx, port, i, gid) || !gid_is_ipv4_mapped(gid))
+			continue;
+		*selected_index = i;
+		return 0;
+	}
+
+	for (int i = 0; i < gid_tbl_len; i++) {
+		memset(gid, 0, sizeof(*gid));
+		if (ibv_query_gid(ctx, port, i, gid) || gid_is_zero(gid))
+			continue;
+		*selected_index = i;
+		return 0;
+	}
+
+	fprintf(stderr, "no non-zero GID found on port %d\n", port);
+	return -1;
+}
+
 static size_t align_up(size_t v, size_t a)
 {
 	return (v + a - 1) & ~(a - 1);
@@ -94,7 +160,7 @@ static size_t align_up(size_t v, size_t a)
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"usage: %s --role recv|send|bidi --dev DEV --gid-index N --port P\n"
+		"usage: %s --role recv|send|bidi --dev DEV [--gid-index N|auto] --port P\n"
 		"          [--connect HOST] [--size BYTES] [--count N]\n"
 		"          [--depth N] [--recv-posts N] [--mtu 256|512|1024|2048|4096]\n"
 		"          [--recv-post-delay-ms N]\n"
@@ -114,6 +180,15 @@ static int parse_int(const char *s, int *out)
 		return -1;
 	*out = (int)v;
 	return 0;
+}
+
+static int parse_gid_index(const char *s, int *out)
+{
+	if (!strcmp(s, "auto")) {
+		*out = -1;
+		return 0;
+	}
+	return parse_int(s, out);
 }
 
 static int parse_size(const char *s, size_t *out)
@@ -164,7 +239,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 {
 	memset(o, 0, sizeof(*o));
 	o->port = 18515;
-	o->gid_index = 1;
+	o->gid_index = -1;
 	o->ib_port = 1;
 	o->depth = 64;
 	o->count = 1000;
@@ -184,7 +259,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 			if (parse_int(argv[++i], &o->port))
 				return -1;
 		} else if (!strcmp(argv[i], "--gid-index") && i + 1 < argc) {
-			if (parse_int(argv[++i], &o->gid_index))
+			if (parse_gid_index(argv[++i], &o->gid_index))
 				return -1;
 		} else if (!strcmp(argv[i], "--ib-port") && i + 1 < argc) {
 			if (parse_int(argv[++i], &o->ib_port))
@@ -221,7 +296,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	}
 
 	if (!o->role || !o->dev || o->port <= 0 || o->port > 65535 ||
-	    o->gid_index < 0 || o->ib_port <= 0 || o->depth <= 0 ||
+	    o->gid_index < -1 || o->ib_port <= 0 || o->depth <= 0 ||
 	    o->depth > 4095 || o->recv_posts < 0 ||
 	    o->recv_posts > 4095 || o->count <= 0)
 		return -1;
@@ -376,29 +451,40 @@ static int exchange_info(int fd, const struct peer_info *local,
 	return 0;
 }
 
-static int qp_to_rts(struct ibv_qp *qp, int port, int sgid_index,
-		     const union ibv_gid *dgid, uint32_t dlid,
-		     uint32_t dest_qpn, uint32_t local_psn,
-		     uint32_t remote_psn, enum ibv_mtu path_mtu)
+static int qp_to_init(struct ibv_qp *qp, int port)
 {
 	struct ibv_qp_attr a;
+	int tn3205 = getenv("UC_ONEWAY_TN3205") != NULL;
 	int ret;
 
 	memset(&a, 0, sizeof(a));
 	a.qp_state = IBV_QPS_INIT;
 	a.pkey_index = 0;
 	a.port_num = (uint8_t)port;
-	a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE |
-			    IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+	a.qp_access_flags = tn3205 ? 0 :
+			    (IBV_ACCESS_LOCAL_WRITE |
+			     IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
 	errno = 0;
 	ret = ibv_modify_qp(qp, &a, IBV_QP_STATE | IBV_QP_PKEY_INDEX |
 			    IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
-	fprintf(stderr, "modify INIT ret=%d errno=%d\n", ret, errno);
+	fprintf(stderr, "modify INIT ret=%d errno=%d access_flags=0x%x\n",
+		ret, errno, a.qp_access_flags);
 	fflush(stderr);
 	if (ret) {
 		perror("modify INIT");
 		return ret;
 	}
+	return 0;
+}
+
+static int qp_to_rts(struct ibv_qp *qp, int port, int sgid_index,
+		     const union ibv_gid *dgid, uint32_t dlid,
+		     uint32_t dest_qpn, uint32_t local_psn,
+		     uint32_t remote_psn, enum ibv_mtu path_mtu)
+{
+	struct ibv_qp_attr a;
+	int tn3205 = getenv("UC_ONEWAY_TN3205") != NULL;
+	int ret;
 
 	memset(&a, 0, sizeof(a));
 	a.qp_state = IBV_QPS_RTR;
@@ -411,8 +497,8 @@ static int qp_to_rts(struct ibv_qp *qp, int port, int sgid_index,
 	a.ah_attr.port_num = (uint8_t)port;
 	/* Match JACCL: only enable global routing when the dgid has a non-zero
 	 * interface_id (i.e. it's a real GID, not the zero default). */
-	a.ah_attr.is_global = 0;
-	if (dgid->global.interface_id) {
+	a.ah_attr.is_global = tn3205 ? 1 : 0;
+	if (tn3205 || dgid->global.interface_id) {
 		a.ah_attr.is_global = 1;
 		a.ah_attr.grh.dgid = *dgid;
 		a.ah_attr.grh.sgid_index = sgid_index;
@@ -423,8 +509,8 @@ static int qp_to_rts(struct ibv_qp *qp, int port, int sgid_index,
 			    IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
 			    IBV_QP_RQ_PSN);
 	fprintf(stderr,
-		"modify RTR ret=%d errno=%d dest_qpn=%u sgid_index=%d dlid=%u\n",
-		ret, errno, dest_qpn, sgid_index, dlid);
+		"modify RTR ret=%d errno=%d dest_qpn=%u sgid_index=%d dlid=%u is_global=%d\n",
+		ret, errno, dest_qpn, sgid_index, dlid, a.ah_attr.is_global);
 	fflush(stderr);
 	if (ret) {
 		perror("modify RTR");
@@ -583,6 +669,7 @@ int main(int argc, char **argv)
 	int last_done = 0;
 	int initial_recvs = 0;
 	int wr_depth;
+	int sgid_index;
 
 	if (parse_opts(argc, argv, &o)) {
 		usage(argv[0]);
@@ -614,10 +701,12 @@ int main(int argc, char **argv)
 		goto out_ctx;
 	}
 	debug_step("query gid");
-	if (ibv_query_gid(ctx, o.ib_port, o.gid_index, &local_gid)) {
-		perror("ibv_query_gid");
+	if (select_gid(ctx, o.ib_port, o.gid_index, port_attr.gid_tbl_len,
+		       &local_gid, &sgid_index))
 		goto out_ctx;
-	}
+	fprintf(stderr, "selected sgid_index=%d local_gid=", sgid_index);
+	print_gid(stderr, &local_gid);
+	fprintf(stderr, "\n");
 
 	debug_step("alloc pd");
 	pd = ibv_alloc_pd(ctx);
@@ -648,8 +737,13 @@ int main(int argc, char **argv)
 	send_buf = buf;
 	recv_buf = is_bidi ? buf + send_region_size : buf;
 	debug_step("register mr");
-	mr = ibv_reg_mr(pd, buf, bufsz, IBV_ACCESS_LOCAL_WRITE |
-				IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
+	int mr_access = getenv("UC_ONEWAY_TN3205") ?
+			IBV_ACCESS_LOCAL_WRITE :
+			(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+			 IBV_ACCESS_REMOTE_WRITE);
+	fprintf(stderr, "register mr len=%zu access=0x%x\n", bufsz,
+		mr_access);
+	mr = ibv_reg_mr(pd, buf, bufsz, mr_access);
 	if (!mr) {
 		perror("ibv_reg_mr");
 		goto out_buf;
@@ -682,6 +776,9 @@ int main(int argc, char **argv)
 		qp->qp_num, qpia.cap.max_send_wr, qpia.cap.max_recv_wr,
 		qpia.cap.max_send_sge, qpia.cap.max_recv_sge);
 	fflush(stderr);
+	debug_step("modify init");
+	if (qp_to_init(qp, o.ib_port))
+		goto out_qp;
 
 	/* Match JACCL's fixed initial PSN to rule it out as a delivery factor. */
 	psn = 7;
@@ -731,10 +828,15 @@ int main(int argc, char **argv)
 	printf("%s local_qpn=%u remote_qpn=%u size=%zu count=%d depth=%d recv_posts=%d mtu=%d\n",
 	       o.role, local.qpn, remote.qpn, o.size, o.count, o.depth,
 	       initial_recvs, o.mtu);
+	fprintf(stderr, "local_gid=");
+	print_gid(stderr, &local_gid);
+	fprintf(stderr, " remote_gid=");
+	print_gid(stderr, &remote_gid);
+	fprintf(stderr, "\n");
 
-	fprintf(stderr, "transitioning QP to RTS\n");
+	fprintf(stderr, "transitioning QP to RTR/RTS\n");
 	fflush(stderr);
-	if (qp_to_rts(qp, o.ib_port, o.gid_index, &remote_gid, remote.lid,
+	if (qp_to_rts(qp, o.ib_port, sgid_index, &remote_gid, remote.lid,
 		      remote.qpn, local.psn, remote.psn, mtu_enum(o.mtu)))
 		goto out_qp;
 	fprintf(stderr, "QP is RTS\n");

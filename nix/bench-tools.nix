@@ -15,6 +15,7 @@ let
   # plain libibverbs verbs surface, no Linux-specific kernel uapi or
   # LD_PRELOAD-style entrypoints.
   darwinPrograms = [
+    "mac_tb_rdma_probe"
     "rc_write_poll"
     "rc_write_verify"
     "u4_pingpong"
@@ -22,10 +23,8 @@ let
     "uc_write_verify"
   ];
 
-  # Full Linux set. ibv_trace (LD_PRELOAD tracer, built as .so) and
-  # mac_tb_rdma_probe (Linux-side prober of Mac peers) are Linux-only.
+  # Full Linux set. ibv_trace is an LD_PRELOAD tracer built as .so.
   linuxPrograms = darwinPrograms ++ [
-    "mac_tb_rdma_probe"
     "rc_qpn_churn"
     "rdma_gid_probe"
   ];

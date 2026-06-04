@@ -53,6 +53,81 @@ static void print_gid(const union ibv_gid *gid)
 		       i == 14 ? "" : ":");
 }
 
+static int gid_is_zero(const union ibv_gid *gid)
+{
+	static const union ibv_gid zero;
+
+	return !memcmp(gid, &zero, sizeof(*gid));
+}
+
+static int gid_is_ipv4_mapped(const union ibv_gid *gid)
+{
+	static const uint8_t prefix[12] = {
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff,
+	};
+
+	return !memcmp(gid->raw, prefix, sizeof(prefix));
+}
+
+static int parse_gid_index(const char *value, int *index)
+{
+	char *end = NULL;
+	long parsed;
+
+	if (!value || !strcmp(value, "auto")) {
+		*index = -1;
+		return 0;
+	}
+
+	errno = 0;
+	parsed = strtol(value, &end, 0);
+	if (errno || !end || *end || parsed < 0 || parsed > INT_MAX)
+		return -1;
+	*index = (int)parsed;
+	return 0;
+}
+
+static int select_gid(struct ibv_context *ctx, int port, int requested_index,
+		      int gid_tbl_len, union ibv_gid *gid, int *selected_index)
+{
+	if (requested_index >= 0) {
+		if (requested_index >= gid_tbl_len) {
+			fprintf(stderr, "gid index %d exceeds gid table length %d\n",
+				requested_index, gid_tbl_len);
+			return -1;
+		}
+		memset(gid, 0, sizeof(*gid));
+		if (ibv_query_gid(ctx, port, requested_index, gid))
+			return -1;
+		if (gid_is_zero(gid)) {
+			fprintf(stderr, "gid index %d is empty\n",
+				requested_index);
+			return -1;
+		}
+		*selected_index = requested_index;
+		return 0;
+	}
+
+	for (int i = 0; i < gid_tbl_len; i++) {
+		memset(gid, 0, sizeof(*gid));
+		if (ibv_query_gid(ctx, port, i, gid) || !gid_is_ipv4_mapped(gid))
+			continue;
+		*selected_index = i;
+		return 0;
+	}
+
+	for (int i = 0; i < gid_tbl_len; i++) {
+		memset(gid, 0, sizeof(*gid));
+		if (ibv_query_gid(ctx, port, i, gid) || gid_is_zero(gid))
+			continue;
+		*selected_index = i;
+		return 0;
+	}
+
+	fprintf(stderr, "no non-zero GID found on port %d\n", port);
+	return -1;
+}
+
 static int parse_ipv4_gid(const char *ip, union ibv_gid *gid)
 {
 	struct in_addr addr;
@@ -74,22 +149,6 @@ static const char *status_text(int ret, int saved_errno)
 	return strerror(ret > 0 ? ret : saved_errno);
 }
 
-static int find_gid_index(struct ibv_context *ctx, int port,
-			  const union ibv_gid *wanted, int limit)
-{
-	for (int i = 0; i < limit; i++) {
-		union ibv_gid gid;
-
-		memset(&gid, 0, sizeof(gid));
-		if (ibv_query_gid(ctx, port, i, &gid))
-			continue;
-		if (!memcmp(&gid, wanted, sizeof(gid)))
-			return i;
-	}
-
-	return -1;
-}
-
 static void dump_gids(struct ibv_context *ctx, int port, int limit)
 {
 	for (int i = 0; i < limit; i++) {
@@ -98,7 +157,7 @@ static void dump_gids(struct ibv_context *ctx, int port, int limit)
 		memset(&gid, 0, sizeof(gid));
 		if (ibv_query_gid(ctx, port, i, &gid))
 			continue;
-		if (!memcmp(&gid, &(union ibv_gid){0}, sizeof(gid)))
+		if (gid_is_zero(&gid))
 			continue;
 
 		printf("gid[%d]=", i);
@@ -207,6 +266,7 @@ int main(int argc, char **argv)
 	int doc_shape = getenv("MAC_TB_RDMA_PROBE_DOC_SHAPE") != NULL;
 	int self_qpn = getenv("MAC_TB_RDMA_PROBE_SELF_QPN") != NULL;
 	int wait_all = getenv("MAC_TB_RDMA_PROBE_WAIT_ALL") != NULL;
+	int requested_gid_index = -1;
 	int alarm_sec = getenv("MAC_TB_RDMA_PROBE_ALARM_SEC") ?
 				atoi(getenv("MAC_TB_RDMA_PROBE_ALARM_SEC")) : 0;
 	int sleep_sec = getenv("MAC_TB_RDMA_PROBE_SLEEP_SEC") ?
@@ -266,6 +326,12 @@ int main(int argc, char **argv)
 	}
 	if (!iters)
 		iters = 1;
+	if (parse_gid_index(getenv("MAC_TB_RDMA_PROBE_GID_INDEX"),
+			    &requested_gid_index)) {
+		fprintf(stderr,
+			"invalid MAC_TB_RDMA_PROBE_GID_INDEX; use auto or a non-negative integer\n");
+		return 1;
+	}
 	if (send_len > UINT_MAX) {
 		fprintf(stderr, "send_len too large for one SGE: %zu\n",
 			send_len);
@@ -326,13 +392,12 @@ int main(int argc, char **argv)
 	       port_attr.active_mtu);
 	dump_gids(ctx, 1, port_attr.gid_tbl_len < 8 ? port_attr.gid_tbl_len : 8);
 
-	memset(&local_gid, 0, sizeof(local_gid));
-	ret = ibv_query_gid(ctx, 1, 1, &local_gid);
-	if (ret) {
-		fprintf(stderr, "ibv_query_gid index 1 failed: %d\n", ret);
+	if (select_gid(ctx, 1, requested_gid_index, port_attr.gid_tbl_len,
+		       &local_gid, &sgid_index)) {
+		ret = EINVAL;
 		goto out_close;
 	}
-	printf("using sgid[1]=");
+	printf("using sgid[%d]=", sgid_index);
 	print_gid(&local_gid);
 	printf("\n");
 
@@ -348,7 +413,6 @@ int main(int argc, char **argv)
 		remote_qpn = 2;
 	}
 
-	sgid_index = find_gid_index(ctx, 1, &local_gid, port_attr.gid_tbl_len);
 	printf("selected sgid_index=%d remote_qpn=%d remote_psn=%d dgid=",
 	       sgid_index, remote_qpn, remote_psn);
 	print_gid(&remote_gid);
