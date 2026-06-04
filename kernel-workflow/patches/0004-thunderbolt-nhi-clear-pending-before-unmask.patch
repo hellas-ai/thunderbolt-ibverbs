@@ -49,15 +49,12 @@ index 4fac166ed2ce..b1708d79d6b0 100644
  {
  	int bit;
  
-@@ -591,7 +598,7 @@ irqreturn_t ring_msix(int irq, void *data)
+@@ -591,5 +598,5 @@ irqreturn_t ring_msix(int irq, void *data)
  	struct tb_ring *ring = data;
  
  	spin_lock(&ring->nhi->lock);
 -	ring_clear_msix(ring);
 +	ring_clear_msix_pending(ring);
  	spin_lock(&ring->lock);
- 	ring->debug_msix_interrupts++;
- 	__ring_interrupt(ring);
 -- 
 2.53.0
-

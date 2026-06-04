@@ -1,0 +1,98 @@
+From f01dc4dca17cb21c36ab7f585019d4f9cc2a6a04 Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Tue, 28 Apr 2026 09:22:07 +0200
+Subject: [PATCH 19/21] thunderbolt: Add tb_ring_flush()
+
+This allows the caller to wait for the ring to be empty. We are going to
+need this in the upcoming userspace tunneling support.
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/thunderbolt/nhi.c   | 28 ++++++++++++++++++++++++++++
+ include/linux/thunderbolt.h |  3 +++
+ 2 files changed, 31 insertions(+)
+
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index 13009246e617..a0a789bfb680 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -325,6 +325,8 @@ static void ring_work(struct work_struct *work)
+ 		if (frame->callback)
+ 			frame->callback(ring, frame, canceled);
+ 	}
++
++	wake_up(&ring->wait);
+ }
+ 
+ int __tb_ring_enqueue(struct tb_ring *ring, struct ring_frame *frame)
+@@ -601,6 +603,7 @@ static struct tb_ring *tb_ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
+ 	INIT_LIST_HEAD(&ring->queue);
+ 	INIT_LIST_HEAD(&ring->in_flight);
+ 	INIT_WORK(&ring->work, ring_work);
++	init_waitqueue_head(&ring->wait);
+ 
+ 	ring->nhi = nhi;
+ 	ring->hop = hop;
+@@ -760,6 +763,31 @@ void tb_ring_start(struct tb_ring *ring)
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_start);
+ 
++static bool tb_ring_empty(struct tb_ring *ring)
++{
++	guard(spinlock_irqsave)(&ring->lock);
++	return list_empty(&ring->in_flight);
++}
++
++/**
++ * tb_ring_flush() - Waits for a ring to be empty
++ * @ring: Ring to wait
++ * @timeout_msec: Timeout in ms how long to wait.
++ *
++ * This can be called before stopping a ring to make sure all the frames
++ * submitted prior have been completed.
++ *
++ * Return: %true if the ring is empty now, %false otherwise.
++ */
++bool tb_ring_flush(struct tb_ring *ring, unsigned int timeout_msec)
++{
++	if (!wait_event_timeout(ring->wait, tb_ring_empty(ring),
++				msecs_to_jiffies(timeout_msec)))
++		return false;
++	return tb_ring_empty(ring);
++}
++EXPORT_SYMBOL_GPL(tb_ring_flush);
++
+ /**
+  * tb_ring_stop() - shutdown a ring
+  * @ring: Ring to stop
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index 9df8a356396f..9c5cb5e4f23d 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -556,6 +556,7 @@ struct tb_nhi {
+  * @poll_data: Data passed to @start_poll
+  * @interval_nsec: Interval counter if interrupt throttling is to be
+  *		   used with this ring (in ns)
++ * @wait: Used to signal that the ring may be empty now
+  */
+ struct tb_ring {
+ 	spinlock_t lock;
+@@ -580,6 +581,7 @@ struct tb_ring {
+ 	void (*start_poll)(void *data);
+ 	void *poll_data;
+ 	unsigned int interval_nsec;
++	wait_queue_head_t wait;
+ };
+ 
+ /* Leave ring interrupt enabled on suspend */
+@@ -653,6 +655,7 @@ struct tb_ring *tb_ring_alloc_rx(struct tb_nhi *nhi, int hop, int size,
+ 				 u16 sof_mask, u16 eof_mask,
+ 				 void (*start_poll)(void *), void *poll_data);
+ void tb_ring_start(struct tb_ring *ring);
++bool tb_ring_flush(struct tb_ring *ring, unsigned int timeout_msec);
+ void tb_ring_stop(struct tb_ring *ring);
+ void tb_ring_free(struct tb_ring *ring);
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,92 @@
+From 57387d899b72fbae19fa7700c52174e061c8b3f5 Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Mon, 27 Apr 2026 10:11:04 +0200
+Subject: [PATCH 07/21] thunderbolt: Wait for tb_domain_release() to complete
+ when driver is removed
+
+We should not call nhi_shutdown() before the domain structure and the
+control channel rings are completely released. Otherwise we might
+release resources like the nhi->msix_ida that are still referenced in
+tb_domain_release(). For this reason wait for the tb_domain_release() to
+be completed before continuing to nhi_shutdown() and eventually
+releasing of the rest of the data structures.
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/thunderbolt/domain.c | 3 +++
+ drivers/thunderbolt/nhi.c    | 4 ++++
+ include/linux/thunderbolt.h  | 2 ++
+ 3 files changed, 9 insertions(+)
+
+diff --git a/drivers/thunderbolt/domain.c b/drivers/thunderbolt/domain.c
+index 317780b99992..df4d7dd45adf 100644
+--- a/drivers/thunderbolt/domain.c
++++ b/drivers/thunderbolt/domain.c
+@@ -319,12 +319,15 @@ const struct bus_type tb_bus_type = {
+ static void tb_domain_release(struct device *dev)
+ {
+ 	struct tb *tb = container_of(dev, struct tb, dev);
++	struct tb_nhi *nhi = tb->nhi;
+ 
+ 	tb_ctl_free(tb->ctl);
+ 	destroy_workqueue(tb->wq);
+ 	ida_free(&tb_domain_ida, tb->index);
+ 	mutex_destroy(&tb->lock);
+ 	kfree(tb);
++
++	complete(&nhi->domain_released);
+ }
+ 
+ const struct device_type tb_domain_type = {
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index 2bb2e79ca3cb..1a2051673067 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -1401,6 +1401,8 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	dev_dbg(dev, "NHI initialized, starting thunderbolt\n");
+ 
++	init_completion(&nhi->domain_released);
++
+ 	res = tb_domain_add(tb, host_reset);
+ 	if (res) {
+ 		/*
+@@ -1408,6 +1410,7 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		 * activated. Do a proper shutdown.
+ 		 */
+ 		tb_domain_put(tb);
++		wait_for_completion(&nhi->domain_released);
+ 		nhi_shutdown(nhi);
+ 		return res;
+ 	}
+@@ -1433,6 +1436,7 @@ static void nhi_remove(struct pci_dev *pdev)
+ 	pm_runtime_forbid(&pdev->dev);
+ 
+ 	tb_domain_remove(tb);
++	wait_for_completion(&nhi->domain_released);
+ 	nhi_shutdown(nhi);
+ }
+ 
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index 0ba112175bb3..a5ef7100a6d3 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -493,6 +493,7 @@ static inline struct tb_xdomain *tb_service_parent(struct tb_service *svc)
+  *		    MSI-X is used.
+  * @hop_count: Number of rings (end point hops) supported by NHI.
+  * @quirks: NHI specific quirks if any
++ * @domain_released: Completed when domain has been fully released
+  */
+ struct tb_nhi {
+ 	spinlock_t lock;
+@@ -507,6 +508,7 @@ struct tb_nhi {
+ 	struct work_struct interrupt_work;
+ 	u32 hop_count;
+ 	unsigned long quirks;
++	struct completion domain_released;
+ };
+ 
+ /**
+-- 
+2.53.0
+

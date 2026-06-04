@@ -1,0 +1,176 @@
+From c0dbafea7e9ac2f97deb9bb3e1d59f1afb99f745 Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Tue, 28 Apr 2026 09:22:08 +0200
+Subject: [PATCH 20/21] thunderbolt: Add support for ConfigFS
+
+This adds ConfigFS support to USB4/Thunderbolt bus. By itself this just
+creates the subsystem but it exposes functions that can be used to
+register groups under it.
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/thunderbolt/Kconfig    |  4 +++
+ drivers/thunderbolt/Makefile   |  1 +
+ drivers/thunderbolt/configfs.c | 61 ++++++++++++++++++++++++++++++++++
+ drivers/thunderbolt/domain.c   |  2 ++
+ drivers/thunderbolt/tb.h       |  8 +++++
+ include/linux/thunderbolt.h    |  6 ++++
+ 6 files changed, 82 insertions(+)
+ create mode 100644 drivers/thunderbolt/configfs.c
+
+diff --git a/drivers/thunderbolt/Kconfig b/drivers/thunderbolt/Kconfig
+index db3b0bef48f4..9b4aaa456e32 100644
+--- a/drivers/thunderbolt/Kconfig
++++ b/drivers/thunderbolt/Kconfig
+@@ -18,6 +18,10 @@ menuconfig USB4
+ 
+ if USB4
+ 
++config USB4_CONFIGFS
++	def_tristate USB4
++	depends on CONFIGFS_FS && !(USB4=y && CONFIGFS_FS=m)
++
+ config USB4_DEBUGFS_WRITE
+ 	bool "Enable write by debugfs to configuration spaces (DANGEROUS)"
+ 	help
+diff --git a/drivers/thunderbolt/Makefile b/drivers/thunderbolt/Makefile
+index b44b32dcb832..d5b367dfda1e 100644
+--- a/drivers/thunderbolt/Makefile
++++ b/drivers/thunderbolt/Makefile
+@@ -7,6 +7,7 @@ thunderbolt-objs += usb4_port.o nvm.o retimer.o quirks.o clx.o
+ 
+ thunderbolt-${CONFIG_ACPI} += acpi.o
+ thunderbolt-$(CONFIG_DEBUG_FS) += debugfs.o
++thunderbolt-$(CONFIG_USB4_CONFIGFS) += configfs.o
+ thunderbolt-${CONFIG_USB4_KUNIT_TEST} += test.o
+ CFLAGS_test.o += $(DISABLE_STRUCTLEAK_PLUGIN)
+ 
+diff --git a/drivers/thunderbolt/configfs.c b/drivers/thunderbolt/configfs.c
+new file mode 100644
+index 000000000000..dc6bc363dfe8
+--- /dev/null
++++ b/drivers/thunderbolt/configfs.c
+@@ -0,0 +1,61 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ConfigFS support
++ *
++ * Copyright (C) 2026, Intel Corporation
++ * Author: Mika Westerberg <mika.westerberg@linux.intel.com>
++ */
++
++#include <linux/configfs.h>
++#include <linux/export.h>
++
++#include "tb.h"
++
++static const struct config_item_type tb_root_group_type = {
++	.ct_owner = THIS_MODULE,
++};
++
++static struct configfs_subsystem tb_configfs = {
++	.su_group = {
++		.cg_item = {
++			.ci_namebuf = "thunderbolt",
++			.ci_type = &tb_root_group_type,
++		},
++	},
++};
++
++/**
++ * tb_configfs_register_group() - Register Thunderbolt ConfigFS group
++ * @group: Group to register.
++ *
++ * Registers the new @group under Thunderbolt subsystem ConfigFS.
++ *
++ * Return: 0% in case of success, negative errno otherwise.
++ */
++int tb_configfs_register_group(struct config_group *group)
++{
++	return configfs_register_group(&tb_configfs.su_group, group);
++}
++EXPORT_SYMBOL_GPL(tb_configfs_register_group);
++
++/**
++ * tb_configfs_unregister_group() - Unregister previously registered group
++ * @group: Group to unregister.
++ */
++void tb_configfs_unregister_group(struct config_group *group)
++{
++	configfs_unregister_group(group);
++}
++EXPORT_SYMBOL_GPL(tb_configfs_unregister_group);
++
++int tb_configfs_init(void)
++{
++	config_group_init(&tb_configfs.su_group);
++	mutex_init(&tb_configfs.su_mutex);
++	return configfs_register_subsystem(&tb_configfs);
++}
++
++void tb_configfs_exit(void)
++{
++	configfs_unregister_subsystem(&tb_configfs);
++}
+diff --git a/drivers/thunderbolt/domain.c b/drivers/thunderbolt/domain.c
+index d83719a37b4c..b381f184340e 100644
+--- a/drivers/thunderbolt/domain.c
++++ b/drivers/thunderbolt/domain.c
+@@ -887,6 +887,7 @@ int tb_domain_init(void)
+ {
+ 	int ret;
+ 
++	tb_configfs_init();
+ 	tb_debugfs_init();
+ 	tb_acpi_init();
+ 
+@@ -916,4 +917,5 @@ void tb_domain_exit(void)
+ 	tb_xdomain_exit();
+ 	tb_acpi_exit();
+ 	tb_debugfs_exit();
++	tb_configfs_exit();
+ }
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index 229b9e7961fb..e60f1bc3764e 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -1558,4 +1558,12 @@ static inline void tb_retimer_debugfs_init(struct tb_retimer *rt) { }
+ static inline void tb_retimer_debugfs_remove(struct tb_retimer *rt) { }
+ #endif
+ 
++#if IS_REACHABLE(CONFIG_CONFIGFS_FS)
++int tb_configfs_init(void);
++void tb_configfs_exit(void);
++#else
++static inline int tb_configfs_init(void) { return 0; }
++static inline void tb_configfs_exit(void) { }
++#endif
++
+ #endif
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index 9c5cb5e4f23d..0be9b298e692 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -13,6 +13,7 @@
+ 
+ #include <linux/types.h>
+ 
++struct config_group;
+ struct fwnode_handle;
+ struct device;
+ 
+@@ -727,6 +728,11 @@ static inline struct device *tb_ring_dma_device(struct tb_ring *ring)
+ bool usb4_usb3_port_match(struct device *usb4_port_dev,
+ 			  const struct fwnode_handle *usb3_port_fwnode);
+ 
++#if IS_REACHABLE(CONFIG_CONFIGFS_FS)
++int tb_configfs_register_group(struct config_group *group);
++void tb_configfs_unregister_group(struct config_group *group);
++#endif
++
+ #else /* CONFIG_USB4 */
+ static inline bool usb4_usb3_port_match(struct device *usb4_port_dev,
+ 					const struct fwnode_handle *usb3_port_fwnode)
+-- 
+2.53.0
+

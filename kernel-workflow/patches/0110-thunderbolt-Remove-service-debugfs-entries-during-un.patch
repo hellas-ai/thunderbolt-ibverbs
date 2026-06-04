@@ -1,0 +1,72 @@
+From 4a688092e3fc40226b5aa8a55866257b9ac22af0 Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Mon, 27 Apr 2026 10:11:07 +0200
+Subject: [PATCH 10/21] thunderbolt: Remove service debugfs entries during
+ unregister
+
+We add them as part of the register path so to keep it symmetric remove
+them as part of the unregister path. This also removes them even if the
+service itself is not yet released (but is unregistered), thus allowing
+new register with the same service name to happen.
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/thunderbolt/xdomain.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+index 0e97d0ad7733..76e1902d18f3 100644
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -1035,7 +1035,6 @@ static void tb_service_release(struct device *dev)
+ 	struct tb_service *svc = container_of(dev, struct tb_service, dev);
+ 	struct tb_xdomain *xd = tb_service_parent(svc);
+ 
+-	tb_service_debugfs_remove(svc);
+ 	ida_free(&xd->service_ids, svc->id);
+ 	kfree(svc->key);
+ 	kfree(svc);
+@@ -1050,6 +1049,14 @@ const struct device_type tb_service_type = {
+ };
+ EXPORT_SYMBOL_GPL(tb_service_type);
+ 
++static void __unregister_service(struct device *dev)
++{
++	struct tb_service *svc = tb_to_service(dev);
++
++	tb_service_debugfs_remove(svc);
++	device_unregister(&svc->dev);
++}
++
+ static int remove_missing_service(struct device *dev, void *data)
+ {
+ 	struct tb_xdomain *xd = data;
+@@ -1061,7 +1068,7 @@ static int remove_missing_service(struct device *dev, void *data)
+ 
+ 	if (!tb_property_find(xd->remote_properties, svc->key,
+ 			      TB_PROPERTY_TYPE_DIRECTORY))
+-		device_unregister(dev);
++		__unregister_service(dev);
+ 
+ 	return 0;
+ }
+@@ -1154,6 +1161,7 @@ static void enumerate_services(struct tb_xdomain *xd)
+ 		tb_service_debugfs_init(svc);
+ 
+ 		if (device_register(&svc->dev)) {
++			tb_service_debugfs_remove(svc);
+ 			put_device(&svc->dev);
+ 			break;
+ 		}
+@@ -2092,7 +2100,7 @@ void tb_xdomain_add(struct tb_xdomain *xd)
+ 
+ static int unregister_service(struct device *dev, void *data)
+ {
+-	device_unregister(dev);
++	__unregister_service(dev);
+ 	return 0;
+ }
+ 
+-- 
+2.53.0
+
