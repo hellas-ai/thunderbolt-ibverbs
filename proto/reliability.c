@@ -204,6 +204,117 @@ tbv_rel_u32 tbv_rel_decode_verbs_rnr_retry(tbv_rel_u8 rnr_retry)
 		       encoded;
 }
 
+int tbv_rel_order_init(struct tbv_rel_order_queue *q, tbv_rel_u32 capacity)
+{
+	if (!q || !capacity || capacity > TBV_REL_ORDER_MAX)
+		return -EINVAL;
+
+	memset(q, 0, sizeof(*q));
+	q->capacity = capacity;
+	return 0;
+}
+
+static tbv_rel_u32 tbv_rel_order_index(const struct tbv_rel_order_queue *q,
+				       tbv_rel_u32 offset)
+{
+	return (q->head + offset) % q->capacity;
+}
+
+int tbv_rel_order_push(struct tbv_rel_order_queue *q, tbv_rel_u32 op_id)
+{
+	struct tbv_rel_order_entry *entry;
+	tbv_rel_u32 i;
+
+	if (!q || !q->capacity)
+		return -EINVAL;
+	if (q->count == q->capacity)
+		return -ENOSPC;
+
+	for (i = 0; i < q->count; i++) {
+		entry = &q->entries[tbv_rel_order_index(q, i)];
+		if (entry->occupied && entry->op_id == op_id)
+			return -EEXIST;
+	}
+
+	entry = &q->entries[tbv_rel_order_index(q, q->count)];
+	memset(entry, 0, sizeof(*entry));
+	entry->occupied = true;
+	entry->op_id = op_id;
+	q->count++;
+	return 0;
+}
+
+int tbv_rel_order_mark(struct tbv_rel_order_queue *q, tbv_rel_u32 op_id,
+		       tbv_rel_u8 status)
+{
+	struct tbv_rel_order_entry *entry;
+	tbv_rel_u32 i;
+
+	if (!q || !q->capacity)
+		return -EINVAL;
+
+	for (i = 0; i < q->count; i++) {
+		entry = &q->entries[tbv_rel_order_index(q, i)];
+		if (!entry->occupied || entry->op_id != op_id)
+			continue;
+		if (entry->ready)
+			return entry->status == status ? 0 : -EALREADY;
+		entry->ready = true;
+		entry->status = status;
+		return 0;
+	}
+
+	return -ENOENT;
+}
+
+int tbv_rel_order_flush(struct tbv_rel_order_queue *q, tbv_rel_u8 status)
+{
+	struct tbv_rel_order_entry *entry;
+	tbv_rel_u32 i;
+
+	if (!q || !q->capacity)
+		return -EINVAL;
+
+	for (i = 0; i < q->count; i++) {
+		entry = &q->entries[tbv_rel_order_index(q, i)];
+		if (!entry->ready) {
+			entry->ready = true;
+			entry->status = status;
+		}
+	}
+
+	return 0;
+}
+
+int tbv_rel_order_drain(struct tbv_rel_order_queue *q,
+			struct tbv_rel_completion *out, tbv_rel_u32 max,
+			tbv_rel_u32 *drained)
+{
+	tbv_rel_u32 n = 0;
+
+	if (!q || !q->capacity || (max && !out))
+		return -EINVAL;
+
+	while (q->count && n < max) {
+		struct tbv_rel_order_entry *entry = &q->entries[q->head];
+
+		if (!entry->occupied || !entry->ready)
+			break;
+
+		tbv_rel_complete(&out[n], entry->op_id, entry->status);
+		memset(entry, 0, sizeof(*entry));
+		q->head = (q->head + 1u) % q->capacity;
+		q->count--;
+		n++;
+	}
+	if (!q->count)
+		q->head = 0;
+	if (drained)
+		*drained = n;
+
+	return 0;
+}
+
 void tbv_rel_rx_init(struct tbv_rel_rx_op *rx, tbv_rel_u64 conn_id,
 		     tbv_rel_u32 max_payload)
 {

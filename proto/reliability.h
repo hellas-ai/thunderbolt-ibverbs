@@ -20,6 +20,7 @@ typedef uint64_t tbv_rel_u64;
 #endif
 
 #define TBV_REL_MAX_FRAGS 64u
+#define TBV_REL_ORDER_MAX 128u
 #define TBV_REL_RETRY_INFINITE ((tbv_rel_u32)~0u)
 #define TBV_REL_VERBS_RNR_RETRY_INFINITE 7u
 
@@ -42,6 +43,7 @@ enum tbv_rel_completion_status {
 	TBV_REL_COMP_RNR_RETRY_EXHAUSTED = 1,
 	TBV_REL_COMP_RETRY_EXHAUSTED = 2,
 	TBV_REL_COMP_REMOTE_ERROR = 3,
+	TBV_REL_COMP_FLUSHED = 4,
 };
 
 enum tbv_rel_tx_state {
@@ -118,6 +120,20 @@ struct tbv_rel_rx_op {
 	bool accepted;
 };
 
+struct tbv_rel_order_entry {
+	tbv_rel_u32 op_id;
+	tbv_rel_u8 status;
+	bool occupied;
+	bool ready;
+};
+
+struct tbv_rel_order_queue {
+	tbv_rel_u32 capacity;
+	tbv_rel_u32 head;
+	tbv_rel_u32 count;
+	struct tbv_rel_order_entry entries[TBV_REL_ORDER_MAX];
+};
+
 static inline bool tbv_rel_u32_before(tbv_rel_u32 a, tbv_rel_u32 b)
 {
 	return a != b && (tbv_rel_u32)(a - b) > 0x80000000u;
@@ -143,6 +159,15 @@ tbv_rel_u64 tbv_rel_retry_interval(tbv_rel_u64 ack_timeout,
 				   tbv_rel_u32 retry_budget);
 tbv_rel_u64 tbv_rel_ack_timeout_ns(tbv_rel_u8 timeout);
 tbv_rel_u32 tbv_rel_decode_verbs_rnr_retry(tbv_rel_u8 rnr_retry);
+
+int tbv_rel_order_init(struct tbv_rel_order_queue *q, tbv_rel_u32 capacity);
+int tbv_rel_order_push(struct tbv_rel_order_queue *q, tbv_rel_u32 op_id);
+int tbv_rel_order_mark(struct tbv_rel_order_queue *q, tbv_rel_u32 op_id,
+		       tbv_rel_u8 status);
+int tbv_rel_order_flush(struct tbv_rel_order_queue *q, tbv_rel_u8 status);
+int tbv_rel_order_drain(struct tbv_rel_order_queue *q,
+			struct tbv_rel_completion *out, tbv_rel_u32 max,
+			tbv_rel_u32 *drained);
 
 void tbv_rel_rx_init(struct tbv_rel_rx_op *rx, tbv_rel_u64 conn_id,
 		     tbv_rel_u32 max_payload);

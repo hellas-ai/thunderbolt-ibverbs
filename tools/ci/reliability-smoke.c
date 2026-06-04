@@ -218,6 +218,117 @@ static int test_ack_timeout_encoding(void)
 	return 0;
 }
 
+static int test_ordered_completion_queue(void)
+{
+	struct tbv_rel_order_queue q;
+	struct tbv_rel_completion out[3] = {};
+	tbv_rel_u32 drained = 99;
+
+	CHECK(tbv_rel_order_init(&q, 4) == 0);
+	CHECK(tbv_rel_order_push(&q, 1) == 0);
+	CHECK(tbv_rel_order_push(&q, 2) == 0);
+	CHECK(tbv_rel_order_push(&q, 3) == 0);
+
+	CHECK(tbv_rel_order_mark(&q, 2, TBV_REL_COMP_OK) == 0);
+	CHECK(tbv_rel_order_drain(&q, out, 3, &drained) == 0);
+	CHECK(drained == 0);
+
+	CHECK(tbv_rel_order_mark(&q, 1, TBV_REL_COMP_OK) == 0);
+	CHECK(tbv_rel_order_drain(&q, out, 3, &drained) == 0);
+	CHECK(drained == 2);
+	CHECK(out[0].valid && out[0].op_id == 1 &&
+	      out[0].status == TBV_REL_COMP_OK);
+	CHECK(out[1].valid && out[1].op_id == 2 &&
+	      out[1].status == TBV_REL_COMP_OK);
+
+	CHECK(tbv_rel_order_mark(&q, 3, TBV_REL_COMP_REMOTE_ERROR) == 0);
+	CHECK(tbv_rel_order_drain(&q, out, 3, &drained) == 0);
+	CHECK(drained == 1);
+	CHECK(out[0].valid && out[0].op_id == 3 &&
+	      out[0].status == TBV_REL_COMP_REMOTE_ERROR);
+
+	return 0;
+}
+
+static int test_ordered_terminal_failure_does_not_overtake(void)
+{
+	struct tbv_rel_order_queue q;
+	struct tbv_rel_completion out[2] = {};
+	tbv_rel_u32 drained;
+
+	CHECK(tbv_rel_order_init(&q, 4) == 0);
+	CHECK(tbv_rel_order_push(&q, 10) == 0);
+	CHECK(tbv_rel_order_push(&q, 11) == 0);
+
+	CHECK(tbv_rel_order_mark(&q, 11,
+				 TBV_REL_COMP_RETRY_EXHAUSTED) == 0);
+	CHECK(tbv_rel_order_drain(&q, out, 2, &drained) == 0);
+	CHECK(drained == 0);
+
+	CHECK(tbv_rel_order_flush(&q, TBV_REL_COMP_FLUSHED) == 0);
+	CHECK(tbv_rel_order_drain(&q, out, 2, &drained) == 0);
+	CHECK(drained == 2);
+	CHECK(out[0].valid && out[0].op_id == 10 &&
+	      out[0].status == TBV_REL_COMP_FLUSHED);
+	CHECK(out[1].valid && out[1].op_id == 11 &&
+	      out[1].status == TBV_REL_COMP_RETRY_EXHAUSTED);
+
+	return 0;
+}
+
+static int test_ordered_rnr_exhaustion_waits_for_prior_wr(void)
+{
+	struct tbv_rel_order_queue q;
+	struct tbv_rel_completion out[2] = {};
+	tbv_rel_u32 drained;
+
+	CHECK(tbv_rel_order_init(&q, 4) == 0);
+	CHECK(tbv_rel_order_push(&q, 20) == 0);
+	CHECK(tbv_rel_order_push(&q, 21) == 0);
+
+	CHECK(tbv_rel_order_mark(&q, 21,
+				 TBV_REL_COMP_RNR_RETRY_EXHAUSTED) == 0);
+	CHECK(tbv_rel_order_drain(&q, out, 2, &drained) == 0);
+	CHECK(drained == 0);
+
+	CHECK(tbv_rel_order_mark(&q, 20, TBV_REL_COMP_OK) == 0);
+	CHECK(tbv_rel_order_drain(&q, out, 2, &drained) == 0);
+	CHECK(drained == 2);
+	CHECK(out[0].valid && out[0].op_id == 20 &&
+	      out[0].status == TBV_REL_COMP_OK);
+	CHECK(out[1].valid && out[1].op_id == 21 &&
+	      out[1].status == TBV_REL_COMP_RNR_RETRY_EXHAUSTED);
+
+	return 0;
+}
+
+static int test_ordered_completion_ring_wrap(void)
+{
+	struct tbv_rel_order_queue q;
+	struct tbv_rel_completion out[2] = {};
+	tbv_rel_u32 drained;
+
+	CHECK(tbv_rel_order_init(&q, 2) == 0);
+	CHECK(tbv_rel_order_push(&q, 30) == 0);
+	CHECK(tbv_rel_order_push(&q, 31) == 0);
+	CHECK(tbv_rel_order_push(&q, 32) == -ENOSPC);
+	CHECK(tbv_rel_order_mark(&q, 30, TBV_REL_COMP_OK) == 0);
+	CHECK(tbv_rel_order_drain(&q, out, 1, &drained) == 0);
+	CHECK(drained == 1 && out[0].op_id == 30);
+
+	CHECK(tbv_rel_order_push(&q, 32) == 0);
+	CHECK(tbv_rel_order_mark(&q, 32, TBV_REL_COMP_OK) == 0);
+	CHECK(tbv_rel_order_drain(&q, out, 2, &drained) == 0);
+	CHECK(drained == 0);
+
+	CHECK(tbv_rel_order_mark(&q, 31, TBV_REL_COMP_OK) == 0);
+	CHECK(tbv_rel_order_drain(&q, out, 2, &drained) == 0);
+	CHECK(drained == 2);
+	CHECK(out[0].op_id == 31 && out[1].op_id == 32);
+
+	return 0;
+}
+
 #define READ_RESP_TEST_TOTAL 48u
 #define READ_RESP_TEST_CHUNK 16u
 #define READ_RESP_TEST_FRAGS \
@@ -495,6 +606,10 @@ int main(void)
 	CHECK(test_wrap_safe_sequence_helpers() == 0);
 	CHECK(test_retry_interval_uses_retry_budget() == 0);
 	CHECK(test_ack_timeout_encoding() == 0);
+	CHECK(test_ordered_completion_queue() == 0);
+	CHECK(test_ordered_terminal_failure_does_not_overtake() == 0);
+	CHECK(test_ordered_rnr_exhaustion_waits_for_prior_wr() == 0);
+	CHECK(test_ordered_completion_ring_wrap() == 0);
 	CHECK(test_read_response_retry_uses_stable_snapshot() == 0);
 	CHECK(test_generated_loss_duplicate_reorder_schedules() == 0);
 
