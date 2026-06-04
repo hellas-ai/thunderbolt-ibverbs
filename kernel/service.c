@@ -27,14 +27,14 @@ static const char tbv_apple_ca_key[TB_PROPERTY_KEY_SIZE + 1] = {
 };
 
 /*
- * Apple's AppleThunderboltRDMA.kext matches inbound services on
- * { Protocol ID = 64087 (0xFA57), Protocol Version = 1 } and does not
- * require a specific Service Key. But Apple's own RDMA services advertise
- * themselves under the property key "rdma" (per TN3205, April 2026) — so
- * use that key so macOS userspace tools (system_profiler, ioreg) report
- * the peer correctly instead of "Service: Unknown".
+ * Apple's RDMA service key is not printable. macOS exposes Linux services
+ * advertised under "rdma" in IORegistry, but AppleThunderboltRDMA does not
+ * bind them as RDMA peers. Use the same AD key Apple advertises.
  */
-static const char tbv_apple_protocol_key[] = "rdma";
+static const char tbv_apple_ad_key[TB_PROPERTY_KEY_SIZE + 1] = {
+	(char)0xff, (char)0xff, (char)0xff, (char)0xff,
+	(char)0xff, (char)0xff, 'A', 'D', '\0',
+};
 
 static struct tbv_state *tbv_service_state;
 
@@ -583,8 +583,7 @@ static int tbv_register_apple_dir(struct tbv_state *state, u32 prtcstns)
 		return ret;
 	}
 
-	ret = tb_register_property_dir(tbv_apple_protocol_key,
-				       state->apple_dir);
+	ret = tb_register_property_dir(tbv_apple_ad_key, state->apple_dir);
 	if (ret) {
 		tb_property_free_dir(state->apple_dir);
 		state->apple_dir = NULL;
@@ -652,8 +651,7 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 
 err_unregister_apple:
 	if (state->apple_dir) {
-		tb_unregister_property_dir(tbv_apple_protocol_key,
-					   state->apple_dir);
+		tb_unregister_property_dir(tbv_apple_ad_key, state->apple_dir);
 		tb_property_free_dir(state->apple_dir);
 		state->apple_dir = NULL;
 	}
@@ -680,8 +678,7 @@ void tbv_services_stop(struct tbv_state *state)
 	tbv_native_control_stop(state);
 
 	if (state->apple_dir) {
-		tb_unregister_property_dir(tbv_apple_protocol_key,
-					   state->apple_dir);
+		tb_unregister_property_dir(tbv_apple_ad_key, state->apple_dir);
 		tb_property_free_dir(state->apple_dir);
 		state->apple_dir = NULL;
 	}
