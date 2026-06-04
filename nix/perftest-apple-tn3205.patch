@@ -1,0 +1,42 @@
+--- a/src/perftest_resources.c
++++ b/src/perftest_resources.c
+@@ -40,0 +41,11 @@
++static int is_apple_thunderbolt_uc(const struct perftest_parameters *user_param)
++{
++#ifdef __APPLE__
++	return user_param->connection_type == UC &&
++	       user_param->ib_devname &&
++	       !strncmp(user_param->ib_devname, "rdma_en", 7);
++#else
++	return 0;
++#endif
++}
++
+@@ -3420,0 +3432,4 @@
++		if (is_apple_thunderbolt_uc(user_param) &&
++		    (user_param->verb == SEND ||
++		     user_param->verb == SEND_IMM))
++			attr.qp_access_flags = 0;
+@@ -3485,0 +3501,2 @@
++			if (is_apple_thunderbolt_uc(user_param))
++				attr->ah_attr.grh.hop_limit = 1;
+--- a/src/perftest_parameters.c
++++ b/src/perftest_parameters.c
+@@ -4332,0 +4333,8 @@
++#ifdef __APPLE__
++	if (user_param->connection_type == UC &&
++	    (user_param->verb == SEND || user_param->verb == SEND_IMM) &&
++	    user_param->ib_devname &&
++	    !strncmp(user_param->ib_devname, "rdma_en", 7))
++		user_param->cq_mod = 1;
++#endif
++
+@@ -4404,0 +4413,8 @@
++
++#ifdef __APPLE__
++	if (user_param->connection_type == UC &&
++	    (user_param->verb == SEND || user_param->verb == SEND_IMM) &&
++	    user_param->ib_devname &&
++	    !strncmp(user_param->ib_devname, "rdma_en", 7))
++		user_param->cq_mod = 1;
++#endif

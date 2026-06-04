@@ -29,6 +29,7 @@ if stdenv.hostPlatform.isDarwin then
     pname = "perftest-apple-rdma";
     version = "26.04.17";
     src = perftest-src;
+    patches = [ ./perftest-apple-tn3205.patch ];
 
     nativeBuildInputs = [ autoreconfHook ];
     buildInputs = [ apple-sdk_26 ];
