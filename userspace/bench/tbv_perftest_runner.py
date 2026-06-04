@@ -203,7 +203,10 @@ CSV_FIELDS = [
     "server",
     "client",
     "kernel",
+    "module_id",
+    "module_id_source",
     "module_sha256",
+    "module_ko_path",
     "iommu",
     "direction",
     "dev",
@@ -405,11 +408,13 @@ def parse_iommu_setting(cmdline: str) -> str:
 def collect_host_identity(host: str) -> dict[str, str]:
     cmd = (
         "ko=$(modinfo -F filename thunderbolt_ibverbs 2>/dev/null); "
+        "note=/sys/module/thunderbolt_ibverbs/notes/.note.gnu.build-id; "
         "echo kernel=$(uname -r); "
         "echo srcversion=$(cat /sys/module/thunderbolt_ibverbs/srcversion 2>/dev/null); "
         "echo taint=$(cat /sys/module/thunderbolt_ibverbs/taint 2>/dev/null); "
         "echo ko_path=$ko; "
         "echo module_sha256=$(sha256sum \"$ko\" 2>/dev/null | cut -c1-16); "
+        "echo loaded_note_sha256=$(sha256sum \"$note\" 2>/dev/null | cut -c1-16); "
         "echo cmdline=$(tr -d '\\n' < /proc/cmdline 2>/dev/null)"
     )
     out = run_ssh(host, cmd, check=False, timeout=15).stdout
@@ -419,6 +424,12 @@ def collect_host_identity(host: str) -> dict[str, str]:
         if sep:
             fields[key.strip()] = value.strip()
     fields["iommu"] = parse_iommu_setting(fields.get("cmdline", ""))
+    if fields.get("loaded_note_sha256"):
+        fields["module_id"] = fields["loaded_note_sha256"]
+        fields["module_id_source"] = "loaded-note-sha256"
+    else:
+        fields["module_id"] = fields.get("module_sha256", "")
+        fields["module_id_source"] = "modinfo-ko-sha256"
     return fields
 
 
@@ -426,6 +437,8 @@ def format_identity(label: str, identity: dict[str, str]) -> str:
     return (
         f"tbv-perftest: {label} "
         f"kernel={identity.get('kernel', '?')} "
+        f"module_id={identity.get('module_id') or 'unknown'} "
+        f"module_id_source={identity.get('module_id_source') or '-'} "
         f"module_sha256={identity.get('module_sha256') or 'unknown'} "
         f"srcversion={identity.get('srcversion') or '-'} "
         f"taint={identity.get('taint') or '-'} "
@@ -948,7 +961,7 @@ def main() -> int:
         identity_client = collect_host_identity(client)
         print(format_identity(server, identity_server), flush=True)
         print(format_identity(client, identity_client), flush=True)
-        for field in ("kernel", "module_sha256", "iommu"):
+        for field in ("kernel", "module_id", "iommu"):
             if identity_server.get(field) != identity_client.get(field):
                 print(
                     f"tbv-perftest: WARNING: server/client {field} mismatch",
@@ -1002,7 +1015,10 @@ def main() -> int:
                             "server": run_server,
                             "client": run_client,
                             "kernel": identity_server.get("kernel", ""),
+                            "module_id": identity_server.get("module_id", ""),
+                            "module_id_source": identity_server.get("module_id_source", ""),
                             "module_sha256": identity_server.get("module_sha256", ""),
+                            "module_ko_path": identity_server.get("ko_path", ""),
                             "iommu": identity_server.get("iommu", ""),
                             "direction": direction_name,
                             "dev": dev,
