@@ -1,0 +1,233 @@
+From 4faa032f7c1ced461c236cd81cc91748f807bdd9 Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Tue, 28 Apr 2026 09:22:05 +0200
+Subject: [PATCH 17/21] thunderbolt / net: Let the service drivers configure
+ interrupt throttling
+
+Instead of the core driver programming fixed value for throttling let
+the service drivers to specify the interval if they need this. We also
+allow user to tune this through a module parameter if the default is not
+good fit.
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/net/thunderbolt/main.c |  7 ++++
+ drivers/thunderbolt/dma_test.c |  5 +++
+ drivers/thunderbolt/nhi.c      | 58 ++++++++++++++++++----------------
+ drivers/thunderbolt/nhi_regs.h |  3 +-
+ include/linux/thunderbolt.h    |  5 +++
+ 5 files changed, 50 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/net/thunderbolt/main.c b/drivers/net/thunderbolt/main.c
+index 495f7fe366e6..45caba0e602d 100644
+--- a/drivers/net/thunderbolt/main.c
++++ b/drivers/net/thunderbolt/main.c
+@@ -218,6 +218,10 @@ static bool tbnet_e2e = true;
+ module_param_named(e2e, tbnet_e2e, bool, 0444);
+ MODULE_PARM_DESC(e2e, "USB4NET full end-to-end flow control (default: true)");
+ 
++static unsigned int tbnet_throttling = 128000;
++module_param_named(throttling, tbnet_throttling, uint, 0444);
++MODULE_PARM_DESC(throttling, "Interrupt throttling rate in ns (default: 128000)");
++
+ static void tbnet_fill_header(struct thunderbolt_ip_header *hdr, u64 route,
+ 	u8 sequence, const uuid_t *initiator_uuid, const uuid_t *target_uuid,
+ 	enum thunderbolt_ip_type type, size_t size, u32 command_id)
+@@ -956,6 +960,9 @@ static int tbnet_open(struct net_device *dev)
+ 	}
+ 	net->rx_ring.ring = ring;
+ 
++	tb_ring_throttling(net->tx_ring.ring, tbnet_throttling);
++	tb_ring_throttling(net->rx_ring.ring, tbnet_throttling);
++
+ 	napi_enable(&net->napi);
+ 	start_login(net);
+ 
+diff --git a/drivers/thunderbolt/dma_test.c b/drivers/thunderbolt/dma_test.c
+index af1e6bc9c7cd..7877319b1b03 100644
+--- a/drivers/thunderbolt/dma_test.c
++++ b/drivers/thunderbolt/dma_test.c
+@@ -155,6 +155,8 @@ static int dma_test_start_rings(struct dma_test *dt)
+ 		dt->tx_ring = ring;
+ 		e2e_tx_hop = ring->hop;
+ 
++		tb_ring_throttling(ring, 128000);
++
+ 		ret = tb_xdomain_alloc_out_hopid(xd, -1);
+ 		if (ret < 0) {
+ 			dma_test_free_rings(dt);
+@@ -162,6 +164,7 @@ static int dma_test_start_rings(struct dma_test *dt)
+ 		}
+ 
+ 		dt->tx_hopid = ret;
++
+ 	}
+ 
+ 	if (dt->packets_to_receive) {
+@@ -180,6 +183,8 @@ static int dma_test_start_rings(struct dma_test *dt)
+ 
+ 		dt->rx_ring = ring;
+ 
++		tb_ring_throttling(ring, 128000);
++
+ 		ret = tb_xdomain_alloc_in_hopid(xd, -1);
+ 		if (ret < 0) {
+ 			dma_test_free_rings(dt);
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index 1a2051673067..13009246e617 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -93,7 +93,7 @@ static void ring_interrupt_active(struct tb_ring *ring, bool active)
+ 	u32 old, new;
+ 
+ 	if (ring->irq > 0) {
+-		u32 step, shift, ivr, misc;
++		u32 step, shift, ivr, misc, itr;
+ 		void __iomem *ivr_base;
+ 		int auto_clear_bit;
+ 		int index;
+@@ -131,6 +131,12 @@ static void ring_interrupt_active(struct tb_ring *ring, bool active)
+ 		if (active)
+ 			ivr |= ring->vector << shift;
+ 		iowrite32(ivr, ivr_base + step);
++
++		/* Throttling is specified in 256ns increments */
++		itr = DIV_ROUND_UP(ring->interval_nsec, 256);
++		itr &= REG_INT_THROTTLING_RATE_INTERVAL_MASK;
++		iowrite32(itr, ring->nhi->iobase + REG_INT_THROTTLING_RATE +
++			  ring->vector * 4);
+ 	}
+ 
+ 	old = ioread32(ring->nhi->iobase + reg);
+@@ -854,6 +860,26 @@ void tb_ring_free(struct tb_ring *ring)
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_free);
+ 
++/**
++ * tb_ring_throttling() - Configure throttling for ring interrupt
++ * @ring: Ring to configure
++ * @interval_nsec: Interval counter for moderation (in ns), %0 disables
++ *
++ * Enables or disables ring interrupt throttling. The ring must be
++ * stopped for this to be called. Granularity is 256 ns.
++ *
++ * Return: %0 on success, negative errno otherwise.
++ */
++int tb_ring_throttling(struct tb_ring *ring, unsigned int interval_nsec)
++{
++	guard(spinlock_irqsave)(&ring->lock);
++	if (WARN_ON_ONCE(ring->running))
++		return -EBUSY;
++	ring->interval_nsec = interval_nsec;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(tb_ring_throttling);
++
+ /**
+  * nhi_mailbox_cmd() - Send a command through NHI mailbox
+  * @nhi: Pointer to the NHI structure
+@@ -1035,22 +1061,6 @@ static int nhi_poweroff_noirq(struct device *dev)
+ 	return __nhi_suspend_noirq(dev, wakeup);
+ }
+ 
+-static void nhi_enable_int_throttling(struct tb_nhi *nhi)
+-{
+-	/* Throttling is specified in 256ns increments */
+-	u32 throttle = DIV_ROUND_UP(128 * NSEC_PER_USEC, 256);
+-	unsigned int i;
+-
+-	/*
+-	 * Configure interrupt throttling for all vectors even if we
+-	 * only use few.
+-	 */
+-	for (i = 0; i < MSIX_MAX_VECS; i++) {
+-		u32 reg = REG_INT_THROTTLING_RATE + i * 4;
+-		iowrite32(throttle, nhi->iobase + reg);
+-	}
+-}
+-
+ static int nhi_resume_noirq(struct device *dev)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+@@ -1065,13 +1075,10 @@ static int nhi_resume_noirq(struct device *dev)
+ 	 */
+ 	if (!pci_device_is_present(pdev)) {
+ 		nhi->going_away = true;
+-	} else {
+-		if (nhi->ops && nhi->ops->resume_noirq) {
+-			ret = nhi->ops->resume_noirq(nhi);
+-			if (ret)
+-				return ret;
+-		}
+-		nhi_enable_int_throttling(tb->nhi);
++	} else if (nhi->ops && nhi->ops->resume_noirq) {
++		ret = nhi->ops->resume_noirq(nhi);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	return tb_domain_resume_noirq(tb);
+@@ -1133,7 +1140,6 @@ static int nhi_runtime_resume(struct device *dev)
+ 			return ret;
+ 	}
+ 
+-	nhi_enable_int_throttling(nhi);
+ 	return tb_domain_runtime_resume(tb);
+ }
+ 
+@@ -1271,8 +1277,6 @@ static int nhi_init_msi(struct tb_nhi *nhi)
+ 	/* In case someone left them on. */
+ 	nhi_disable_interrupts(nhi);
+ 
+-	nhi_enable_int_throttling(nhi);
+-
+ 	ida_init(&nhi->msix_ida);
+ 
+ 	/*
+diff --git a/drivers/thunderbolt/nhi_regs.h b/drivers/thunderbolt/nhi_regs.h
+index cf5222bee971..d6a197fabc74 100644
+--- a/drivers/thunderbolt/nhi_regs.h
++++ b/drivers/thunderbolt/nhi_regs.h
+@@ -101,7 +101,8 @@ struct ring_desc {
+ 
+ #define REG_RING_INTERRUPT_MASK_CLEAR_BASE	0x38208
+ 
+-#define REG_INT_THROTTLING_RATE	0x38c00
++#define REG_INT_THROTTLING_RATE			0x38c00
++#define REG_INT_THROTTLING_RATE_INTERVAL_MASK	GENMASK(15, 0)
+ 
+ /* Interrupt Vector Allocation */
+ #define REG_INT_VEC_ALLOC_BASE	0x38c40
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index 1d1bd458b5af..1160e0bf5c5b 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -554,6 +554,8 @@ struct tb_nhi {
+  * @start_poll: Called when ring interrupt is triggered to start
+  *		polling. Passing %NULL keeps the ring in interrupt mode.
+  * @poll_data: Data passed to @start_poll
++ * @interval_nsec: Interval counter if interrupt throttling is to be
++ *		   used with this ring (in ns)
+  */
+ struct tb_ring {
+ 	spinlock_t lock;
+@@ -577,6 +579,7 @@ struct tb_ring {
+ 	u16 eof_mask;
+ 	void (*start_poll)(void *data);
+ 	void *poll_data;
++	unsigned int interval_nsec;
+ };
+ 
+ /* Leave ring interrupt enabled on suspend */
+@@ -697,6 +700,8 @@ static inline int tb_ring_tx(struct tb_ring *ring, struct ring_frame *frame)
+ struct ring_frame *tb_ring_poll(struct tb_ring *ring);
+ void tb_ring_poll_complete(struct tb_ring *ring);
+ 
++int tb_ring_throttling(struct tb_ring *ring, unsigned int interval_nsec);
++
+ /**
+  * tb_ring_dma_device() - Return device used for DMA mapping
+  * @ring: Ring whose DMA device is retrieved
+-- 
+2.53.0
+

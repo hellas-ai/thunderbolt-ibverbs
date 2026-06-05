@@ -18,7 +18,19 @@
     }:
     let
       lib = nixpkgs.lib;
-      thunderboltKernelPatches = import ./kernel-workflow/patches;
+      upstreamThunderboltKernelPatches = import ./kernel-workflow/patches/upstream-thunderbolt-next.nix;
+      portableLocalThunderboltKernelPatches = import ./kernel-workflow/patches/local-portable.nix;
+      portableThunderboltKernelPatches = import ./kernel-workflow/patches/portable.nix;
+      integrationDebugThunderboltKernelPatches = import ./kernel-workflow/patches/local-integration-debug.nix;
+      localThunderboltKernelPatches = import ./kernel-workflow/patches;
+      kernelPatchSets = {
+        kernelPatches = localThunderboltKernelPatches;
+        portableKernelPatches = portableThunderboltKernelPatches;
+        upstreamKernelPatches = upstreamThunderboltKernelPatches;
+        portableLocalKernelPatches = portableLocalThunderboltKernelPatches;
+        integrationDebugKernelPatches = integrationDebugThunderboltKernelPatches;
+        kernelPatchesForIntegrationTree = localThunderboltKernelPatches;
+      };
       linuxSystems = [ "x86_64-linux" ];
       darwinSystems = [ "aarch64-darwin" ];
       systems = linuxSystems ++ darwinSystems;
@@ -52,7 +64,7 @@
         pkgs:
         let
           testingKernel = pkgs.linuxPackages_testing.kernel;
-          kernelPatches = (testingKernel.passthru.kernelPatches or [ ]) ++ thunderboltKernelPatches;
+          kernelPatches = (testingKernel.passthru.kernelPatches or [ ]) ++ localThunderboltKernelPatches;
         in
         (testingKernel.override {
           argsOverride = {
@@ -98,6 +110,7 @@
             bash -n \
               packaging/regen-rdma-core-patches.sh \
               packaging/test-rdma-patches.sh \
+              kernel-workflow/regen-upstream-thunderbolt-patches.sh \
               tools/ci/distro-build.sh \
               tools/ci/distro-install.sh \
               tools/ci/distro-package-rdma.sh \
@@ -106,6 +119,51 @@
               tools/ci/vm-smoke.sh
             runHook postBuild
           '';
+
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out"
+            runHook postInstall
+          '';
+
+          meta = {
+            maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+          };
+        };
+      mkPortableKernelPatchCheck =
+        pkgs:
+        let
+          portablePatchBundle = pkgs.runCommand "thunderbolt-portable-kernel-patches" { } ''
+            mkdir -p "$out"
+            ${lib.concatMapStringsSep "\n" (patch: ''
+              cp ${patch.patch} "$out/${baseNameOf (toString patch.patch)}"
+            '') portableThunderboltKernelPatches}
+            printf '%s\n' ${
+              lib.escapeShellArgs (map (patch: baseNameOf (toString patch.patch)) portableThunderboltKernelPatches)
+            } > "$out/series"
+          '';
+        in
+        pkgs.stdenv.mkDerivation {
+          pname = "thunderbolt-portable-kernel-patches-apply-check";
+          version = "0.1.0";
+          src = pkgs.linuxPackages_latest.kernel.src;
+
+          nativeBuildInputs = [ pkgs.git ];
+
+          patchPhase = ''
+            runHook prePatch
+            while IFS= read -r patch; do
+              [ -n "$patch" ] || continue
+              patch="${portablePatchBundle}/$patch"
+              echo "checking $patch"
+              git apply --check "$patch"
+              git apply "$patch"
+            done < ${portablePatchBundle}/series
+            runHook postPatch
+          '';
+
+          dontConfigure = true;
+          dontBuild = true;
 
           installPhase = ''
             runHook preInstall
@@ -290,6 +348,7 @@
         }
         // lib.optionalAttrs isLinux {
           thunderbolt-ibverbs = pkgsAt.thunderbolt-ibverbs;
+          portable-kernel-patches = mkPortableKernelPatchCheck pkgs;
           script-syntax = mkScriptSyntaxCheck pkgs;
           proto-smoke = mkProtoSmoke pkgs;
           rdma-core-usb4 = pkgsAt.rdma-core-usb4;
@@ -375,11 +434,9 @@
           }
         );
 
-      lib.kernelPatches = thunderboltKernelPatches;
+      lib = kernelPatchSets;
 
-      legacyPackages = forLinuxSystems (_pkgs: {
-        kernelPatches = thunderboltKernelPatches;
-      });
+      legacyPackages = forLinuxSystems (_pkgs: kernelPatchSets);
 
       nixosModules.default = import ./module.nix { inherit self; };
     };

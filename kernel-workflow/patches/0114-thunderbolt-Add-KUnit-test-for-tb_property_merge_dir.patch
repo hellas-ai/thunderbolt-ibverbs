@@ -1,0 +1,115 @@
+From 488a8301e522366f825446492e83b1dba3af90b6 Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Tue, 28 Apr 2026 09:22:02 +0200
+Subject: [PATCH 14/21] thunderbolt: Add KUnit test for tb_property_merge_dir()
+
+This makes sure it keeps working if we ever need to change it.
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+---
+ drivers/thunderbolt/test.c | 82 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 82 insertions(+)
+
+diff --git a/drivers/thunderbolt/test.c b/drivers/thunderbolt/test.c
+index 1f4318249c22..ce14ab9ef7dd 100644
+--- a/drivers/thunderbolt/test.c
++++ b/drivers/thunderbolt/test.c
+@@ -2852,6 +2852,87 @@ static void tb_test_property_copy(struct kunit *test)
+ 	tb_property_free_dir(src);
+ }
+ 
++static void tb_test_property_merge(struct kunit *test)
++{
++	struct tb_property_dir *dir1, *dir2, *dir3;
++	struct tb_property *p;
++	uuid_t uuid;
++	int ret;
++
++	dir1 = tb_property_create_dir(&network_dir_uuid);
++	KUNIT_ASSERT_NOT_NULL(test, dir1);
++	ret = tb_property_add_immediate(dir1, "prtcid", 1);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	ret = tb_property_add_immediate(dir1, "prtcvers", 1);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	ret = tb_property_add_immediate(dir1, "prtcrevs", 0);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	ret = tb_property_add_immediate(dir1, "prtcstns", 0);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++
++	dir2 = tb_property_create_dir(&network_dir_uuid);
++	KUNIT_ASSERT_NOT_NULL(test, dir2);
++	ret = tb_property_add_text(dir2, "descr", "This is text");
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	/* This replaces the value in dir1 */
++	ret = tb_property_add_immediate(dir2, "prtcvers", 0x1234);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++
++	uuid_gen(&uuid);
++	dir3 = tb_property_create_dir(&uuid);
++	KUNIT_ASSERT_NOT_NULL(test, dir3);
++	ret = tb_property_add_immediate(dir3, "value0", 0);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	ret = tb_property_add_text(dir3, "value1", "Text value");
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	ret = tb_property_add_dir(dir2, "my", dir3);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++
++	ret = tb_property_merge_dir(dir1, dir2, true);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++
++	p = tb_property_get_next(dir1, NULL);
++	KUNIT_ASSERT_NOT_NULL(test, p);
++	KUNIT_ASSERT_STREQ(test, &p->key[0], "prtcid");
++	KUNIT_ASSERT_EQ(test, p->type, TB_PROPERTY_TYPE_VALUE);
++	KUNIT_ASSERT_EQ(test, p->length, 1);
++	KUNIT_ASSERT_EQ(test, p->value.immediate, 1);
++	p = tb_property_get_next(dir1, p);
++	KUNIT_ASSERT_NOT_NULL(test, p);
++	KUNIT_ASSERT_STREQ(test, &p->key[0], "prtcvers");
++	KUNIT_ASSERT_EQ(test, p->type, TB_PROPERTY_TYPE_VALUE);
++	KUNIT_ASSERT_EQ(test, p->length, 1);
++	KUNIT_ASSERT_EQ(test, p->value.immediate, 0x1234);
++	p = tb_property_get_next(dir1, p);
++	KUNIT_ASSERT_NOT_NULL(test, p);
++	KUNIT_ASSERT_STREQ(test, &p->key[0], "prtcrevs");
++	KUNIT_ASSERT_EQ(test, p->type, TB_PROPERTY_TYPE_VALUE);
++	KUNIT_ASSERT_EQ(test, p->length, 1);
++	KUNIT_ASSERT_EQ(test, p->value.immediate, 0);
++	p = tb_property_get_next(dir1, p);
++	KUNIT_ASSERT_NOT_NULL(test, p);
++	KUNIT_ASSERT_STREQ(test, &p->key[0], "prtcstns");
++	KUNIT_ASSERT_EQ(test, p->type, TB_PROPERTY_TYPE_VALUE);
++	KUNIT_ASSERT_EQ(test, p->length, 1);
++	KUNIT_ASSERT_EQ(test, p->value.immediate, 0);
++	p = tb_property_get_next(dir1, p);
++	KUNIT_ASSERT_NOT_NULL(test, p);
++	KUNIT_ASSERT_STREQ(test, &p->key[0], "descr");
++	KUNIT_ASSERT_EQ(test, p->type, TB_PROPERTY_TYPE_TEXT);
++	KUNIT_ASSERT_EQ(test, p->length, 4);
++	KUNIT_ASSERT_STREQ(test, p->value.text, "This is text");
++	p = tb_property_get_next(dir1, p);
++	KUNIT_ASSERT_NOT_NULL(test, p);
++	KUNIT_ASSERT_STREQ(test, &p->key[0], "my");
++	KUNIT_ASSERT_EQ(test, p->type, TB_PROPERTY_TYPE_DIRECTORY);
++	compare_dirs(test, p->value.dir, dir3);
++	p = tb_property_get_next(dir1, p);
++	KUNIT_ASSERT_NULL(test, p);
++
++	tb_property_free_dir(dir2);
++	tb_property_free_dir(dir1);
++}
++
+ static struct kunit_case tb_test_cases[] = {
+ 	KUNIT_CASE(tb_test_path_basic),
+ 	KUNIT_CASE(tb_test_path_not_connected_walk),
+@@ -2892,6 +2973,7 @@ static struct kunit_case tb_test_cases[] = {
+ 	KUNIT_CASE(tb_test_property_parse),
+ 	KUNIT_CASE(tb_test_property_format),
+ 	KUNIT_CASE(tb_test_property_copy),
++	KUNIT_CASE(tb_test_property_merge),
+ 	{ }
+ };
+ 
+-- 
+2.53.0
+
