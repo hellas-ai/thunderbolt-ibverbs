@@ -355,6 +355,9 @@
             thunderbolt-ibverbs = module;
             thunderbolt-ibverbs-linux-thunderbolt = moduleForThunderboltKernel;
             tbv-perftest = perftestBench.runner;
+            tbv-hip-gda-probes = pkgs.callPackage ./nix/hip-gda-probes.nix {
+              rdma-core-usb4 = rdmaCoreUsb4;
+            };
           }
         )
       );
@@ -476,6 +479,7 @@
               pkgs.trace-cmd
               pkgs.usbutils
               pkgsAt.rdma-core-usb4
+              pkgsAt.tbv-hip-gda-probes
             ];
             meta = {
               maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
@@ -512,6 +516,9 @@
             rdma-core-usb4 = mkRdmaCoreUsb4 prev;
             thunderbolt-ibverbs = final.linuxPackages.callPackage ./nix/module.nix { };
             thunderbolt-ibverbs-linux-thunderbolt = thunderboltLinuxPackages.callPackage ./nix/module.nix { };
+            tbv-hip-gda-probes = final.callPackage ./nix/hip-gda-probes.nix {
+              rdma-core-usb4 = final.rdma-core-usb4;
+            };
           }
         );
 
