@@ -32,6 +32,7 @@ let
   scripts = [
     "tbv_perftest_runner.py"
     "tbv_rdma_sweep.py"
+    "tbv_uc_stress.py"
   ];
 
   cPrograms = if isDarwin then darwinPrograms else linuxPrograms;
