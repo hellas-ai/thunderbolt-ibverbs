@@ -34,6 +34,7 @@ CSV_FIELDS = [
     "size_bytes",
     "count",
     "send_depth",
+    "send_slots",
     "recv_depth",
     "recv_posts",
     "mtu",
@@ -117,6 +118,7 @@ def uc_command(
     mtu: int,
     check: bool,
     check_any_order: bool,
+    send_slots: int | None = None,
     recv_posts: int | None = None,
     connect: str | None = None,
 ) -> str:
@@ -141,6 +143,8 @@ def uc_command(
     ]
     if recv_posts is not None:
         parts.extend(["--recv-posts", str(recv_posts)])
+    if send_slots is not None:
+        parts.extend(["--send-slots", str(send_slots)])
     if connect is not None:
         parts.extend(["--connect", connect])
     if check_any_order:
@@ -259,6 +263,7 @@ def run_case(
         size=size,
         count=args.count,
         depth=send_depth,
+        send_slots=args.send_slots or None,
         mtu=mtu,
         check=args.check,
         check_any_order=False,
@@ -317,6 +322,7 @@ def run_case(
         "size_bytes": str(size),
         "count": str(args.count),
         "send_depth": str(send_depth),
+        "send_slots": str(args.send_slots or send_depth),
         "recv_depth": str(args.recv_depth),
         "recv_posts": str(args.recv_posts),
         "mtu": str(mtu),
@@ -369,6 +375,7 @@ def main() -> int:
     parser.add_argument("--directions", choices=["forward", "reverse", "both"], default="forward")
     parser.add_argument("--sizes", type=parse_csv_ints, default=parse_csv_ints("32768"))
     parser.add_argument("--send-depths", type=parse_csv_ints, default=parse_csv_ints("16,32,64"))
+    parser.add_argument("--send-slots", type=int, default=0)
     parser.add_argument("--recv-depth", type=int, default=64)
     parser.add_argument("--recv-posts", type=int, default=64)
     parser.add_argument("--mtus", type=parse_csv_ints, default=parse_csv_ints("4096"))
@@ -392,6 +399,8 @@ def main() -> int:
         die("--recv-depth and --recv-posts must be positive")
     if any(depth <= 0 for depth in args.send_depths):
         die("--send-depths must be positive")
+    if args.send_slots < 0:
+        die("--send-slots must be non-negative")
 
     csv_path = Path(args.csv)
     log_dir = Path(args.log_dir) if args.log_dir else csv_path.with_suffix("")

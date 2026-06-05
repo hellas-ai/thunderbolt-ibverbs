@@ -52,6 +52,7 @@ struct opts {
 	int gid_index;
 	int ib_port;
 	int depth;
+	int send_slots;
 	int recv_posts;
 	int recv_post_delay_ms;
 	int count;
@@ -163,7 +164,8 @@ static void usage(const char *argv0)
 	fprintf(stderr,
 		"usage: %s --role recv|send|bidi --dev DEV [--gid-index N|auto] --port P\n"
 		"          [--connect HOST] [--size BYTES] [--count N]\n"
-		"          [--depth N] [--recv-posts N] [--mtu 256|512|1024|2048|4096]\n"
+		"          [--depth N] [--send-slots N] [--recv-posts N]\n"
+		"          [--mtu 256|512|1024|2048|4096]\n"
 		"          [--recv-post-delay-ms N]\n"
 		"          [--recv-wr-id-base N] [--send-wr-id-base N]\n"
 		"          [--check] [--check-any-order]\n",
@@ -268,6 +270,9 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		} else if (!strcmp(argv[i], "--depth") && i + 1 < argc) {
 			if (parse_int(argv[++i], &o->depth))
 				return -1;
+		} else if (!strcmp(argv[i], "--send-slots") && i + 1 < argc) {
+			if (parse_int(argv[++i], &o->send_slots))
+				return -1;
 		} else if (!strcmp(argv[i], "--recv-posts") && i + 1 < argc) {
 			if (parse_int(argv[++i], &o->recv_posts))
 				return -1;
@@ -301,7 +306,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 
 	if (!o->role || !o->dev || o->port <= 0 || o->port > 65535 ||
 	    o->gid_index < -1 || o->ib_port <= 0 || o->depth <= 0 ||
-	    o->depth > 4095 || o->recv_posts < 0 ||
+	    o->depth > 4095 || o->send_slots < 0 || o->recv_posts < 0 ||
 	    o->recv_posts > 4095 || o->count <= 0)
 		return -1;
 	if (o->mtu != 256 && o->mtu != 512 && o->mtu != 1024 &&
@@ -701,6 +706,7 @@ int main(int argc, char **argv)
 	int last_done = 0;
 	int initial_recvs = 0;
 	int wr_depth;
+	int send_slots;
 	int sgid_index;
 	uint8_t *seen = NULL;
 
@@ -721,6 +727,10 @@ int main(int argc, char **argv)
 	wr_depth = o.depth;
 	if (!is_sender && initial_recvs > wr_depth)
 		wr_depth = initial_recvs;
+	send_slots = (is_sender || is_bidi) ?
+		     (o.send_slots ? o.send_slots : o.depth) : 0;
+	if (send_slots < 0 || send_slots > o.count)
+		send_slots = o.count;
 
 	debug_step("open device");
 	ctx = open_dev(o.dev);
@@ -756,9 +766,11 @@ int main(int argc, char **argv)
 	page_size = (size_t)sys_page_size;
 	stride = align_up(o.size, page_size);
 	if (is_bidi) {
-		send_region_size = stride * (size_t)o.depth;
+		send_region_size = stride * (size_t)send_slots;
 		bufsz = align_up(send_region_size + stride * (size_t)wr_depth,
 				 page_size);
+	} else if (is_sender) {
+		bufsz = align_up(stride * (size_t)send_slots, page_size);
 	} else {
 		bufsz = align_up(stride * (size_t)wr_depth, page_size);
 	}
@@ -866,9 +878,9 @@ int main(int argc, char **argv)
 		remote.qpn = (uint32_t)strtoul(getenv("UC_ONEWAY_REMOTE_QPN_OVERRIDE"),
 					       NULL, 0);
 	memcpy(remote_gid.raw, remote.gid, sizeof(remote.gid));
-	printf("%s local_qpn=%u remote_qpn=%u size=%zu count=%d depth=%d recv_posts=%d mtu=%d\n",
+	printf("%s local_qpn=%u remote_qpn=%u size=%zu count=%d depth=%d send_slots=%d recv_posts=%d mtu=%d\n",
 	       o.role, local.qpn, remote.qpn, o.size, o.count, o.depth,
-	       initial_recvs, o.mtu);
+	       send_slots, initial_recvs, o.mtu);
 	fprintf(stderr, "local_gid=");
 	print_gid(stderr, &local_gid);
 	fprintf(stderr, " remote_gid=");
@@ -960,7 +972,7 @@ int main(int argc, char **argv)
 		while (send_completed < o.count || recv_completed < o.count) {
 			while (send_posted < o.count &&
 			       send_in_flight < o.depth) {
-				int slot = send_posted % o.depth;
+				int slot = send_posted % send_slots;
 				struct ibv_sge sge;
 				struct ibv_send_wr wr;
 				struct ibv_send_wr *bad = NULL;
@@ -1074,7 +1086,7 @@ int main(int argc, char **argv)
 
 		while (completed < o.count) {
 			while (posted < o.count && in_flight < o.depth) {
-				int slot = posted % o.depth;
+				int slot = posted % send_slots;
 				struct ibv_sge sge;
 				struct ibv_send_wr wr;
 				struct ibv_send_wr *bad = NULL;
