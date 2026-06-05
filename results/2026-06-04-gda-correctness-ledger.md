@@ -1018,8 +1018,114 @@ Interpretation:
    this pressure row across five runs.
 2. The ACK path now has the expected duplicate shape: every logical ACK is
    matched once and observed once more as a late duplicate.
-3. The old late-duplicate teardown wart did not appear here: `data_rx_no_qp=0`
+3. `data_rx_ack_miss=0` is not a lost-ACK metric; it only says no arriving ACKs
+   were unexplained orphans. Lost ACKs are visible through retransmit/timeout
+   behavior, not this counter.
+4. The old late-duplicate teardown wart did not appear here: `data_rx_no_qp=0`
    after userspace exit on both hosts.
-4. This does not prove the transport is reliable. It proves that the current
+5. This does not prove the transport is reliable. It proves that the current
    software ACK replication plus AMD E2E auto-disable survives this formerly
    failing GDA visibility row.
+
+## 2026-06-05 ACK-Loss Fault Injection
+
+Added a disabled-by-default kernel fault injector:
+
+```text
+native_ack_drop_every=0
+```
+
+When set to `N`, the receiver silently drops every Nth logical native OK
+SEND_ACK before the all-rail fan-out. This deliberately suppresses all rail
+copies for that ACK and returns success to the caller, modeling a transport
+loss rather than a local send error. Debugfs counters:
+
+```text
+data_tx_ack_drop_checked
+data_tx_ack_drop_injected
+```
+
+The first forced-loss attempts exposed a test-harness bug rather than a clean
+protocol result. With the original probe, the receiver exited as soon as the GPU
+observed all signals, even if the sender still had WRs pending because their
+ACKs had been dropped. That destroyed the receiver QP while the sender was
+still retransmitting, producing `data_rx_no_qp` on the receiver and hard resets
+on `strix-2` with no preserved previous-boot journal.
+
+Bad/stressful attempts:
+
+```text
+count=64 native_ack_drop_every=16 qp_timeout_ms=200
+receiver status=OK elapsed=0.721s
+receiver data_tx_ack_drop_checked=225 data_tx_ack_drop_injected=14
+receiver data_rx_duplicate_ack=97 data_rx_no_qp=119 data_rx_canceled=4096
+strix-2 hard reset around 04:19
+
+count=16 native_ack_drop_every=16 qp_timeout_ms=5000
+receiver status=OK elapsed=0.075s
+receiver data_tx_ack_drop_checked=33 data_tx_ack_drop_injected=2
+receiver data_rx_duplicate_ack=1 data_rx_no_qp=119
+strix-2 hard reset around 04:22
+```
+
+The HIP visibility probe was then fixed to include a final sender-completion
+fence: after sending all per-sequence GPU-visible ACKs, the receiver keeps its
+QP alive until the sender reports that all send completions have been observed
+or until the probe timeout expires.
+
+With that fenced probe, the single-drop validation passed:
+
+```text
+receiver:
+native_ack_drop_every=32 qp_timeout_ms=5000
+hip_rdma_write_visibility_probe --kind host-uncached --mode normal \
+  --size 65536 --count 16 --timeout-ms 30000
+
+send_result ... count=16 status=OK elapsed_sec=0.141131
+recv_result ... count=16 status=OK elapsed_sec=0.141199
+```
+
+Post-run counters:
+
+```text
+strix-1 receiver:
+data_tx_ack_ok=33
+data_tx_ack_drop_checked=33
+data_tx_ack_drop_injected=1
+native_tx_send_ack=64
+data_rx_duplicate_ack=1
+data_rx_ack_history_miss=0
+data_rx_no_qp=0
+data_tx_posted=73 data_tx_completed=73
+path_tx inflight=0 on all paths
+
+strix-2 sender:
+data_wr_send=32
+data_wr_retransmit=1
+data_wr_retry_enqueue_error=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=289 data_tx_completed=289
+data_rx_ack=64
+data_rx_ack_matched=32
+data_rx_ack_match_retried=1
+data_rx_ack_match_max_ms=138
+data_rx_ack_miss=0
+data_rx_late_ack=32
+data_rx_no_qp=0
+path_tx inflight=0 on all paths
+```
+
+Interpretation:
+
+1. The ACK-loss injector now gives a repeatable way to force the reliability
+   backstop.
+2. The receiver duplicate-PSN re-ack path worked for the injected lost ACK:
+   the WR completed after one retransmit and did not double-deliver to
+   userspace-visible state.
+3. The probe must keep the receiver QP alive until the sender has observed all
+   send completions; otherwise ACK-loss testing can turn into teardown-induced
+   `data_rx_no_qp` and sender reset instead of a protocol validation.
+4. The aggressive `qp_timeout_ms=200` run is not a correctness baseline. It is
+   a separate stress/failure case showing that retransmit storms and teardown
+   races can still be dangerous.
