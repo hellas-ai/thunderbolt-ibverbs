@@ -43,6 +43,39 @@ static void tbv_rel_build_ack(const struct tbv_rel_data_frame *frame,
 	ack->status = status;
 }
 
+static bool tbv_rel_rx_find_cached_ack(const struct tbv_rel_rx_op *rx,
+				       const struct tbv_rel_data_frame *frame,
+				       struct tbv_rel_ack_frame *ack)
+{
+	tbv_rel_u32 i;
+
+	for (i = 0; i < TBV_REL_ACK_HISTORY_SIZE; i++) {
+		const struct tbv_rel_rx_ack_history_entry *entry =
+			&rx->ack_history[i];
+
+		if (!entry->valid || entry->op_id != frame->op_id)
+			continue;
+		if (ack)
+			*ack = entry->ack;
+		return true;
+	}
+
+	return false;
+}
+
+static void tbv_rel_rx_store_cached_ack(struct tbv_rel_rx_op *rx,
+					const struct tbv_rel_ack_frame *ack)
+{
+	struct tbv_rel_rx_ack_history_entry *entry =
+		&rx->ack_history[rx->ack_history_next %
+				 TBV_REL_ACK_HISTORY_SIZE];
+
+	entry->valid = true;
+	entry->op_id = ack->op_id;
+	entry->ack = *ack;
+	rx->ack_history_next++;
+}
+
 int tbv_rel_tx_start(struct tbv_rel_tx_op *tx, tbv_rel_u64 conn_id,
 		     tbv_rel_u32 op_id, tbv_rel_u8 op,
 		     tbv_rel_u32 total_len, tbv_rel_u32 max_payload,
@@ -364,10 +397,10 @@ int tbv_rel_rx_on_data(struct tbv_rel_rx_op *rx,
 		return 0;
 	}
 
-	if (rx->accepted && frame->op_id == rx->op_id) {
+	if (!rx->active && tbv_rel_rx_find_cached_ack(rx, frame,
+						     &event->ack)) {
 		event->duplicate = true;
 		event->ack_valid = true;
-		event->ack = rx->cached_ack;
 		return 0;
 	}
 
@@ -406,6 +439,7 @@ int tbv_rel_rx_on_data(struct tbv_rel_rx_op *rx,
 		rx->active = false;
 		rx->completion_count++;
 		tbv_rel_build_ack(frame, TBV_REL_ACK_OK, &rx->cached_ack);
+		tbv_rel_rx_store_cached_ack(rx, &rx->cached_ack);
 		event->ack_valid = true;
 		event->ack = rx->cached_ack;
 		event->completion_valid = true;

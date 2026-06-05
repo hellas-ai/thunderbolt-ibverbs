@@ -92,6 +92,7 @@ static int test_partial_links_cannot_activate(void)
 	CHECK(tbv_cfg_link_set_backend(&link, TBV_CFG_BACKEND_NATIVE) == 0);
 	CHECK(tbv_cfg_link_seal(&link) == -EINVAL);
 	CHECK(tbv_cfg_link_set_route(&link, &route) == 0);
+	CHECK(tbv_cfg_link_set_app_gids(&link, NULL, 1) == -EINVAL);
 	CHECK(tbv_cfg_link_seal(&link) == -EINVAL);
 
 	return 0;

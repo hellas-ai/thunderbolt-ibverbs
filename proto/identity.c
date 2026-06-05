@@ -244,7 +244,8 @@ int tbv_id_validate_app_compat(const struct tbv_id_gid *gids,
 		return ret;
 
 	if (llama.device_id != nccl.device_id || llama.port != nccl.port ||
-	    llama.gid_index != nccl.gid_index)
+	    llama.gid_index != nccl.gid_index ||
+	    llama.gid_type != nccl.gid_type)
 		return -EXDEV;
 
 	if (selection)

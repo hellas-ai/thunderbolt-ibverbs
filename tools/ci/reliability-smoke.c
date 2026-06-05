@@ -155,6 +155,43 @@ static int test_rnr_is_not_success(void)
 	return 0;
 }
 
+static int test_old_completed_op_retransmit_replays_ack(void)
+{
+	struct tbv_rel_rx_op rx;
+	struct tbv_rel_data_frame op5 = {
+		.conn_id = 0x5757,
+		.op_id = 5,
+		.offset = 0,
+		.length = 8,
+		.frag_index = 0,
+		.frag_count = 1,
+		.op = TBV_REL_OP_SEND,
+	};
+	struct tbv_rel_data_frame op6 = op5;
+	struct tbv_rel_rx_event event;
+
+	op6.op_id = 6;
+	tbv_rel_rx_init(&rx, 0x5757, 16);
+
+	CHECK(tbv_rel_rx_on_data(&rx, &op5, true, &event) == 0);
+	CHECK(event.ack_valid && event.completion_valid);
+	CHECK(event.completion.op_id == 5);
+	CHECK(rx.completion_count == 1);
+
+	CHECK(tbv_rel_rx_on_data(&rx, &op6, true, &event) == 0);
+	CHECK(event.ack_valid && event.completion_valid);
+	CHECK(event.completion.op_id == 6);
+	CHECK(rx.completion_count == 2);
+
+	CHECK(tbv_rel_rx_on_data(&rx, &op5, true, &event) == 0);
+	CHECK(event.duplicate && event.ack_valid);
+	CHECK(event.ack.op_id == 5);
+	CHECK(!event.completion_valid);
+	CHECK(rx.completion_count == 2);
+
+	return 0;
+}
+
 static int test_verbs_rnr_retry_7_is_infinite(void)
 {
 	struct tbv_rel_tx_op tx;
@@ -602,6 +639,7 @@ int main(void)
 	CHECK(test_lost_middle_fragment_retry_exactly_once() == 0);
 	CHECK(test_stale_connection_id_ignored() == 0);
 	CHECK(test_rnr_is_not_success() == 0);
+	CHECK(test_old_completed_op_retransmit_replays_ack() == 0);
 	CHECK(test_verbs_rnr_retry_7_is_infinite() == 0);
 	CHECK(test_wrap_safe_sequence_helpers() == 0);
 	CHECK(test_retry_interval_uses_retry_budget() == 0);

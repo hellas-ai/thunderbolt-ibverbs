@@ -95,7 +95,7 @@ int tbv_cfg_link_set_app_gids(struct tbv_cfg_link *link,
 {
 	if (!tbv_cfg_link_mutable(link))
 		return -EBUSY;
-	if (gid_count == 0 || gid_count > TBV_CFG_MAX_APP_GIDS)
+	if (!gids || gid_count == 0 || gid_count > TBV_CFG_MAX_APP_GIDS)
 		return -EINVAL;
 
 	memcpy(link->app_gids, gids, sizeof(*gids) * gid_count);

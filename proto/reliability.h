@@ -20,6 +20,7 @@ typedef uint64_t tbv_rel_u64;
 #endif
 
 #define TBV_REL_MAX_FRAGS 64u
+#define TBV_REL_ACK_HISTORY_SIZE 16u
 #define TBV_REL_ORDER_MAX 128u
 #define TBV_REL_RETRY_INFINITE ((tbv_rel_u32)~0u)
 #define TBV_REL_VERBS_RNR_RETRY_INFINITE 7u
@@ -105,6 +106,12 @@ struct tbv_rel_tx_op {
 	tbv_rel_u8 state;
 };
 
+struct tbv_rel_rx_ack_history_entry {
+	bool valid;
+	tbv_rel_u32 op_id;
+	struct tbv_rel_ack_frame ack;
+};
+
 struct tbv_rel_rx_op {
 	tbv_rel_u64 conn_id;
 	tbv_rel_u32 max_payload;
@@ -113,8 +120,10 @@ struct tbv_rel_rx_op {
 	tbv_rel_u32 frame_count;
 	tbv_rel_u32 received_count;
 	tbv_rel_u32 completion_count;
+	tbv_rel_u32 ack_history_next;
 	tbv_rel_u64 received_bitmap;
 	struct tbv_rel_ack_frame cached_ack;
+	struct tbv_rel_rx_ack_history_entry ack_history[TBV_REL_ACK_HISTORY_SIZE];
 	tbv_rel_u8 op;
 	bool active;
 	bool accepted;

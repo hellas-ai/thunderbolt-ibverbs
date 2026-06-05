@@ -503,7 +503,7 @@ def fatal_counter_details(label: str, counters: dict[str, int]) -> list[str]:
     details = []
     for name in FATAL_COUNTERS:
         value = counters.get(name, 0)
-        if value:
+        if value > 0:
             details.append(f"{label}.{name}+{value}")
     return details
 

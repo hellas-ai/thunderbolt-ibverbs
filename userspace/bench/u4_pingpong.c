@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <limits.h>
 #include <unistd.h>
 #include <time.h>
 #include <stdint.h>
@@ -32,6 +33,10 @@ static struct ibv_context *open_dev(void)
 	int n, i;
 	struct ibv_device **list = ibv_get_device_list(&n);
 	struct ibv_context *ctx = NULL;
+
+	if (!list)
+		return NULL;
+
 	for (i = 0; i < n; i++) {
 		const char *name = ibv_get_device_name(list[i]);
 
@@ -118,31 +123,54 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "unknown mode: %s\n", argv[1]);
 		return 1;
 	}
-	int iters = atoi(argv[2]);
-	size_t size = atol(argv[3]);
-	if (size > 1u << 24) { fprintf(stderr, "max size 16 MiB\n"); return 1; }
+
+	char *end = NULL;
+	errno = 0;
+	long parsed_iters = strtol(argv[2], &end, 10);
+	if (errno || end == argv[2] || *end || parsed_iters <= 0 ||
+	    parsed_iters > INT_MAX) {
+		fprintf(stderr, "iters must be an integer in [1, %d]\n",
+			INT_MAX);
+		return 1;
+	}
+	int iters = (int)parsed_iters;
+
+	errno = 0;
+	end = NULL;
+	unsigned long parsed_size = strtoul(argv[3], &end, 10);
+	if (errno || end == argv[3] || *end || parsed_size == 0 ||
+	    parsed_size > (1UL << 24)) {
+		fprintf(stderr, "size must be an integer in [1, 16777216]\n");
+		return 1;
+	}
+	size_t size = (size_t)parsed_size;
 
 	struct ibv_context *ctx = open_dev();
 	if (!ctx) { fprintf(stderr, "no usb4_rdma0\n"); return 1; }
 
 	struct ibv_pd *pd = ibv_alloc_pd(ctx);
+	if (!pd) { perror("ibv_alloc_pd"); return 1; }
 	/* POSTED recv slots + 1 send slot at offset send_off, all size bytes. */
 	#define POSTED 32
 	size_t send_off = ((POSTED * size + 4095) & ~4095UL);
 	size_t bufsz = ((send_off + size + 4095) & ~4095UL);
 	if (bufsz < 65536) bufsz = 65536;
 	char *buf = aligned_alloc(4096, bufsz);
+	if (!buf) { perror("aligned_alloc"); return 1; }
 	memset(buf, 0, bufsz);
 	memset(buf + send_off, (is_client || is_source) ? 0xc3 : 0x5a, size);
 	struct ibv_mr *mr = ibv_reg_mr(pd, buf, bufsz,
 				       IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE);
+	if (!mr) { perror("ibv_reg_mr"); return 1; }
 	struct ibv_cq *cq = ibv_create_cq(ctx, 64, NULL, NULL, 0);
+	if (!cq) { perror("ibv_create_cq"); return 1; }
 	struct ibv_qp_init_attr qa = {
 		.send_cq=cq, .recv_cq=cq,
 		.cap = {.max_send_wr=64, .max_recv_wr=64, .max_send_sge=1, .max_recv_sge=1 },
 		.qp_type=IBV_QPT_RC,
 	};
 	struct ibv_qp *qp = ibv_create_qp(pd, &qa);
+	if (!qp) { perror("ibv_create_qp"); return 1; }
 	int rv = qp_to_rts(ctx, qp);
 	if (rv) { fprintf(stderr, "qp_to_rts: %d (%s)\n", rv, strerror(rv)); return 2; }
 
@@ -155,7 +183,11 @@ int main(int argc, char **argv) {
 		rwr.wr_id = 0x1000 + i;
 		rsge.addr = (uintptr_t)buf + i * size;
 		rwr.sg_list = &rsge;
-		ibv_post_recv(qp, &rwr, &bad);
+		rv = ibv_post_recv(qp, &rwr, &bad);
+		if (rv) {
+			fprintf(stderr, "initial post_recv i=%d: %d\n", i, rv);
+			return 2;
+		}
 	}
 
 	long *latencies = (is_client || is_source) ? calloc(iters, sizeof(*latencies)) : NULL;

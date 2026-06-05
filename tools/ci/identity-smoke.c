@@ -120,6 +120,24 @@ static int test_duplicate_gid_on_same_endpoint_prefers_rocev2(void)
 	return 0;
 }
 
+static int test_app_compat_rejects_gid_type_mismatch(void)
+{
+	struct tbv_id_gid gids[] = {
+		mk_gid(4, 1, 1, TBV_ID_GID_ROCE_V1, 10, 0, 4, 2),
+		mk_gid(4, 1, 1, TBV_ID_GID_ROCE_V2, 10, 0, 4, 2),
+	};
+	struct tbv_id_route route = mk_route(10, 0, 5, 2, 10, 0, 4, 2);
+	struct tbv_id_nccl_policy nccl;
+	struct tbv_id_selection sel;
+
+	tbv_id_nccl_policy_default(&nccl);
+	nccl.roce_version = 1;
+	CHECK(tbv_id_validate_app_compat(gids, 2, &route, &nccl, &sel) ==
+	      -EXDEV);
+
+	return 0;
+}
+
 static int test_nccl_requires_global_rocev2_by_default(void)
 {
 	static const tbv_id_u8 link_local[TBV_ID_ADDR_BYTES] = {
@@ -148,6 +166,7 @@ int main(void)
 	CHECK(test_current_bridge_shape_is_ambiguous() == 0);
 	CHECK(test_nccl_addr_range_is_not_enough_for_llama() == 0);
 	CHECK(test_duplicate_gid_on_same_endpoint_prefers_rocev2() == 0);
+	CHECK(test_app_compat_rejects_gid_type_mismatch() == 0);
 	CHECK(test_nccl_requires_global_rocev2_by_default() == 0);
 
 	puts("identity smoke OK");
