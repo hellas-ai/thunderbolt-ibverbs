@@ -2395,25 +2395,30 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 		tqp->recvq_size = init_attr->cap.max_recv_wr;
 	}
 
-	if (tbv_backend_is_apple(tqp->backend) &&
-	    READ_ONCE(apple_rx_pending_bytes) &&
-	    READ_ONCE(apple_rx_pending_total_bytes)) {
+	if (tbv_backend_is_apple(tqp->backend)) {
 		u32 slots = min_t(u32, READ_ONCE(apple_rx_pending_slots),
 				  TBV_APPLE_PENDING_RX_MAX_SLOTS);
 
-		if (slots) {
-			tqp->apple_pending =
-				kvcalloc(slots, sizeof(*tqp->apple_pending),
-					 GFP_KERNEL);
-			if (!tqp->apple_pending) {
-				kfree(tqp->recvq);
-				if (!gsi)
-					ida_free(&tbv_qpn_ida, qpn);
-				ret = -ENOMEM;
-				goto err_put_rail;
-			}
-			tqp->apple_pending_slot_count = slots;
+		if (!slots || !READ_ONCE(apple_rx_pending_bytes) ||
+		    !READ_ONCE(apple_rx_pending_total_bytes)) {
+			kfree(tqp->recvq);
+			if (!gsi)
+				ida_free(&tbv_qpn_ida, qpn);
+			ret = -EINVAL;
+			goto err_put_rail;
 		}
+
+		tqp->apple_pending =
+			kvcalloc(slots, sizeof(*tqp->apple_pending),
+				 GFP_KERNEL);
+		if (!tqp->apple_pending) {
+			kfree(tqp->recvq);
+			if (!gsi)
+				ida_free(&tbv_qpn_ida, qpn);
+			ret = -ENOMEM;
+			goto err_put_rail;
+		}
+		tqp->apple_pending_slot_count = slots;
 	}
 
 	tqp->init_attr = *init_attr;
@@ -5244,24 +5249,6 @@ static void tbv_apple_rx_drain_pending_locked(struct tbv_state *state,
 	}
 }
 
-static int tbv_apple_rx_copy_piece(struct tbv_state *state,
-				   const struct tbv_recv_wqe *wqe,
-				   u32 dst_off, const void *src, u32 len,
-				   u32 *delivered, u32 *user_len)
-{
-	int ret;
-
-	if (!len)
-		return 0;
-
-	ret = tbv_rx_copy_to_wqe(state, wqe, dst_off + *user_len, src, len,
-				 delivered);
-	if (ret)
-		return ret;
-	*user_len += len;
-	return 0;
-}
-
 static int tbv_apple_rx_copy_piece_to_buf(struct tbv_qp *tqp,
 					  struct tbv_apple_pending_rx *p,
 					  const void *src, u32 len,
@@ -5333,28 +5320,6 @@ static int tbv_apple_rx_wire_user_len(u32 len, u8 eof, u32 *user_len)
 	return 0;
 }
 
-static int tbv_apple_rx_copy_frame(struct tbv_state *state,
-				   const struct tbv_recv_wqe *wqe,
-				   u32 dst_off, const void *payload, u32 len,
-				   u8 eof, u32 *delivered,
-				   u32 *out_user_len)
-{
-	int ret;
-	u32 copy_len;
-	u32 user_len = 0;
-
-	ret = tbv_apple_rx_wire_user_len(len, eof, &copy_len);
-	if (ret)
-		return ret;
-
-	ret = tbv_apple_rx_copy_piece(state, wqe, dst_off, payload, copy_len,
-				      delivered, &user_len);
-	if (ret)
-		return ret;
-	*out_user_len = user_len;
-	return 0;
-}
-
 static int tbv_apple_rx_copy_frame_to_buf(struct tbv_qp *tqp,
 					  struct tbv_apple_pending_rx *p,
 					  const void *payload, u32 len, u8 eof,
@@ -5380,9 +5345,8 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 			      const struct tbv_path *path,
 			      const void *payload, u32 len, u8 sof, u8 eof)
 {
-	struct tbv_rx_message *msg;
+	struct tbv_apple_pending_rx *pending;
 	struct tbv_qp *tqp;
-	bool terminal;
 	bool raw_rx;
 	u32 qpn;
 	u32 user_len = 0;
@@ -5411,92 +5375,45 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 	}
 
 	mutex_lock(&tqp->rx_lock);
-	msg = &tqp->rx_msg;
-	if (!msg->active && tqp->apple_pending_ready_count)
+	if (tqp->apple_pending_ready_count)
 		tbv_apple_rx_drain_pending_locked(state, tqp);
+	if (sof && tqp->apple_pending_active >= 0)
+		atomic64_inc(&state->apple_rx_sof_while_active);
+	if (tqp->apple_pending_active < 0 && !sof && !raw_rx) {
+		atomic64_inc(&state->apple_rx_no_sof_when_idle);
+		atomic64_inc(&state->data_rx_bad_frame);
+		mutex_unlock(&tqp->rx_lock);
+		tbv_qp_put(tqp);
+		return;
+	}
+
+	pending = tbv_apple_pending_active_locked(state, tqp);
+	if (!pending) {
+		atomic64_inc(&state->data_rx_no_recv);
+		atomic64_inc(&state->data_rx_reorder_dropped);
+		mutex_unlock(&tqp->rx_lock);
+		tbv_qp_put(tqp);
+		return;
+	}
+
 	if (tbv_apple_rx_trace_take())
-		pr_info("apple rx qpn=%u sof=%u eof=%u len=%u active=%u received=%u delivered=%u wqe_len=%u recv_count=%u pending_active=%d pending_ready=%u\n",
-			qpn, sof, eof, len, msg->active, msg->received,
-			msg->delivered, msg->active ? msg->wqe.length : 0,
+		pr_info("apple rx qpn=%u sof=%u eof=%u len=%u pending_len=%u recv_count=%u pending_active=%d pending_ready=%u\n",
+			qpn, sof, eof, len, pending->delivered,
 			tqp->recv_count, tqp->apple_pending_active,
 			tqp->apple_pending_ready_count);
-	if (sof && (msg->active || tqp->apple_pending_active >= 0))
-		atomic64_inc(&state->apple_rx_sof_while_active);
-	if (!msg->active) {
-		struct tbv_apple_pending_rx *pending = NULL;
 
-		if (tqp->apple_pending_active >= 0) {
-			pending = tbv_apple_pending_active_locked(state, tqp);
-		} else if (!sof && !raw_rx) {
-			atomic64_inc(&state->apple_rx_no_sof_when_idle);
-		}
-
-		/*
-		 * If a frame arrived before userspace posted a receive WQE, keep
-		 * the whole Apple message in the pending assembler until EOF.
-		 * Switching to a newly posted WQE mid-message corrupts the
-		 * message boundary: the prefix stays in the deferred buffer and
-		 * the suffix is completed as a separate receive.
-		 */
-		if (!pending && !tbv_qp_pop_recv(tqp, &msg->wqe)) {
-			pending = tbv_apple_pending_active_locked(state, tqp);
-			if (!pending) {
-				atomic64_inc(&state->data_rx_no_recv);
-				atomic64_inc(&state->data_rx_reorder_dropped);
-				mutex_unlock(&tqp->rx_lock);
-				tbv_qp_put(tqp);
-				return;
-			}
-		}
-
-		if (pending) {
-			ret = tbv_apple_rx_copy_frame_to_buf(tqp, pending,
-							     payload, len,
-							     eof,
-							     &user_len);
-			if (ret) {
-				atomic64_inc(&state->data_rx_bad_frame);
-				pending->status = (ret == -EMSGSIZE ||
-						   ret == -ENOSPC) ?
-					IB_WC_LOC_LEN_ERR : IB_WC_LOC_PROT_ERR;
-			}
-			if (eof == 3) {
-				tbv_apple_pending_finish_locked(tqp);
-				tbv_apple_rx_drain_pending_locked(state, tqp);
-			}
-			mutex_unlock(&tqp->rx_lock);
-			tbv_qp_put(tqp);
-			return;
-		}
-		msg->active = true;
-		msg->src_qp = tqp->attr.dest_qp_num;
-		msg->status = IB_WC_SUCCESS;
-	}
-
-	ret = tbv_apple_rx_copy_frame(state, &msg->wqe, msg->received,
-				      payload, len, eof, &msg->delivered,
-				      &user_len);
+	ret = tbv_apple_rx_copy_frame_to_buf(tqp, pending, payload, len, eof,
+					     &user_len);
 	if (ret) {
 		atomic64_inc(&state->data_rx_bad_frame);
-		msg->status = IB_WC_LOC_PROT_ERR;
+		pending->status = (ret == -EMSGSIZE || ret == -ENOSPC) ?
+			IB_WC_LOC_LEN_ERR : IB_WC_LOC_PROT_ERR;
 	}
 
-	msg->received += user_len;
-	if (msg->received > msg->wqe.length) {
-		msg->status = IB_WC_LOC_LEN_ERR;
-		atomic64_inc(&state->apple_rx_len_overrun);
-	}
-
-	terminal = eof == 3 ||
-		   (eof == 2 && msg->active &&
-		    msg->received >= msg->wqe.length);
-	if (terminal) {
-		tbv_apple_rx_push_wc(tqp, &msg->wqe, msg->delivered,
-				     msg->status);
-		memset(msg, 0, sizeof(*msg));
-		atomic64_inc(&state->data_rx_send);
-		atomic64_inc(&state->data_rx_op_send);
-	} else if (!msg->active) {
+	if (eof == 3) {
+		tbv_apple_pending_finish_locked(tqp);
+		tbv_apple_rx_drain_pending_locked(state, tqp);
+	} else if (!pending->active) {
 		atomic64_inc(&state->apple_rx_eof_without_active);
 	}
 	mutex_unlock(&tqp->rx_lock);
@@ -6219,12 +6136,10 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 			    size_t len)
 {
 	struct sg_table *sgt = &mr->umem->sgt_append.sgt;
-	struct scatterlist *sg;
 	size_t offset;
-	size_t copied = 0;
+	size_t copied;
 	u64 mr_end;
 	u64 end;
-	unsigned int i;
 
 	if (!len)
 		return 0;
@@ -6238,46 +6153,9 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 		return -EFAULT;
 
 	offset = ib_umem_offset(mr->umem) + addr - mr->start;
-	for_each_sgtable_sg(sgt, sg, i) {
-		size_t seg_len = sg->length;
-		size_t seg_off;
-
-		if (offset >= seg_len) {
-			offset -= seg_len;
-			continue;
-		}
-
-		seg_off = sg->offset + offset;
-		seg_len -= offset;
-		offset = 0;
-
-		while (seg_len && copied < len) {
-			struct page *page;
-			size_t page_off = offset_in_page(seg_off);
-			size_t chunk = min_t(size_t, PAGE_SIZE - page_off,
-					     seg_len);
-			void *kaddr;
-
-			chunk = min_t(size_t, chunk, len - copied);
-
-			page = pfn_to_page(page_to_pfn(sg_page(sg)) +
-					   (seg_off >> PAGE_SHIFT));
-			kaddr = kmap_local_page(page);
-			memcpy((u8 *)kaddr + page_off, (const u8 *)src + copied,
-			       chunk);
-			flush_dcache_page(page);
-			kunmap_local(kaddr);
-
-			copied += chunk;
-			seg_off += chunk;
-			seg_len -= chunk;
-		}
-
-		if (copied == len)
-			return 0;
-	}
-
-	return -EFAULT;
+	copied = sg_pcopy_from_buffer(sgt->sgl, sgt->orig_nents, src, len,
+				      offset);
+	return copied == len ? 0 : -EFAULT;
 }
 
 static int tbv_umem_copy_to_iova(struct tbv_mr *mr, u64 iova,

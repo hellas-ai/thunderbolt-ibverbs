@@ -1177,7 +1177,15 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 		e2e_tx_hop = path->tx_ring->hop;
 
 	path->tx_poll_enabled = tbv_path_progress_poll_enabled(path);
-	path->rx_supp_poll_enabled = path->tx_poll_enabled;
+	/*
+	 * RX frames for the Apple-compatible verbs path carry no per-message
+	 * sequence number. Processing the same RX ring from the normal
+	 * completion path and a supplemental poller can therefore expose later
+	 * frames to the verbs receive queue before earlier frames. Keep RX
+	 * completion single-sourced; TX polling is still used for timely send
+	 * completions.
+	 */
+	path->rx_supp_poll_enabled = false;
 	path->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, rx_hop,
 					 path->cfg.rx_ring_size,
 					 path->cfg.rx_flags, e2e_tx_hop,
