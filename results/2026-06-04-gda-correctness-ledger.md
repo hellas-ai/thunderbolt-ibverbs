@@ -1877,3 +1877,108 @@ receiver data_rx_canceled=0
 
 Interpretation: after the hostile unfenced rows, the clean fast path still
 behaves normally and the live hosts were left with ACK injection disabled.
+
+### Follow-Up: Sender Guard Counters and Tombstone Bounds
+
+Code hardening after reviewing the first tombstone series:
+
+```text
+- tombstone expiry is now bounded by the destroyed QP's actual retry window:
+  max(30s, tx_timeout * (max_retries + 2)).
+- the 128-entry tombstone cap now increments data_qp_tombstone_evicted and logs
+  the evicted QPN pair when the cap forces early eviction.
+```
+
+Important timeout nuance:
+
+```text
+qp_timeout_ms=200 was set in the stress rows, but this RC probe sets verbs
+attr.timeout=14. Therefore the operative send ACK timeout is the verbs value,
+about 67ms, not the fallback module parameter. The dmesg retransmit ages
+around 70-73ms confirm this.
+```
+
+Retry/tombstone bound:
+
+```text
+TBV_SEND_MAX_RETRIES=7
+tbv_rel_retry_interval(timeout, retries) == timeout
+
+For the RC probe:
+  verbs timeout 14 => ~67ms
+  tombstone lifetime=max(30s, 9 * 67ms) = 30s
+
+For a QP using the default fallback:
+  qp_timeout_ms=5000
+  tombstone lifetime=max(30s, 9 * 5000ms) = 45s
+
+For the explicit fallback setting used in stress if a QP did not set verbs
+timeout:
+  qp_timeout_ms=200
+  tombstone lifetime=max(30s, 9 * 200ms) = 30s
+```
+
+Explicit post-bound trigger row:
+
+```text
+count=256 timeout_ms=60000 native_tx_max_inflight=6 qp_timeout_ms=200
+receiver native_ack_drop_every=2
+final_fence=0
+port=18550
+sender:   status=OK elapsed_sec=18.432606
+receiver: status=OK elapsed_sec=18.358310
+booted strix-1=/nix/store/3h21xhxiyj85kvxgzna16y9lv1fi9zgf-nixos-system-strix-1-26.11pre-git
+booted strix-2=/nix/store/jq5vzd96alzf4wx8pcp2mw57s7y2r5qy-nixos-system-strix-2-26.11pre-git
+```
+
+Sender (`strix-2`) counters:
+
+```text
+data_wr_send=512
+data_wr_retransmit=256
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_wr_retry_enqueue_error=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=7010 data_tx_completed=7010 data_tx_errors=0
+data_rx_completed=3134 data_rx_canceled=0
+data_rx_ack=2903 data_rx_ack_matched=669
+data_rx_ack_match_retried=256 data_rx_late_ack=2234
+data_rx_ack_miss=0
+data_qp_tombstone_evicted=0
+```
+
+Receiver (`strix-1`) counters:
+
+```text
+data_tx_ack_ok=2914
+data_tx_ack_drop_checked=2897 data_tx_ack_drop_injected=1448
+data_rx_duplicate_ack=2385
+data_rx_ack_history_miss=0
+data_rx_no_qp=17
+data_rx_no_qp_reack=17
+data_rx_no_qp_error_ack=0
+data_qp_tombstone_evicted=0
+data_tx_posted=3134 data_tx_completed=3134 data_tx_errors=0
+data_rx_completed=7010 data_rx_canceled=0
+```
+
+Pstore was empty on both hosts. Netconsole recorded only deliberate markers
+plus unrelated USB messages; no panic/oops/watchdog output.
+
+Interpretation:
+
+1. The sender-side teardown guards did **not** fire in this row, nor in the
+   earlier `count=1024` row. Therefore the sender guard is instrumented
+   coverage for the plausible crash path, but it is not yet demonstrated as the
+   crash-fixing path. The precise statement is: sender teardown guard
+   counters remained zero while the workload passed.
+2. The receiver tombstone path is the directly exercised fix: all 17 no-QP
+   post-destroy arrivals were re-acked from tombstone history, with no history
+   misses, no error ACKs, and no evictions.
+3. The old `data_rx_canceled=4096` signature still has not reappeared after the
+   tombstone fix and dynamic lifetime/cap instrumentation, but without a fired
+   sender guard or crash stack it remains a latent lower-frequency concern
+   rather than a proven fixed sender-side race.
