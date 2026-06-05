@@ -1129,3 +1129,606 @@ Interpretation:
 4. The aggressive `qp_timeout_ms=200` run is not a correctness baseline. It is
    a separate stress/failure case showing that retransmit storms and teardown
    races can still be dangerous.
+
+## 2026-06-05 NixOS Retest After Strix LAN/Deployment Fixes
+
+Host deployment changes before retest:
+
+```text
+nixos-config:
+- strix-1/strix-2 LAN now uses eno1 directly; br0.lan removed.
+- thunderbolt-ibverbs roce_netdev=eno1.
+- netconsole sender enabled on eno1 for both Strix hosts.
+- crashDump enabled with crashkernel=512M.
+- thunderbolt-ibverbs-kernel lock overridden to the local
+  thunderbolt-ibverbs-gda-iommu-revive branch.
+- tbv-hip-gda-probes included in the Strix system profile.
+```
+
+Verification:
+
+```text
+strix-1 eno1: 192.168.23.136/24, netconsole-sender active
+strix-2 eno1: 192.168.23.192/24, netconsole-sender active
+hip_rdma_write_visibility_probe present on both hosts
+module params present: native_e2e, native_tx_max_inflight,
+  native_ack_drop_every, qp_timeout_ms
+```
+
+Netconsole was tested with emergency `/dev/kmsg` markers from both hosts; both
+arrived on the local UDP listener. During the GDA retests below, the only
+netconsole lines were those two deliberate test markers.
+
+All tests used:
+
+```text
+native_e2e=-1
+native_tx_max_inflight=6
+roce_netdev=eno1
+receiver=strix-1
+sender=strix-2
+dev=usb4_rdma0 gid-index=1 kind=host-uncached mode=normal size=65536
+```
+
+Fresh clean pressure-row baseline:
+
+```text
+count=256 timeout_ms=15000 native_ack_drop_every=0 qp_timeout_ms=5000
+send_result status=OK elapsed_sec=0.053407
+recv_result status=OK elapsed_sec=0.053490
+```
+
+Counters:
+
+```text
+strix-1 receiver:
+data_tx_ack_ok=512 native_tx_send_ack=1024
+data_tx_posted=1168 data_tx_completed=1168
+data_rx_completed=4608 data_rx_canceled=0 data_rx_repost_failed=0
+data_rx_bad_frame=0 data_rx_bad_header=0
+data_rx_no_qp=0 data_rx_bad_peer=0 data_rx_unconnected_qp=0
+path_tx inflight=0 on all paths
+
+strix-2 sender:
+data_wr_send=512 data_wr_retransmit=0 data_wr_timeout=0
+data_tx_posted=4608 data_tx_completed=4608
+data_rx_ack=1024 data_rx_ack_matched=512 data_rx_late_ack=512
+data_rx_ack_match_max_ms=3 data_rx_ack_miss=0
+data_rx_canceled=0 data_rx_repost_failed=0 data_rx_no_qp=0
+path_tx inflight=0 on all paths
+```
+
+Single forced ACK-loss validation on the redeployed system:
+
+```text
+count=16 timeout_ms=30000 native_ack_drop_every=32 qp_timeout_ms=5000
+send_result status=OK elapsed_sec=0.075117
+recv_result status=OK elapsed_sec=0.075238
+```
+
+Counters:
+
+```text
+strix-1 receiver:
+data_tx_ack_ok=33
+data_tx_ack_drop_checked=33 data_tx_ack_drop_injected=1
+native_tx_send_ack=64
+data_rx_duplicate_ack=1 data_rx_ack_history_miss=0
+data_rx_no_qp=0 data_rx_canceled=0 data_rx_repost_failed=0
+data_tx_posted=73 data_tx_completed=73
+path_tx inflight=0 on all paths
+
+strix-2 sender:
+data_wr_send=32 data_wr_retransmit=1 data_wr_timeout=0
+data_wr_retry_enqueue_error=0 data_wr_retry_exhausted=0
+data_tx_posted=289 data_tx_completed=289
+data_rx_ack=64 data_rx_ack_matched=32 data_rx_late_ack=32
+data_rx_ack_match_retried=1 data_rx_ack_match_max_ms=71
+data_rx_ack_miss=0 data_rx_no_qp=0 data_rx_canceled=0
+path_tx inflight=0 on all paths
+```
+
+Moderate retransmit stress:
+
+```text
+count=64 timeout_ms=30000 native_ack_drop_every=8 qp_timeout_ms=5000
+send_result status=OK elapsed_sec=1.299223
+recv_result status=OK elapsed_sec=1.299278
+```
+
+Counters:
+
+```text
+strix-1 receiver:
+data_tx_ack_ok=290
+data_tx_ack_drop_checked=290 data_tx_ack_drop_injected=36
+native_tx_send_ack=508
+data_rx_duplicate_ack=162 data_rx_ack_history_miss=0
+data_rx_no_qp=0 data_rx_canceled=0 data_rx_repost_failed=0
+data_tx_posted=549 data_tx_completed=549
+path_tx inflight=0 on all paths
+
+strix-2 sender:
+data_wr_send=128 data_wr_retransmit=18 data_wr_timeout=0
+data_wr_retry_enqueue_error=0 data_wr_retry_exhausted=0
+data_tx_posted=1314 data_tx_completed=1314
+data_rx_ack=508 data_rx_ack_matched=137 data_rx_late_ack=371
+data_rx_ack_match_retried=18 data_rx_ack_match_max_ms=74
+data_rx_ack_miss=0 data_rx_no_qp=0 data_rx_canceled=0
+path_tx inflight=0 on all paths
+```
+
+Old hard-reset parameter row replayed with the fenced probe:
+
+```text
+count=64 timeout_ms=30000 native_ack_drop_every=16 qp_timeout_ms=200
+send_result status=OK elapsed_sec=0.719094
+recv_result status=OK elapsed_sec=0.719143
+```
+
+Counters:
+
+```text
+strix-1 receiver:
+data_tx_ack_ok=199
+data_tx_ack_drop_checked=199 data_tx_ack_drop_injected=12
+native_tx_send_ack=374
+data_rx_duplicate_ack=71 data_rx_ack_history_miss=0
+data_rx_no_qp=0 data_rx_canceled=0 data_rx_repost_failed=0
+data_tx_posted=412 data_tx_completed=412
+path_tx inflight=0 on all paths
+
+strix-2 sender:
+data_wr_send=128 data_wr_retransmit=10 data_wr_timeout=0
+data_wr_retry_enqueue_error=0 data_wr_retry_exhausted=0
+data_tx_posted=1223 data_tx_completed=1223
+data_rx_ack=374 data_rx_ack_matched=133 data_rx_late_ack=241
+data_rx_ack_match_retried=10 data_rx_ack_match_max_ms=72
+data_rx_ack_miss=0 data_rx_no_qp=0 data_rx_canceled=0
+path_tx inflight=0 on all paths
+```
+
+Interpretation:
+
+1. The redeployed GDA correctness branch reproduces the previous green baseline:
+   AMD native E2E auto-disables to `path_cfg e2e=0`, ACK fan-out is 2x, and the
+   former pressure row passes with no retransmits or teardown artifacts.
+2. The forced-loss backstop now survives more than the single-drop toy case.
+   `drop_every=8` drove 36 injected logical ACK drops and 18 sender
+   retransmits, all completing without timeout, retry exhaustion, RX cancel,
+   or QP teardown fallout.
+3. Replaying the old hard-reset parameters with the fenced probe passed, so
+   `qp_timeout_ms=200` retransmit pressure alone was not sufficient to crash
+   this build.
+4. This does not resolve the unfenced crash. The fenced probe is a test control:
+   it avoids the legal peer-teardown-during-retransmit condition. The kernel
+   still needs an unfenced capture run before claiming that arbitrary peer/QP
+   teardown is crash-proof.
+
+## 2026-06-05 Reusable Crash Capture + Unfenced Retest
+
+NixOS capture setup added/redeployed:
+
+```text
+trex:
+- netconsole collector switched on and persistent:
+  /var/log/netconsole/strix.log
+
+strix-1/strix-2:
+- netconsole sender remains on eno1.
+- sconfig.ramoops enabled with reserved RAM:
+  memmap=2M$0x205d000000
+  ramoops.mem_address=0x205d000000
+  ramoops.mem_size=0x200000
+  ramoops.record_size=0x40000
+- efi_pstore disabled so ramoops can own the singleton pstore backend:
+  efi_pstore.pstore_disable=1
+  pstore.backend=ramoops
+```
+
+Post-reboot verification:
+
+```text
+strix-1:
+pstore.backend=ramoops
+efi_pstore.pstore_disable=Y
+pstore: Registered ramoops as persistent store backend
+ramoops: using 0x200000@0x205d000000, ecc: 16
+
+strix-2:
+pstore.backend=ramoops
+efi_pstore.pstore_disable=Y
+pstore: Registered ramoops as persistent store backend
+ramoops: using 0x200000@0x205d000000, ecc: 16
+```
+
+The HIP visibility probe now has an explicit unsafe mode:
+
+```text
+--unsafe-no-final-fence
+```
+
+This skips the sender-to-receiver final completion fence and makes the teardown
+condition visible in logs as `final_fence=0`.
+
+Unfenced replay of the old hard-reset row:
+
+```text
+count=64 timeout_ms=30000 native_ack_drop_every=16 qp_timeout_ms=200
+final_fence=0
+send_result status=OK elapsed_sec=0.579185
+recv_result status=OK elapsed_sec=0.579171
+```
+
+Counters:
+
+```text
+strix-1 receiver:
+data_tx_ack_ok=200
+data_tx_ack_drop_checked=200 data_tx_ack_drop_injected=12
+data_rx_duplicate_ack=72
+data_tx_posted=414 data_tx_completed=414 data_tx_errors=0
+data_rx_completed=1224 data_rx_canceled=0
+
+strix-2 sender:
+data_wr_send=128 data_wr_retransmit=8 data_wr_timeout=0
+data_wr_retry_enqueue_error=0 data_wr_retry_exhausted=0
+data_tx_posted=1224 data_tx_completed=1224 data_tx_errors=0
+data_rx_completed=414 data_rx_canceled=0
+data_rx_ack=376 data_rx_ack_matched=132
+data_rx_ack_match_retried=8 data_rx_late_ack=244
+data_rx_ack_miss=0
+```
+
+Higher-loss unfenced stress:
+
+```text
+count=256 timeout_ms=60000 native_ack_drop_every=4 qp_timeout_ms=200
+final_fence=0
+send_result status=OK elapsed_sec=10.867799
+recv_result status=OK elapsed_sec=10.867822
+```
+
+Counters:
+
+```text
+strix-1 receiver:
+data_tx_ack_ok=1875
+data_tx_ack_drop_checked=1875 data_tx_ack_drop_injected=468
+data_rx_duplicate_ack=1363
+data_tx_posted=3000 data_tx_completed=3000 data_tx_errors=0
+data_rx_completed=5971 data_rx_canceled=0
+
+strix-2 sender:
+data_wr_send=512 data_wr_retransmit=150 data_wr_timeout=0
+data_wr_retry_enqueue_error=0 data_wr_retry_exhausted=0
+data_tx_posted=5971 data_tx_completed=5971 data_tx_errors=0
+data_rx_completed=3000 data_rx_canceled=4096
+data_rx_ack=2814 data_rx_ack_matched=594
+data_rx_ack_match_retried=150 data_rx_late_ack=2220
+data_rx_ack_miss=0
+```
+
+Netconsole and pstore:
+
+```text
+trex netconsole log contained only deliberate start markers; no crash/oops
+records were emitted.
+/sys/fs/pstore and /var/lib/pstore contained no crash records after the runs.
+```
+
+Follow-up reload check:
+
+```text
+Immediately after a clean post-test module reload:
+strix-1 data_rx_canceled=0
+strix-2 data_rx_canceled=0
+```
+
+Interpretation:
+
+1. The unfenced old-row replay did not reproduce the previous hard reset on the
+   current rebased/patched build. It did exercise the intended path:
+   8 sender retransmits, 72 receiver duplicate re-acks, no timeout, no retry
+   exhaustion, no crash.
+2. A much stronger unfenced row also completed: 468 injected ACK drops,
+   150 sender retransmits, 1363 receiver duplicate re-acks, no timeout, no
+   retry exhaustion, no crash.
+3. This is a non-reproduction, not a proof of absence. The old host reset
+   remains historically real but is now uncaptured on this build and may have
+   depended on code before the current patch/rebase state or on a narrower
+   lifecycle race window.
+4. The high-loss run exposed a new anomaly: `strix-2 data_rx_canceled=4096`.
+   Because a clean reload immediately afterward produced `data_rx_canceled=0`,
+   this is not a deterministic reload counter artifact. Treat it as a live
+   lifecycle/ring-cancel observation to investigate, not as a settled cause.
+
+## 2026-06-05 PR24 Kernel Patch Recipe + Retransmit/Teardown Guard Retest
+
+Before this retest, one important negative result was reclassified:
+
+```text
+git log ba44378..HEAD -- kernel/
+```
+
+was empty at the time of the prior unfenced non-repro. The kernel
+teardown/retry/peer code was therefore byte-identical to the crash-era
+injector commit. That non-repro was not a fix; it dodged the timing window.
+
+Deployment changes:
+
+```text
+nixos-config:
+- restored the referenced thunderbolt-xdomain-bridge-hardening.patch in the
+  Thunderbolt kernel recipe, fixed the malformed hunk metadata, staged it so
+  flakes cannot silently drop it, and rebuilt the Strix kernel.
+- thunderbolt-ibverbs-kernel input was locked to the local
+  thunderbolt-ibverbs-gda-iommu-revive worktree.
+- deployed with colmena switch, then colmena apply boot --reboot.
+
+strix-1 booted:
+/nix/store/ww15x29ycl0cmb9rnq1cmydsab0jsvqq-nixos-system-strix-1-26.11pre-git
+
+strix-2 booted:
+/nix/store/fzv7pkfvlfz1gv7q9cq758zgavc2svph-nixos-system-strix-2-26.11pre-git
+```
+
+Instrumentation added to the GDA module:
+
+```text
+data_wr_retransmit_closing_qp
+data_wr_retransmit_no_live_path
+data_wr_retransmit_teardown_path
+```
+
+The guard logs retransmit attempts that see a local closing QP, no live native
+path, or a selected native path whose rail/path/rings are visibly tearing down.
+It uses `pr_warn_ratelimited()` rather than `WARN_ONCE()` so the watchdog/panic
+configuration does not turn instrumentation into a new crash trigger.
+
+### Instrumented Unfenced High-Loss Row
+
+```text
+count=256 timeout_ms=60000 native_ack_drop_every=4 qp_timeout_ms=200
+final_fence=0
+receiver: status=OK elapsed_sec=11.593501
+sender: wc error status=12 opcode=1 wr_id=513
+```
+
+Sender (`strix-2`) counters:
+
+```text
+data_wr_send=512
+data_wr_retransmit=168
+data_wr_retry_enqueue_error=0
+data_wr_retry_exhausted=1
+data_wr_timeout=1
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_tx_posted=6251 data_tx_completed=6251 data_tx_errors=0
+data_rx_completed=3417 data_rx_canceled=0
+data_rx_ack=3222 data_rx_ack_matched=616
+data_rx_ack_match_retried=161 data_rx_late_ack=2606
+data_rx_ack_miss=0
+```
+
+Receiver (`strix-1`) counters:
+
+```text
+data_tx_ack_ok=2148
+data_tx_ack_drop_checked=2148 data_tx_ack_drop_injected=537
+data_rx_duplicate_ack=1636
+data_tx_posted=3417 data_tx_completed=3417 data_tx_errors=0
+data_rx_completed=6251 data_rx_canceled=0
+data_rx_no_qp=7
+```
+
+### Fenced Control With Same Loss Pressure
+
+```text
+count=256 timeout_ms=60000 native_ack_drop_every=4 qp_timeout_ms=200
+final_fence=1
+sender: status=OK elapsed_sec=12.022799
+receiver: status=OK elapsed_sec=12.022945
+```
+
+Sender (`strix-2`) counters:
+
+```text
+data_wr_send=512
+data_wr_retransmit=163
+data_wr_retry_enqueue_error=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_tx_posted=6193 data_tx_completed=6193 data_tx_errors=0
+data_rx_completed=3339 data_rx_canceled=0
+data_rx_ack=3146 data_rx_ack_matched=608
+data_rx_ack_match_retried=163 data_rx_late_ack=2538
+data_rx_ack_miss=0
+```
+
+Receiver (`strix-1`) counters:
+
+```text
+data_tx_ack_ok=2097
+data_tx_ack_drop_checked=2097 data_tx_ack_drop_injected=524
+data_rx_duplicate_ack=1585
+data_tx_posted=3339 data_tx_completed=3339 data_tx_errors=0
+data_rx_completed=6193 data_rx_canceled=0
+data_rx_no_qp=0
+```
+
+Netconsole and pstore remained quiet during both rows:
+
+```text
+trex netconsole tail contained only the earlier deliberate markers.
+/sys/fs/pstore contained no crash records on either Strix host.
+```
+
+Interpretation:
+
+1. The fenced control proves the live-peer retransmit backstop still works after
+   the PR24 kernel patch reboot and guard instrumentation: 163 retransmits,
+   524 injected ACK drops, no timeout, no retry exhaustion, no RX cancels, and
+   no local retransmit/path teardown guard hits.
+2. The unfenced failure is now a clean remote-QP-teardown failure, not a local
+   sender path-teardown failure. The receiver finished and destroyed the QP,
+   then received 7 retransmitted data frames with no QP (`data_rx_no_qp=7`).
+   The sender never saw a local closing-QP/no-path/teardown-path condition, so
+   it retried until one WR exhausted and surfaced `wc status=12`.
+3. This is a useful contradiction to the earlier `data_rx_canceled=4096`
+   near-miss: the deterministic artifact in this run is `data_rx_no_qp`, while
+   `data_rx_canceled=0` on both hosts. The old hard reset is still not
+   backtraced, but the most reproducible unfenced failure mode is now remote QP
+   tombstone/lost-ACK teardown, not sender-side path/ring teardown.
+4. A principled kernel hardening target is now visible: keep enough destroyed-QP
+   tombstone/ACK history to re-ACK already-consumed duplicate PSNs briefly after
+   QP teardown, or send an explicit native error ACK for no-QP retransmits so
+   the sender completes with a bounded remote error instead of burning the full
+   retry budget. Either way, the kernel must continue to treat arbitrary peer
+   teardown as a clean completion/error path, never a host reset.
+
+## 2026-06-05 Destroyed-QP Tombstone Retest
+
+Change under test:
+
+```text
+When a native QP is destroyed, publish a short-lived tombstone keyed by
+(local_qpn, remote_qpn) containing the QP ACK history. If later duplicate
+SEND/WRITE frames arrive for the destroyed QP, re-ACK matched PSNs from the
+tombstone. If no history entry exists, send an explicit SEND_ACK_ERROR instead
+of silently dropping the frame.
+
+New counters:
+data_rx_no_qp_reack
+data_rx_no_qp_error_ack
+```
+
+Deployment:
+
+```text
+nixos-config flake lock pointed thunderbolt-ibverbs-kernel at the local
+gda-iommu-revive worktree, then both Strix hosts were deployed and rebooted
+with colmena apply boot --reboot.
+
+strix-1 booted:
+/nix/store/lch1h99xwxlqdc1x22177vrv82gn4a9f-nixos-system-strix-1-26.11pre-git
+
+strix-2 booted:
+/nix/store/kbs0alh39160ds6fd9jddy2v74vdpsf0-nixos-system-strix-2-26.11pre-git
+```
+
+Netconsole remained live after reboot; emergency markers from both hosts were
+received by the persistent collector on `trex`.
+
+### Unfenced High-Loss Row, drop_every=4
+
+```text
+count=256 timeout_ms=60000 native_tx_max_inflight=6 qp_timeout_ms=200
+receiver native_ack_drop_every=4
+final_fence=0
+sender:   status=OK elapsed_sec=10.871897
+receiver: status=OK elapsed_sec=10.799840
+```
+
+Sender (`strix-2`) counters:
+
+```text
+data_wr_send=512
+data_wr_retransmit=151
+data_wr_retry_enqueue_error=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_tx_posted=6005 data_tx_completed=6005 data_tx_errors=0
+data_rx_completed=3050 data_rx_canceled=0
+data_rx_ack=2863 data_rx_ack_matched=595
+data_rx_ack_match_retried=151 data_rx_late_ack=2268
+data_rx_ack_miss=0
+```
+
+Receiver (`strix-1`) counters:
+
+```text
+data_tx_ack_ok=1909
+data_tx_ack_drop_checked=1908 data_tx_ack_drop_injected=477
+data_rx_duplicate_ack=1396
+data_rx_ack_history_miss=0
+data_rx_no_qp=1
+data_rx_no_qp_reack=1
+data_rx_no_qp_error_ack=0
+data_tx_posted=3050 data_tx_completed=3050 data_tx_errors=0
+data_rx_completed=6005 data_rx_canceled=0
+```
+
+Receiver dmesg recorded the intended mechanism:
+
+```text
+native RX no-QP re-acked dest_qp=0x900 src_qp=0x900 psn=15781175 opcode=3 ret=0 tombstone=1
+```
+
+### Stronger Unfenced Row, drop_every=2
+
+```text
+count=256 timeout_ms=60000 native_tx_max_inflight=6 qp_timeout_ms=200
+receiver native_ack_drop_every=2
+final_fence=0
+sender:   status=OK elapsed_sec=18.427499
+receiver: status=OK elapsed_sec=18.355733
+```
+
+Sender (`strix-2`) counters:
+
+```text
+data_wr_send=512
+data_wr_retransmit=256
+data_wr_retry_enqueue_error=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_tx_posted=6928 data_tx_completed=6928 data_tx_errors=0
+data_rx_completed=3049 data_rx_canceled=0
+data_rx_ack=2833 data_rx_ack_matched=657
+data_rx_ack_match_retried=256 data_rx_late_ack=2176
+data_rx_ack_miss=0
+```
+
+Receiver (`strix-1`) counters:
+
+```text
+data_tx_ack_ok=2832
+data_tx_ack_drop_checked=2815 data_tx_ack_drop_injected=1407
+data_rx_duplicate_ack=2303
+data_rx_ack_history_miss=0
+data_rx_no_qp=17
+data_rx_no_qp_reack=17
+data_rx_no_qp_error_ack=0
+data_tx_posted=3049 data_tx_completed=3049 data_tx_errors=0
+data_rx_completed=6928 data_rx_canceled=0
+```
+
+Netconsole and pstore remained quiet during both rows except for deliberate
+test markers; `/sys/fs/pstore` was empty on both Strix hosts.
+
+Interpretation:
+
+1. The tombstone path is exercised, not inferred. The receiver accepted
+   duplicate retransmits after userspace destroyed the QP, found matching
+   destroyed-QP ACK history, and re-acked them.
+2. This directly fixes the reproducible unfenced failure from the previous
+   section: the old row had `data_rx_no_qp=7` and the sender exhausted one WR;
+   the new rows have `data_rx_no_qp_reack == data_rx_no_qp` and no sender
+   timeout/retry exhaustion.
+3. The stronger row drove 256 retransmits and 17 post-destroy no-QP arrivals
+   with no local sender teardown guard hits and no RX cancels. That separates
+   this fixed no-QP lifecycle bug from the older uncaptured hard reset/ring
+   cancel race, which remains a separate latent issue until a stack or a direct
+   teardown guard trigger proves otherwise.
