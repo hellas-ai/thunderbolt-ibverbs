@@ -2844,3 +2844,100 @@ Interpretation:
 3. This is still smoke, not a performance-ready conclusion. The GDA collective
    path is functionally alive, but performance remains volatile and much slower
    than the fallback path in several rows, especially alltoallv.
+
+### RCCL All-To-All Comparison After Cap Deploy
+
+Ran a small post-cap comparison on the same deployed kernel:
+
+```text
+log root: /tmp/usb4-rccl-gda-20260606-89bcec0/compare
+sizes: 262144, 524288
+iters/warmup: 20/5
+validation: disabled for the three-way comparison
+MPI TCP iface: eno1
+```
+
+Results:
+
+```text
+fallback RCCL, RCCL_ROCSHMEM_ENABLE=0:
+  262144 B out-of-place: 218816 us, in-place: 219.99 us
+  524288 B out-of-place: 423.41 us, in-place: 218990 us
+  dv_poll_wqes sum +0
+
+host-stream GDA, RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=1:
+  262144 B out-of-place: 1233.93 us, in-place: 1238.99 us
+  524288 B out-of-place: 2335.24 us, in-place: 2342.16 us
+  dv_poll_wqes sum +376
+
+default/device GDA, RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=0:
+  262144 B out-of-place: 1653.54 us, in-place: 6800.15 us
+  524288 B out-of-place: 20536.6 us, in-place: 17430.8 us
+  dv_poll_wqes sum +376
+```
+
+The fallback row had two obvious ~219 ms outliers. A validation-enabled fallback
+rerun with 5/2 iters/warmup immediately returned to the expected range:
+
+```text
+log root: /tmp/usb4-rccl-gda-20260606-89bcec0/compare/fallback-check
+262144 B out-of-place: 201.14 us, in-place: 187.57 us, wrong=0
+524288 B out-of-place: 365.50 us, in-place: 363.80 us, wrong=0
+dv_poll_wqes sum +0
+```
+
+All four comparison runs were correctness-clean:
+
+```text
+dv_hard_error sum              +0
+data_wr_copy_error sum         +0
+data_wr_timeout sum            +0
+data_wr_retry_exhausted sum    +0
+data_tx_errors sum             +0
+data_rx_canceled sum           +0
+data_rx_no_qp sum              +0
+data_rx_no_qp_reack sum        +0
+data_rx_no_qp_error_ack sum    +0
+data_qp_tombstone_evicted sum  +0
+```
+
+Post-comparison health:
+
+```text
+strix-1:
+dv_poll_wqes=516
+data_wr_retransmit=20
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=42227
+data_tx_completed=42227
+data_tx_errors=0
+data_rx_canceled=4096
+data_rx_no_qp=0
+data_qp_tombstone_evicted=0
+
+strix-2:
+dv_poll_wqes=516
+data_wr_retransmit=11
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=40873
+data_tx_completed=40873
+data_tx_errors=0
+data_rx_canceled=0
+data_rx_no_qp=0
+data_qp_tombstone_evicted=0
+```
+
+Interpretation:
+
+1. The app-level all-to-all path is now suitable for cautious correctness and
+   performance characterization: fallback stays off DV, GDA modes move DV
+   counters, and all modes leave the driver clean.
+2. Performance conclusions still need repeated, validation-enabled sweeps. The
+   fallback outliers show that single rows are not stable enough to rank
+   implementations without repetitions and outlier handling.
+3. At these sizes, host-stream GDA is consistently slower than the validated
+   fallback rerun, and default/device GDA is slower and more volatile than
+   host-stream GDA. The next optimization work should stay in RCCL/rocSHMEM
+   integration before moving to vLLM-scale measurements.
