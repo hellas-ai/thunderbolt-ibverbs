@@ -57,6 +57,7 @@ struct opts {
 	int count;
 	int mtu;
 	int check;
+	int check_any_order;
 	int recv_wr_id_base;
 	int send_wr_id_base;
 	size_t size;
@@ -165,7 +166,7 @@ static void usage(const char *argv0)
 		"          [--depth N] [--recv-posts N] [--mtu 256|512|1024|2048|4096]\n"
 		"          [--recv-post-delay-ms N]\n"
 		"          [--recv-wr-id-base N] [--send-wr-id-base N]\n"
-		"          [--check]\n",
+		"          [--check] [--check-any-order]\n",
 		argv0);
 }
 
@@ -290,6 +291,9 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 				return -1;
 		} else if (!strcmp(argv[i], "--check")) {
 			o->check = 1;
+		} else if (!strcmp(argv[i], "--check-any-order")) {
+			o->check = 1;
+			o->check_any_order = 1;
 		} else {
 			return -1;
 		}
@@ -622,6 +626,34 @@ static int check_pattern(const char *p, size_t size, uint64_t expected_seq,
 	return 0;
 }
 
+static int check_seen(uint8_t *seen, int count, uint64_t observed_seq,
+		      int recv_slot, int completed, uint64_t wr_id)
+{
+	size_t byte;
+	uint8_t bit;
+
+	if (observed_seq >= (uint64_t)count) {
+		fprintf(stderr,
+			"check failed completed=%d wr_id=%llu recv_slot=%d observed_seq=%llu out_of_range count=%d\n",
+			completed, (unsigned long long)wr_id, recv_slot,
+			(unsigned long long)observed_seq, count);
+		return -1;
+	}
+
+	byte = (size_t)(observed_seq / 8);
+	bit = (uint8_t)(1u << (observed_seq % 8));
+	if (seen[byte] & bit) {
+		fprintf(stderr,
+			"check failed completed=%d wr_id=%llu recv_slot=%d observed_seq=%llu duplicate\n",
+			completed, (unsigned long long)wr_id, recv_slot,
+			(unsigned long long)observed_seq);
+		return -1;
+	}
+
+	seen[byte] |= bit;
+	return 0;
+}
+
 static void print_rate(const char *role, int done, int count, size_t size,
 		       uint64_t start, uint64_t *last_t, int *last_done)
 {
@@ -670,6 +702,7 @@ int main(int argc, char **argv)
 	int initial_recvs = 0;
 	int wr_depth;
 	int sgid_index;
+	uint8_t *seen = NULL;
 
 	if (parse_opts(argc, argv, &o)) {
 		usage(argv[0]);
@@ -747,6 +780,14 @@ int main(int argc, char **argv)
 	if (!mr) {
 		perror("ibv_reg_mr");
 		goto out_buf;
+	}
+
+	if (o.check_any_order && (!is_sender || is_bidi)) {
+		seen = calloc(((size_t)o.count + 7u) / 8u, 1);
+		if (!seen) {
+			perror("calloc seen");
+			goto out_mr;
+		}
 	}
 
 	debug_step("create cq");
@@ -973,13 +1014,22 @@ int main(int argc, char **argv)
 
 				int slot = slot_from_wr_id(&o, wc[i].wr_id);
 
-				if (o.check &&
-				    check_pattern(recv_buf + (size_t)slot * stride,
-						  o.size,
-						  (uint64_t)recv_completed,
-						  slot, recv_completed,
-						  wc[i].wr_id, wc[i].byte_len))
-					goto out_qp;
+				if (o.check) {
+					char *p = recv_buf + (size_t)slot * stride;
+					uint64_t seq = o.check_any_order ?
+						load_le64(p) :
+						(uint64_t)recv_completed;
+
+					if (o.check_any_order &&
+					    check_seen(seen, o.count, seq, slot,
+						       recv_completed, wc[i].wr_id))
+						goto out_qp;
+					if (check_pattern(p, o.size, seq, slot,
+							  recv_completed,
+							  wc[i].wr_id,
+							  wc[i].byte_len))
+						goto out_qp;
+				}
 				recv_completed++;
 				if (recv_posted < o.count) {
 					errno = 0;
@@ -1092,12 +1142,20 @@ int main(int argc, char **argv)
 						wc[i].byte_len);
 					goto out_qp;
 				}
-				if (o.check &&
-				    check_pattern(recv_buf + (size_t)slot * stride,
-						  o.size, (uint64_t)completed,
-						  slot, completed, wc[i].wr_id,
-						  wc[i].byte_len))
-					goto out_qp;
+				if (o.check) {
+					char *p = recv_buf + (size_t)slot * stride;
+					uint64_t seq = o.check_any_order ?
+						load_le64(p) : (uint64_t)completed;
+
+					if (o.check_any_order &&
+					    check_seen(seen, o.count, seq, slot,
+						       completed, wc[i].wr_id))
+						goto out_qp;
+					if (check_pattern(p, o.size, seq, slot,
+							  completed, wc[i].wr_id,
+							  wc[i].byte_len))
+						goto out_qp;
+				}
 				completed++;
 				if (posted < o.count) {
 					errno = 0;
@@ -1134,6 +1192,7 @@ out_qp:
 out_cq:
 	ibv_destroy_cq(cq);
 out_mr:
+	free(seen);
 	if (mr)
 		ibv_dereg_mr(mr);
 out_buf:
