@@ -1373,6 +1373,7 @@ tbv_retransmit_path_teardown_observed(struct tbv_send_ctx *ctx,
 	bool rail_active;
 	bool missing_tx;
 	bool missing_rx;
+	bool guard_enabled;
 
 	if (!tqp || !tqp->owner || !tbv_send_post_reason_is_retry(reason))
 		return false;
@@ -1395,7 +1396,16 @@ tbv_retransmit_path_teardown_observed(struct tbv_send_ctx *ctx,
 			    ctx->psn, reason, rail ? rail->rail_id : U32_MAX,
 			    rail_active, rail_removing, path_state,
 			    missing_tx, missing_rx);
-	return !READ_ONCE(native_unsafe_retransmit_teardown_guard_disable);
+	guard_enabled =
+		!READ_ONCE(native_unsafe_retransmit_teardown_guard_disable);
+	if (!guard_enabled)
+		pr_emerg_ratelimited("UNSAFE native retransmit allowed teardown path where=%s qpn=0x%x dest_qp=0x%x psn=%u reason=%u rail=%u path_state=%u rail_removing=%u tx_ring_missing=%u rx_ring_missing=%u\n",
+				     where, tqp->base.qp_num,
+				     tqp->attr.dest_qp_num, ctx->psn, reason,
+				     rail ? rail->rail_id : U32_MAX,
+				     path_state, rail_removing, missing_tx,
+				     missing_rx);
+	return guard_enabled;
 }
 
 static bool
