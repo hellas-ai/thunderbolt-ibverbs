@@ -543,6 +543,8 @@ struct tbv_state {
 	atomic64_t data_tx_ack_rnr;
 	atomic64_t data_tx_ack_error;
 	atomic64_t data_tx_ack_send_error;
+	atomic64_t data_tx_ack_drop_checked;
+	atomic64_t data_tx_ack_drop_injected;
 	atomic64_t data_rx_ack_rnr;
 	atomic64_t data_rx_duplicate_ack;
 	atomic64_t data_rx_ack_history_miss;

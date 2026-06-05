@@ -94,6 +94,8 @@ IMPORTANT_COUNTERS = [
     "data_tx_ack_rnr",
     "data_tx_ack_error",
     "data_tx_ack_send_error",
+    "data_tx_ack_drop_checked",
+    "data_tx_ack_drop_injected",
     "data_rx_ack_rnr",
     "data_rx_duplicate_ack",
     "data_rx_ack_history_miss",

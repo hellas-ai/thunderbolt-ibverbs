@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -209,6 +210,29 @@ static int recv_all(int fd, void *buf, size_t len)
 		len -= (size_t)n;
 	}
 	return 0;
+}
+
+static int recv_all_with_timeout(int fd, void *buf, size_t len,
+				 int timeout_ms)
+{
+	struct timeval timeout = {
+		.tv_sec = timeout_ms / 1000,
+		.tv_usec = (timeout_ms % 1000) * 1000,
+	};
+	struct timeval clear = {};
+	int ret;
+
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+		       sizeof(timeout))) {
+		perror("setsockopt SO_RCVTIMEO");
+		return -1;
+	}
+
+	ret = recv_all(fd, buf, len);
+
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &clear, sizeof(clear)))
+		perror("clear SO_RCVTIMEO");
+	return ret;
 }
 
 static int tcp_listen(int port)
@@ -1361,6 +1385,7 @@ static int run_receiver(struct opts *o, int sock, HipRegion *region,
 {
 	char ready = 'R';
 	char ack;
+	char done;
 	hipError_t hret;
 	uint64_t start_ns;
 	int ret = 1;
@@ -1416,6 +1441,12 @@ static int run_receiver(struct opts *o, int sock, HipRegion *region,
 			hipGetErrorString(hret));
 		goto out_sync;
 	}
+	if (recv_all_with_timeout(sock, &done, 1, o->timeout_ms) ||
+	    done != 'D') {
+		fprintf(stderr,
+			"receiver did not get sender completion fence\n");
+		goto out_sync;
+	}
 
 	{
 		double secs = (double)(now_ns() - start_ns) / 1000000000.0;
@@ -1439,6 +1470,7 @@ static int run_sender(struct opts *o, int sock, struct ibv_pd *pd,
 	SenderSource src;
 	char ready;
 	char ack;
+	char done = 'D';
 	size_t signal_offset = align_up(o->size, 64);
 	uint64_t start_ns;
 	int ret = 1;
@@ -1468,6 +1500,10 @@ static int run_sender(struct opts *o, int sock, struct ibv_pd *pd,
 			fprintf(stderr, "receiver did not ack seq=%u\n", seq);
 			goto out_src;
 		}
+	}
+	if (send_all(sock, &done, 1)) {
+		perror("done send");
+		goto out_src;
 	}
 
 	{

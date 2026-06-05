@@ -321,6 +321,10 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_tx_ack_error));
 	seq_printf(s, "data_tx_ack_send_error: %lld\n",
 		   atomic64_read(&state->data_tx_ack_send_error));
+	seq_printf(s, "data_tx_ack_drop_checked: %lld\n",
+		   atomic64_read(&state->data_tx_ack_drop_checked));
+	seq_printf(s, "data_tx_ack_drop_injected: %lld\n",
+		   atomic64_read(&state->data_tx_ack_drop_injected));
 	seq_printf(s, "data_rx_ack_rnr: %lld\n",
 		   atomic64_read(&state->data_rx_ack_rnr));
 	seq_printf(s, "data_rx_duplicate_ack: %lld\n",

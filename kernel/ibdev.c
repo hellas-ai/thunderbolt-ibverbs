@@ -119,6 +119,11 @@ module_param(dv_poll_budget, uint, 0644);
 MODULE_PARM_DESC(dv_poll_budget,
 		 "Maximum DV WQEs the device-level poll worker drains per scan; minimum effective value is 1");
 
+static uint native_ack_drop_every;
+module_param(native_ack_drop_every, uint, 0644);
+MODULE_PARM_DESC(native_ack_drop_every,
+		 "Fault injection: silently drop every Nth native OK SEND_ACK before rail fan-out; 0 disables");
+
 static uint apple_tx_max_inflight_wr = 16;
 module_param(apple_tx_max_inflight_wr, uint, 0644);
 MODULE_PARM_DESC(apple_tx_max_inflight_wr,
@@ -5999,6 +6004,22 @@ static int tbv_send_control_frame_on_all_native_paths(struct tbv_qp *tqp,
 	return sent ? 0 : first_ret;
 }
 
+static bool tbv_should_inject_native_ok_ack_drop(struct tbv_state *state)
+{
+	u32 every = READ_ONCE(native_ack_drop_every);
+	u32 seq;
+
+	if (!state || !every)
+		return false;
+
+	seq = (u32)atomic64_inc_return(&state->data_tx_ack_drop_checked);
+	if (seq % every)
+		return false;
+
+	atomic64_inc(&state->data_tx_ack_drop_injected);
+	return true;
+}
+
 static int tbv_send_ack_on_path(struct tbv_qp *tqp,
 				struct tbv_path *rx_path, u32 dest_qp,
 				u32 src_qp, u32 psn, int status)
@@ -6024,11 +6045,17 @@ static int tbv_send_ack_on_path(struct tbv_qp *tqp,
 	 * on every live rail; non-OK ACKs stay single-path to preserve their
 	 * existing retry/error timing.
 	 */
-	if (status == TBV_NATIVE_SEND_ACK_OK)
-		ret = tbv_send_control_frame_on_all_native_paths(tqp, rx_path,
-								frame, len);
-	else
+	if (status == TBV_NATIVE_SEND_ACK_OK) {
+		if (tbv_should_inject_native_ok_ack_drop(tqp ? tqp->owner : NULL))
+			ret = 0;
+		else
+			ret = tbv_send_control_frame_on_all_native_paths(tqp,
+									rx_path,
+									frame,
+									len);
+	} else {
 		ret = tbv_send_control_frame_on_path(tqp, rx_path, frame, len);
+	}
 	if (tqp && tqp->owner) {
 		if (ret)
 			atomic64_inc(&tqp->owner->data_tx_ack_send_error);
