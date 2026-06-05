@@ -278,6 +278,15 @@ for dep in $(modinfo -F depends "$TBV_MODULE" | tr ',' ' ' || true); do
 done
 
 read -r -a opt_args <<< "$TBV_OPTIONS"
+roce_netdev=""
+for opt in "${opt_args[@]}"; do
+	case "$opt" in
+	roce_netdev=*)
+		roce_netdev="${opt#roce_netdev=}"
+		;;
+	esac
+done
+
 insmod "$TBV_MODULE" "${opt_args[@]}"
 
 if [[ "$TBV_WAIT_SECS" != 0 ]]; then
@@ -288,8 +297,18 @@ grep -q '^thunderbolt_ibverbs ' /proc/modules ||
 	fail "module is not loaded after insmod"
 
 if [[ -r /sys/kernel/debug/thunderbolt_ibverbs/summary ]]; then
-	awk -F': *' '$1 == "profile" || $1 == "verbs_registered" || $1 == "data_rx_bad_frame" || $1 == "data_cq_overflow" { print }' \
+	awk -F': *' '$1 == "profile" || $1 == "verbs_registered" || $1 == "tbnet_identity_proxy_ipv4" || $1 == "data_rx_bad_frame" || $1 == "data_cq_overflow" { print }' \
 		/sys/kernel/debug/thunderbolt_ibverbs/summary
+fi
+if [[ -n "$roce_netdev" ]]; then
+	if command -v ip >/dev/null 2>&1 && ip link show dev "$roce_netdev" >/dev/null 2>&1; then
+		printf 'roce_netdev: %s present\n' "$roce_netdev"
+	else
+		printf 'warning: roce_netdev %s is absent; verbs registration may be deferred until it appears\n' "$roce_netdev" >&2
+	fi
+fi
+if command -v rdma >/dev/null 2>&1; then
+	rdma link show | sed 's/^/rdma: /'
 fi
 REMOTE
 fi

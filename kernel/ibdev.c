@@ -100,12 +100,12 @@ MODULE_PARM_DESC(qp_timeout_ms,
 		 "Fallback milliseconds for pending native/Apple WRs and partial native receives "
 		 "when a QP has no verbs ACK timeout; 0 disables fallback timeout work");
 
-static uint apple_tx_max_inflight_wr = 1;
+static uint apple_tx_max_inflight_wr = 16;
 module_param(apple_tx_max_inflight_wr, uint, 0644);
 MODULE_PARM_DESC(apple_tx_max_inflight_wr,
 		 "Maximum Apple-compatible UC SEND work requests in flight per QP; 0 disables the software window");
 
-static uint apple_tx_max_inflight_frames = 2;
+static uint apple_tx_max_inflight_frames = 64;
 module_param(apple_tx_max_inflight_frames, uint, 0644);
 MODULE_PARM_DESC(apple_tx_max_inflight_frames,
 		 "Maximum Apple-compatible 4 KiB FA57 frames posted per SEND group; 0 disables the frame window");
@@ -2128,18 +2128,24 @@ static enum rdma_link_layer tbv_get_link_layer(struct ib_device *ibdev,
 	return IB_LINK_LAYER_ETHERNET;
 }
 
-static const char *tbv_ibdev_netdev_name(const struct tbv_ibdev *dev)
+static const char *tbv_ibdev_netdev_name_for(struct tbv_state *state,
+					     enum tbv_backend_type backend)
 {
 	const char *name = roce_netdev;
 
-	if (tbv_backend_is_apple(dev->backend) &&
-	    dev->state->tbnet_identity.gid_netdev_name[0])
-		name = dev->state->tbnet_identity.gid_netdev_name;
+	if (tbv_backend_is_apple(backend) &&
+	    state->tbnet_identity.gid_netdev_name[0])
+		name = state->tbnet_identity.gid_netdev_name;
 
 	if (!name || !*name)
 		return NULL;
 
 	return name;
+}
+
+static const char *tbv_ibdev_netdev_name(const struct tbv_ibdev *dev)
+{
+	return tbv_ibdev_netdev_name_for(dev->state, dev->backend);
 }
 
 static int tbv_ibdev_attach_netdev(struct tbv_ibdev *dev)
@@ -2153,11 +2159,11 @@ static int tbv_ibdev_attach_netdev(struct tbv_ibdev *dev)
 
 	ndev = dev_get_by_name(&init_net, name);
 	if (!ndev)
-		return -ENODEV;
+		return -EPROBE_DEFER;
 
 	if (ndev->reg_state != NETREG_REGISTERED) {
 		dev_put(ndev);
-		return -ENODEV;
+		return -EPROBE_DEFER;
 	}
 
 	ret = ib_device_set_netdev(&dev->base, ndev, 1);
@@ -8936,6 +8942,7 @@ int tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
 		mutex_lock(&state->rail_register_lock);
 		dev = rail->ibdev;
 		rail->ibdev = NULL;
+		rail->ibdev_register_deferred = false;
 		mutex_unlock(&state->rail_register_lock);
 		if (!dev)
 			return 0;
@@ -8957,6 +8964,10 @@ int tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
 		return 0;
 	}
 	if (rail->ibdev_register_failed) {
+		mutex_unlock(&state->rail_register_lock);
+		return 0;
+	}
+	if (rail->ibdev_register_deferred) {
 		mutex_unlock(&state->rail_register_lock);
 		return 0;
 	}
@@ -8989,6 +9000,7 @@ int tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
 	idx = tbv_ibdev_rail_name_index(rail);
 	if (idx < 0) {
 		rail->ibdev_register_failed = true;
+		rail->ibdev_register_deferred = false;
 		mutex_unlock(&state->rail_register_lock);
 		pr_warn("rail event ignored: cannot derive deterministic name (peer=%u rail=%u err=%d)\n",
 			rail->peer->peer_id, rail->rail_id, idx);
@@ -8998,15 +9010,105 @@ int tbv_ibdev_rail_event(struct tbv_state *state, struct tbv_rail *rail,
 	dev = NULL;
 	ret = tbv_ibdev_register_one(state, rail, name, &dev);
 	if (ret) {
+		if (ret == -EPROBE_DEFER) {
+			rail->ibdev_register_deferred = true;
+			mutex_unlock(&state->rail_register_lock);
+			pr_info("deferred per-rail ib_device %s registration until RoCE netdev %s exists\n",
+				name,
+				tbv_ibdev_netdev_name_for(state,
+							  rail->peer->backend) ?:
+				"(none)");
+			return ret;
+		}
 		rail->ibdev_register_failed = true;
+		rail->ibdev_register_deferred = false;
 		mutex_unlock(&state->rail_register_lock);
-		pr_warn("failed to register per-rail ib_device %s: %d (will not retry)\n",
+		pr_warn("failed to register per-rail ib_device %s: %d (will not retry automatically)\n",
 			name, ret);
 		return ret;
 	}
+	rail->ibdev_register_deferred = false;
 	rail->ibdev = dev;
 	mutex_unlock(&state->rail_register_lock);
 	return 0;
+}
+
+static bool tbv_ibdev_required_netdev_registered(struct tbv_state *state,
+						const struct tbv_rail *rail)
+{
+	const char *name;
+	struct net_device *ndev;
+	bool registered;
+
+	if (!rail || !rail->peer)
+		return false;
+
+	name = tbv_ibdev_netdev_name_for(state, rail->peer->backend);
+	if (!name)
+		return true;
+
+	ndev = dev_get_by_name(&init_net, name);
+	if (!ndev)
+		return false;
+
+	registered = ndev->reg_state == NETREG_REGISTERED;
+	dev_put(ndev);
+	return registered;
+}
+
+static void tbv_ibdev_netdev_retry_work(struct work_struct *work)
+{
+	struct tbv_state *state =
+		container_of(work, struct tbv_state, ibdev_netdev_retry_work);
+	struct tbv_peer *peer;
+
+	for (;;) {
+		struct tbv_rail *target = NULL;
+		bool skip = false;
+
+		mutex_lock(&state->lock);
+		list_for_each_entry(peer, &state->peers, node) {
+			struct tbv_rail *rail;
+			bool ready;
+
+			list_for_each_entry(rail, &peer->rails, node) {
+				if (!READ_ONCE(rail->ibdev_register_deferred) ||
+				    READ_ONCE(rail->ibdev) ||
+				    READ_ONCE(rail->ibdev_register_failed))
+					continue;
+				if (!tbv_ibdev_required_netdev_registered(state,
+									 rail))
+					continue;
+				if (peer->backend == TBV_BACKEND_NATIVE)
+					ready = tbv_rail_data_ready(rail);
+				else
+					ready = tbv_rail_apple_data_ready(rail);
+				if (!ready || rail->removing)
+					continue;
+				refcount_inc(&rail->refcnt);
+				target = rail;
+				break;
+			}
+			if (target)
+				break;
+		}
+		mutex_unlock(&state->lock);
+
+		if (!target)
+			break;
+
+		mutex_lock(&state->rail_register_lock);
+		if (target->ibdev_register_deferred && !target->ibdev &&
+		    !target->ibdev_register_failed)
+			target->ibdev_register_deferred = false;
+		else
+			skip = true;
+		mutex_unlock(&state->rail_register_lock);
+
+		if (!skip)
+			tbv_ibdev_rail_event(state, target, true);
+		tbv_rail_put(target);
+	}
 }
 
 static int tbv_ibdev_netdev_event(struct notifier_block *nb,
@@ -9017,28 +9119,38 @@ static int tbv_ibdev_netdev_event(struct notifier_block *nb,
 	struct net_device *ndev = netdev_notifier_info_to_dev(ptr);
 	struct tbv_peer *peer;
 
-	if (event != NETDEV_UNREGISTER)
+	switch (event) {
+	case NETDEV_REGISTER:
+	case NETDEV_UP:
+	case NETDEV_CHANGE:
+	case NETDEV_CHANGEADDR:
+		if (state->workqueue)
+			queue_work(state->workqueue,
+				   &state->ibdev_netdev_retry_work);
 		return NOTIFY_DONE;
+	case NETDEV_UNREGISTER:
+		mutex_lock(&state->rail_register_lock);
+		mutex_lock(&state->lock);
+		list_for_each_entry(peer, &state->peers, node) {
+			struct tbv_rail *rail;
 
-	mutex_lock(&state->rail_register_lock);
-	mutex_lock(&state->lock);
-	list_for_each_entry(peer, &state->peers, node) {
-		struct tbv_rail *rail;
+			list_for_each_entry(rail, &peer->rails, node) {
+				struct tbv_ibdev *dev = rail->ibdev;
 
-		list_for_each_entry(rail, &peer->rails, node) {
-			struct tbv_ibdev *dev = rail->ibdev;
+				if (!dev || dev->netdev != ndev)
+					continue;
 
-			if (!dev || dev->netdev != ndev)
-				continue;
-
-			pr_info("detaching ib_device %s from unregistering netdev %s\n",
-				dev_name(&dev->base.dev), ndev->name);
-			tbv_ibdev_detach_netdev(dev);
+				pr_info("detaching ib_device %s from unregistering netdev %s\n",
+					dev_name(&dev->base.dev), ndev->name);
+				tbv_ibdev_detach_netdev(dev);
+			}
 		}
+		mutex_unlock(&state->lock);
+		mutex_unlock(&state->rail_register_lock);
+		return NOTIFY_DONE;
+	default:
+		return NOTIFY_DONE;
 	}
-	mutex_unlock(&state->lock);
-	mutex_unlock(&state->rail_register_lock);
-	return NOTIFY_DONE;
 }
 
 static int tbv_ibdev_register_netdev_notifier(struct tbv_state *state)
@@ -9048,6 +9160,8 @@ static int tbv_ibdev_register_netdev_notifier(struct tbv_state *state)
 	if (state->ibdev_netdev_nb_registered)
 		return 0;
 
+	INIT_WORK(&state->ibdev_netdev_retry_work,
+		  tbv_ibdev_netdev_retry_work);
 	state->ibdev_netdev_nb.notifier_call = tbv_ibdev_netdev_event;
 	ret = register_netdevice_notifier(&state->ibdev_netdev_nb);
 	if (ret)
@@ -9064,6 +9178,7 @@ static void tbv_ibdev_unregister_netdev_notifier(struct tbv_state *state)
 
 	unregister_netdevice_notifier(&state->ibdev_netdev_nb);
 	state->ibdev_netdev_nb_registered = false;
+	cancel_work_sync(&state->ibdev_netdev_retry_work);
 }
 
 int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
@@ -9089,8 +9204,8 @@ int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
 	 * Catch up any rails that became data-ready before this ran. After
 	 * register_enabled is true, native_control and service hooks publish
 	 * rising-edge events directly; this loop replays the edges they
-	 * would have missed. Rails that previously failed to register
-	 * (ibdev_register_failed) are skipped so a single bad lane cannot
+	 * would have missed. Rails that previously failed permanently or are
+	 * waiting for a late RoCE netdev are skipped so a single lane cannot
 	 * spin the loop forever.
 	 */
 	for (;;) {
@@ -9103,17 +9218,19 @@ int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
 
 			list_for_each_entry(rail, &peer->rails, node) {
 				/*
-				 * Read ibdev / ibdev_register_failed without
+				 * Read registration state without
 				 * rail_register_lock: this is only a hint to
 				 * avoid waking the event on rails that have
-				 * obviously already been handled. The real
-				 * gates are re-checked inside the event under
-				 * rail_register_lock. Taking rail_register_lock
-				 * here would invert the lock order we use in
-				 * tbv_ibdev_rail_event (register-then-state).
+				 * obviously already been handled or deferred.
+				 * The real gates are re-checked inside the
+				 * event under rail_register_lock. Taking
+				 * rail_register_lock here would invert the lock
+				 * order we use in tbv_ibdev_rail_event
+				 * (register-then-state).
 				 */
 				if (READ_ONCE(rail->ibdev) ||
-				    READ_ONCE(rail->ibdev_register_failed))
+				    READ_ONCE(rail->ibdev_register_failed) ||
+				    READ_ONCE(rail->ibdev_register_deferred))
 					continue;
 				if (peer->backend == TBV_BACKEND_NATIVE)
 					ready = tbv_rail_data_ready(rail);
@@ -9133,7 +9250,7 @@ int tbv_ibdev_start(struct tbv_state *state, bool register_verbs)
 			break;
 		/*
 		 * Ignore the per-rail return: on failure the rail is marked
-		 * ibdev_register_failed inside the event, so the next loop
+		 * failed or deferred inside the event, so the next loop
 		 * iteration skips it and we make forward progress instead of
 		 * pinning the same lane. Other rails should still publish.
 		 */

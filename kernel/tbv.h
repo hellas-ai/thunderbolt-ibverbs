@@ -280,6 +280,12 @@ struct tbv_rail {
 	 * otherwise cause.
 	 */
 	bool ibdev_register_failed;
+	/*
+	 * Retryable registration blocker. A ready rail can reach verbs
+	 * registration before the configured RoCE netdev exists; keep it out of
+	 * the catchup loop until a matching netdev notifier event retries it.
+	 */
+	bool ibdev_register_deferred;
 	bool native_negotiated;
 	bool native_ready_sent;
 	bool native_remote_ready;
@@ -579,6 +585,7 @@ struct tbv_state {
 	 * take state->lock.
 	 */
 	struct mutex rail_register_lock;
+	struct work_struct ibdev_netdev_retry_work;
 	/*
 	 * Up-event gate, owned by rail_register_lock. Set to true by
 	 * tbv_ibdev_start() before any rising-edge events may publish; cleared

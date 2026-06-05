@@ -65,10 +65,10 @@ void tbv_path_exit_optional_symbols(void)
 	tbv_ring_throttling = NULL;
 }
 
-static bool apple_tx_raw_mode = true;
+static bool apple_tx_raw_mode;
 module_param(apple_tx_raw_mode, bool, 0644);
 MODULE_PARM_DESC(apple_tx_raw_mode,
-		 "Use RAW descriptors for Apple-compatible TX rings");
+		 "Use RAW descriptors for Apple-compatible TX rings; default keeps FRAME descriptors");
 
 static bool apple_tx_e2e;
 module_param(apple_tx_e2e, bool, 0644);
