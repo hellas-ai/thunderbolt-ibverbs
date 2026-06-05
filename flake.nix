@@ -22,14 +22,12 @@
       portableLocalThunderboltKernelPatches = import ./kernel-workflow/patches/local-portable.nix;
       portableThunderboltKernelPatches = import ./kernel-workflow/patches/portable.nix;
       integrationDebugThunderboltKernelPatches = import ./kernel-workflow/patches/local-integration-debug.nix;
-      localThunderboltKernelPatches = import ./kernel-workflow/patches;
+      integrationThunderboltKernelPatches = import ./kernel-workflow/patches/local.nix;
       kernelPatchSets = {
-        kernelPatches = localThunderboltKernelPatches;
-        portableKernelPatches = portableThunderboltKernelPatches;
+        kernelPatches = portableThunderboltKernelPatches;
+        integrationKernelPatches = integrationThunderboltKernelPatches;
         upstreamKernelPatches = upstreamThunderboltKernelPatches;
         portableLocalKernelPatches = portableLocalThunderboltKernelPatches;
-        integrationDebugKernelPatches = integrationDebugThunderboltKernelPatches;
-        kernelPatchesForIntegrationTree = localThunderboltKernelPatches;
       };
       linuxSystems = [ "x86_64-linux" ];
       darwinSystems = [ "aarch64-darwin" ];
@@ -64,7 +62,7 @@
         pkgs:
         let
           testingKernel = pkgs.linuxPackages_testing.kernel;
-          kernelPatches = (testingKernel.passthru.kernelPatches or [ ]) ++ localThunderboltKernelPatches;
+          kernelPatches = (testingKernel.passthru.kernelPatches or [ ]) ++ integrationThunderboltKernelPatches;
         in
         (testingKernel.override {
           argsOverride = {
