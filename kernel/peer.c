@@ -4,15 +4,43 @@
 
 #include <linux/errno.h>
 #include <linux/moduleparam.h>
+#include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/thunderbolt.h>
 
 #include "tbv.h"
 
-static bool native_e2e = true;
-module_param(native_e2e, bool, 0444);
+#define TBV_NATIVE_E2E_AUTO	(-1)
+
+static int native_e2e = TBV_NATIVE_E2E_AUTO;
+module_param(native_e2e, int, 0444);
 MODULE_PARM_DESC(native_e2e,
-		 "Enable E2E flow control on native Linux data rings");
+		 "Native Linux data ring E2E mode: -1 auto, 0 off, 1 on");
+
+static bool tbv_native_e2e_auto_enabled(const struct tbv_peer *peer)
+{
+	const struct tb_xdomain *xd = peer ? peer->xd : NULL;
+	struct device *dev;
+	struct pci_dev *pdev;
+
+	if (!xd || !xd->tb)
+		return true;
+
+	dev = xd->tb->dev.parent;
+	if (!dev || !dev_is_pci(dev))
+		return true;
+
+	pdev = to_pci_dev(dev);
+	return pdev->vendor != PCI_VENDOR_ID_AMD;
+}
+
+static bool tbv_native_e2e_enabled(const struct tbv_peer *peer)
+{
+	if (native_e2e >= 0)
+		return native_e2e > 0;
+
+	return tbv_native_e2e_auto_enabled(peer);
+}
 
 static bool tbv_xdomain_same_remote_host(const struct tb_xdomain *a,
 					 const struct tb_xdomain *b)
@@ -229,12 +257,13 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 	rail->native_remote_ready = false;
 	tbv_native_control_init_rail(rail, peer);
 	tbv_path_default_config(peer->backend, &path_cfg);
-	if (peer->backend == TBV_BACKEND_NATIVE && native_e2e) {
+	if (peer->backend == TBV_BACKEND_NATIVE &&
+	    tbv_native_e2e_enabled(peer)) {
 		/*
-		 * Native rails only bind to Linux peers.  Even in mixed mode the
-		 * Mac-facing wire format is handled by the separate Apple
-		 * backend, so native can keep hardware E2E enabled by default.
-		 * native_e2e=0 is a diagnostic override for loss localization.
+		 * E2E is hardware flow control only; it does not retransmit
+		 * lost frames. In auto mode AMD NHI uses the software data
+		 * credit scheme alone because Strix Halo has reproduced TX
+		 * completion wedges with multiple native E2E rings active.
 		 */
 		path_cfg.tx_flags |= RING_FLAG_E2E;
 		path_cfg.rx_flags |= RING_FLAG_E2E;
