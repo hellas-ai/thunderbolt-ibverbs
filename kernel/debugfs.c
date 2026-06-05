@@ -341,6 +341,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_no_qp_reack));
 	seq_printf(s, "data_rx_no_qp_error_ack: %lld\n",
 		   atomic64_read(&state->data_rx_no_qp_error_ack));
+	seq_printf(s, "data_qp_tombstone_evicted: %lld\n",
+		   atomic64_read(&state->data_qp_tombstone_evicted));
 	seq_printf(s, "data_tx_read_ack_ok: %lld\n",
 		   atomic64_read(&state->data_tx_read_ack_ok));
 	seq_printf(s, "data_tx_read_ack_retry: %lld\n",

@@ -1453,13 +1453,42 @@ void tbv_ibdev_clear_qp_tombstones(struct tbv_state *state)
 	}
 }
 
+static unsigned long
+tbv_qp_tombstone_lifetime_jiffies(unsigned long tx_timeout, u8 max_retries)
+{
+	unsigned long min_lifetime =
+		msecs_to_jiffies(TBV_QP_TOMBSTONE_LIFETIME_MS);
+	unsigned long retry_window;
+
+	if (!min_lifetime)
+		min_lifetime = 1;
+	if (!tx_timeout)
+		return min_lifetime;
+
+	/*
+	 * Keep the tombstone past the sender's retry budget. The extra timeout
+	 * covers the final post-retry wait plus scheduling/teardown jitter.
+	 */
+	if (check_mul_overflow(tx_timeout, (unsigned long)max_retries + 2,
+			       &retry_window))
+		retry_window = MAX_JIFFY_OFFSET;
+
+	return max(min_lifetime, retry_window);
+}
+
 static void tbv_qp_publish_tombstone(struct tbv_qp *tqp)
 {
 	struct tbv_qp_tombstone *ts;
 	struct tbv_qp_tombstone *pos, *tmp;
 	struct tbv_state *state = tqp ? tqp->owner : NULL;
 	unsigned long flags;
+	unsigned long tx_timeout;
 	bool dest_known;
+	bool evicted = false;
+	u8 max_retries;
+	u32 evicted_qpn = 0;
+	u32 evicted_remote_qpn = 0;
+	u32 tombstone_count;
 	u32 remote_qpn;
 
 	if (!state || !tqp->qpn_allocated || tqp->type == IB_QPT_GSI)
@@ -1468,6 +1497,8 @@ static void tbv_qp_publish_tombstone(struct tbv_qp *tqp)
 	spin_lock_irqsave(&tqp->lock, flags);
 	dest_known = tqp->dest_qp_known;
 	remote_qpn = tqp->attr.dest_qp_num;
+	tx_timeout = tbv_qp_tx_timeout_jiffies_locked(tqp);
+	max_retries = tbv_qp_send_max_retries(tqp);
 	spin_unlock_irqrestore(&tqp->lock, flags);
 	if (!dest_known)
 		return;
@@ -1478,7 +1509,9 @@ static void tbv_qp_publish_tombstone(struct tbv_qp *tqp)
 
 	ts->qpn = tqp->base.qp_num;
 	ts->remote_qpn = remote_qpn;
-	ts->expires = jiffies + msecs_to_jiffies(TBV_QP_TOMBSTONE_LIFETIME_MS);
+	ts->expires = jiffies +
+		      tbv_qp_tombstone_lifetime_jiffies(tx_timeout,
+							max_retries);
 	mutex_lock(&tqp->rx_lock);
 	memcpy(ts->ack_history, tqp->ack_history, sizeof(ts->ack_history));
 	mutex_unlock(&tqp->rx_lock);
@@ -1501,9 +1534,19 @@ static void tbv_qp_publish_tombstone(struct tbv_qp *tqp)
 				      struct tbv_qp_tombstone, node);
 		list_del(&pos->node);
 		state->qp_tombstone_count--;
+		evicted = true;
+		evicted_qpn = pos->qpn;
+		evicted_remote_qpn = pos->remote_qpn;
+		atomic64_inc(&state->data_qp_tombstone_evicted);
 		kfree(pos);
 	}
+	tombstone_count = state->qp_tombstone_count;
 	spin_unlock_irqrestore(&state->qp_tombstone_lock, flags);
+
+	if (evicted)
+		pr_warn_ratelimited("native QP tombstone cap evicted qpn=0x%x remote_qpn=0x%x count=%u cap=%u\n",
+				    evicted_qpn, evicted_remote_qpn,
+				    tombstone_count, TBV_QP_TOMBSTONE_MAX);
 }
 
 static bool tbv_native_data_op_has_send_ack(u8 opcode)

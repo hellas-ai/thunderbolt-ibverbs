@@ -553,6 +553,7 @@ struct tbv_state {
 	atomic64_t data_rx_ack_history_miss;
 	atomic64_t data_rx_no_qp_reack;
 	atomic64_t data_rx_no_qp_error_ack;
+	atomic64_t data_qp_tombstone_evicted;
 	atomic64_t data_tx_read_ack_ok;
 	atomic64_t data_tx_read_ack_retry;
 	atomic64_t data_tx_read_ack_error;
