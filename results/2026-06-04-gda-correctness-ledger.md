@@ -2364,3 +2364,52 @@ Interpretation:
 6. Operational default remains safe: `native_qp_tombstone_reack=1`,
    `native_unsafe_retransmit_teardown_guard_disable=0`,
    `native_ack_drop_every=0`, and `qp_timeout_ms=30000`.
+
+Post-breadcrumb redeploy sanity:
+
+After adding the emergency-level breadcrumb for the unsafe teardown retry path,
+the branch was redeployed to both Strix hosts. The paired Colmena deploy first
+failed for `strix-2` because `strix-1` was being used as a remote builder while
+also being rebooted; retrying `strix-2` alone completed cleanly.
+
+```text
+strix-1=/nix/store/g4ncxvshjv7m031z6i9pdq0xbrrl9zq2-nixos-system-strix-1-26.11pre-git
+strix-2=/nix/store/i63c0v4snl1q7hyibj06wnmaasfrpvx0-nixos-system-strix-2-26.11pre-git
+kernel=7.0.10
+```
+
+Final fenced sanity on the deployed baseline:
+
+```text
+count=256 timeout_ms=60000 native_tx_max_inflight=6 qp_timeout_ms=30000
+native_ack_drop_every=0
+native_qp_tombstone_reack=1
+native_retransmit_teardown_guard=1
+final_fence=1
+port=18567
+sender:   status=OK elapsed_sec=0.054835
+receiver: status=OK elapsed_sec=0.055007
+
+sender:
+data_wr_send=512
+data_wr_retransmit=0
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_rx_ack=1024
+data_rx_ack_matched=512
+data_rx_ack_match_retried=0
+data_rx_canceled=0
+data_rx_no_qp=0
+
+receiver:
+data_tx_ack_ok=512
+data_tx_ack_drop_checked=0 data_tx_ack_drop_injected=0
+data_rx_duplicate_ack=0
+data_rx_no_qp=0
+data_rx_no_qp_reack=0
+data_rx_no_qp_error_ack=0
+data_rx_canceled=0
+```
