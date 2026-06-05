@@ -109,6 +109,7 @@
               packaging/regen-rdma-core-patches.sh \
               packaging/test-rdma-patches.sh \
               kernel-workflow/regen-upstream-thunderbolt-patches.sh \
+              tools/tbv-target-module.sh \
               tools/ci/distro-build.sh \
               tools/ci/distro-install.sh \
               tools/ci/distro-package-rdma.sh \
@@ -362,6 +363,25 @@
         pkgs:
         let
           pkgsAt = self.packages.${pkgs.stdenv.hostPlatform.system};
+          targetModuleApp = pkgs.writeShellApplication {
+            name = "tbv-target-module";
+            runtimeInputs = [
+              pkgs.coreutils
+              pkgs.findutils
+              pkgs.gawk
+              pkgs.gnugrep
+              pkgs.kmod
+              pkgs.nix
+              pkgs.openssh
+            ];
+            text = ''
+              exec ${./tools/tbv-target-module.sh} "$@"
+            '';
+            meta = {
+              description = "Build, verify, copy, and optionally reload thunderbolt_ibverbs for a NixOS target kernel";
+              maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+            };
+          };
         in
         {
           tbv-perftest = {
@@ -369,6 +389,14 @@
             program = lib.getExe pkgsAt.tbv-perftest;
             meta = {
               description = "Run the Thunderbolt/USB4 RDMA perftest benchmark matrix";
+              maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+            };
+          };
+          tbv-target-module = {
+            type = "app";
+            program = lib.getExe targetModuleApp;
+            meta = {
+              description = "Build and reload thunderbolt_ibverbs only when the module matches the target's booted kernel";
               maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
             };
           };
