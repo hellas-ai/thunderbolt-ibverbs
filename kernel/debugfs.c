@@ -211,6 +211,12 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_retransmit));
 	seq_printf(s, "data_wr_rnr_retransmit: %lld\n",
 		   atomic64_read(&state->data_wr_rnr_retransmit));
+	seq_printf(s, "data_wr_retransmit_closing_qp: %lld\n",
+		   atomic64_read(&state->data_wr_retransmit_closing_qp));
+	seq_printf(s, "data_wr_retransmit_no_live_path: %lld\n",
+		   atomic64_read(&state->data_wr_retransmit_no_live_path));
+	seq_printf(s, "data_wr_retransmit_teardown_path: %lld\n",
+		   atomic64_read(&state->data_wr_retransmit_teardown_path));
 	seq_printf(s, "data_wr_retry_enqueue_error: %lld\n",
 		   atomic64_read(&state->data_wr_retry_enqueue_error));
 	seq_printf(s, "data_wr_retry_exhausted: %lld\n",
@@ -331,6 +337,10 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_duplicate_ack));
 	seq_printf(s, "data_rx_ack_history_miss: %lld\n",
 		   atomic64_read(&state->data_rx_ack_history_miss));
+	seq_printf(s, "data_rx_no_qp_reack: %lld\n",
+		   atomic64_read(&state->data_rx_no_qp_reack));
+	seq_printf(s, "data_rx_no_qp_error_ack: %lld\n",
+		   atomic64_read(&state->data_rx_no_qp_error_ack));
 	seq_printf(s, "data_tx_read_ack_ok: %lld\n",
 		   atomic64_read(&state->data_tx_read_ack_ok));
 	seq_printf(s, "data_tx_read_ack_retry: %lld\n",

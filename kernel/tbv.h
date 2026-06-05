@@ -488,6 +488,9 @@ struct tbv_state {
 	atomic64_t data_wr_path_send_error;
 	atomic64_t data_wr_retransmit;
 	atomic64_t data_wr_rnr_retransmit;
+	atomic64_t data_wr_retransmit_closing_qp;
+	atomic64_t data_wr_retransmit_no_live_path;
+	atomic64_t data_wr_retransmit_teardown_path;
 	atomic64_t data_wr_retry_enqueue_error;
 	atomic64_t data_wr_retry_exhausted;
 	atomic64_t data_wr_rnr_retry_exhausted;
@@ -548,6 +551,8 @@ struct tbv_state {
 	atomic64_t data_rx_ack_rnr;
 	atomic64_t data_rx_duplicate_ack;
 	atomic64_t data_rx_ack_history_miss;
+	atomic64_t data_rx_no_qp_reack;
+	atomic64_t data_rx_no_qp_error_ack;
 	atomic64_t data_tx_read_ack_ok;
 	atomic64_t data_tx_read_ack_retry;
 	atomic64_t data_tx_read_ack_error;
@@ -609,6 +614,9 @@ struct tbv_state {
 	atomic64_t native_legacy_ambiguous_limited;
 	struct xarray verbs_mrs_xa;
 	struct xarray verbs_qps_xa;
+	spinlock_t qp_tombstone_lock;
+	struct list_head qp_tombstones;
+	u32 qp_tombstone_count;
 	/*
 	 * Serializes per-rail ib_device registration against teardown.
 	 * tbv_ibdev_rail_event() publishes one ib_device per active rail as
@@ -840,6 +848,7 @@ u32 tbv_link_count(struct tbv_state *state);
 void tbv_link_debugfs_show(struct seq_file *s, struct tbv_state *state);
 int tbv_debugfs_init(struct tbv_state *state);
 void tbv_debugfs_exit(struct tbv_state *state);
+void tbv_ibdev_clear_qp_tombstones(struct tbv_state *state);
 int tbv_configfs_start(struct tbv_state *state);
 void tbv_configfs_stop(struct tbv_state *state);
 

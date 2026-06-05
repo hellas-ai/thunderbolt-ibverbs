@@ -69,6 +69,8 @@
 #define TBV_RX_REORDER_MAX_BYTES (64u * 1024u * 1024u)
 #define TBV_RX_REORDER_MAX_FRAGS TBV_NATIVE_DATA_MAX_FRAGS
 #define TBV_ACK_HISTORY_SIZE TBV_IBDEV_MAX_QP_WR
+#define TBV_QP_TOMBSTONE_MAX 128
+#define TBV_QP_TOMBSTONE_LIFETIME_MS 30000
 #define TBV_IBDEV_GID_TBL_LEN 8
 #define TBV_APPLE_PENDING_RX_DEFAULT_SLOTS 4096
 #define TBV_APPLE_PENDING_RX_MAX_SLOTS 16384
@@ -305,6 +307,14 @@ struct tbv_ack_history_entry {
 	u32 psn;
 	int status;
 	bool valid;
+};
+
+struct tbv_qp_tombstone {
+	struct list_head node;
+	u32 qpn;
+	u32 remote_qpn;
+	unsigned long expires;
+	struct tbv_ack_history_entry ack_history[TBV_ACK_HISTORY_SIZE];
 };
 
 enum tbv_send_post_reason {
@@ -1283,6 +1293,107 @@ static bool tbv_send_rnr_waits_for_recv_credit(const struct tbv_send_ctx *send)
 	return send->recv_credit_required && tbv_send_rnr_retries_infinite(send);
 }
 
+static bool tbv_send_post_reason_is_retry(enum tbv_send_post_reason reason)
+{
+	return reason == TBV_SEND_POST_RETRY_TIMEOUT ||
+	       reason == TBV_SEND_POST_RETRY_RNR;
+}
+
+static void
+tbv_note_retransmit_closing_qp(struct tbv_qp *tqp,
+			       const struct tbv_send_ctx *send,
+			       enum tbv_send_post_reason reason,
+			       const char *where, enum ib_qp_state qp_state,
+			       bool closing)
+{
+	if (!tqp || !tqp->owner || !tbv_send_post_reason_is_retry(reason))
+		return;
+	if (!closing && qp_state != IB_QPS_ERR && qp_state != IB_QPS_RESET)
+		return;
+
+	atomic64_inc(&tqp->owner->data_wr_retransmit_closing_qp);
+	pr_warn_ratelimited("native retransmit saw closing QP where=%s qpn=0x%x dest_qp=0x%x psn=%u reason=%u closing=%u qp_state=%u pending=%u completed=%u tx_pending=%d\n",
+			    where, tqp->base.qp_num, tqp->attr.dest_qp_num,
+			    send ? send->psn : 0, reason, closing, qp_state,
+			    send ? send->pending : 0,
+			    send ? send->completed : 0,
+			    send ? atomic_read(&send->tx_pending) : 0);
+}
+
+static void
+tbv_note_retransmit_no_live_path(struct tbv_send_ctx *ctx,
+				 enum tbv_send_post_reason reason,
+				 const char *where)
+{
+	struct tbv_qp *tqp = ctx ? ctx->tqp : NULL;
+	struct tbv_rail *rail = tqp ? READ_ONCE(tqp->rail) : NULL;
+
+	if (!tqp || !tqp->owner || !tbv_send_post_reason_is_retry(reason))
+		return;
+
+	atomic64_inc(&tqp->owner->data_wr_retransmit_no_live_path);
+	pr_warn_ratelimited("native retransmit found no live path where=%s qpn=0x%x dest_qp=0x%x psn=%u reason=%u closing=%u qp_state=%u rail=%u rail_removing=%u rail_ready=%u\n",
+			    where, tqp->base.qp_num, tqp->attr.dest_qp_num,
+			    ctx->psn, reason, READ_ONCE(tqp->closing),
+			    READ_ONCE(tqp->state), rail ? rail->rail_id : U32_MAX,
+			    rail ? READ_ONCE(rail->removing) : 0,
+			    rail ? tbv_rail_data_ready(rail) : 0);
+}
+
+static bool
+tbv_retransmit_path_teardown_observed(struct tbv_send_ctx *ctx,
+				      enum tbv_send_post_reason reason,
+				      struct tbv_path *path,
+				      const char *where)
+{
+	struct tbv_qp *tqp = ctx ? ctx->tqp : NULL;
+	struct tbv_rail *rail = path ? READ_ONCE(path->rail) : NULL;
+	enum tbv_path_state path_state;
+	bool rail_removing;
+	bool rail_active;
+	bool missing_tx;
+	bool missing_rx;
+
+	if (!tqp || !tqp->owner || !tbv_send_post_reason_is_retry(reason))
+		return false;
+	if (!path)
+		return false;
+
+	path_state = READ_ONCE(path->state);
+	rail_removing = rail ? READ_ONCE(rail->removing) : true;
+	rail_active = rail ? READ_ONCE(rail->active) : false;
+	missing_tx = !READ_ONCE(path->tx_ring);
+	missing_rx = !READ_ONCE(path->rx_ring);
+
+	if (rail && !rail_removing &&
+	    path_state == TBV_PATH_TUNNEL_ENABLED && !missing_tx && !missing_rx)
+		return false;
+
+	atomic64_inc(&tqp->owner->data_wr_retransmit_teardown_path);
+	pr_warn_ratelimited("native retransmit selected teardown path where=%s qpn=0x%x dest_qp=0x%x psn=%u reason=%u rail=%u rail_active=%u rail_removing=%u path_state=%u tx_ring_missing=%u rx_ring_missing=%u\n",
+			    where, tqp->base.qp_num, tqp->attr.dest_qp_num,
+			    ctx->psn, reason, rail ? rail->rail_id : U32_MAX,
+			    rail_active, rail_removing, path_state,
+			    missing_tx, missing_rx);
+	return true;
+}
+
+static bool
+tbv_retransmit_paths_teardown_observed(struct tbv_send_ctx *ctx,
+				       enum tbv_send_post_reason reason,
+				       struct tbv_path **paths,
+				       u32 path_count, const char *where)
+{
+	u32 i;
+
+	for (i = 0; i < path_count; i++) {
+		if (tbv_retransmit_path_teardown_observed(ctx, reason,
+							  paths[i], where))
+			return true;
+	}
+	return false;
+}
+
 static void tbv_qp_ack_history_store_locked(struct tbv_qp *tqp, u32 psn,
 					    int status)
 {
@@ -1305,6 +1416,171 @@ static bool tbv_qp_ack_history_lookup_locked(struct tbv_qp *tqp, u32 psn,
 	if (status)
 		*status = entry->status;
 	return true;
+}
+
+static void tbv_qp_prune_tombstones_locked(struct tbv_state *state,
+					   unsigned long now)
+{
+	struct tbv_qp_tombstone *ts, *tmp;
+
+	list_for_each_entry_safe(ts, tmp, &state->qp_tombstones, node) {
+		if (!time_after(now, ts->expires))
+			continue;
+		list_del(&ts->node);
+		if (state->qp_tombstone_count)
+			state->qp_tombstone_count--;
+		kfree(ts);
+	}
+}
+
+void tbv_ibdev_clear_qp_tombstones(struct tbv_state *state)
+{
+	struct tbv_qp_tombstone *ts, *tmp;
+	LIST_HEAD(dead);
+	unsigned long flags;
+
+	if (!state)
+		return;
+
+	spin_lock_irqsave(&state->qp_tombstone_lock, flags);
+	list_splice_init(&state->qp_tombstones, &dead);
+	state->qp_tombstone_count = 0;
+	spin_unlock_irqrestore(&state->qp_tombstone_lock, flags);
+
+	list_for_each_entry_safe(ts, tmp, &dead, node) {
+		list_del(&ts->node);
+		kfree(ts);
+	}
+}
+
+static void tbv_qp_publish_tombstone(struct tbv_qp *tqp)
+{
+	struct tbv_qp_tombstone *ts;
+	struct tbv_qp_tombstone *pos, *tmp;
+	struct tbv_state *state = tqp ? tqp->owner : NULL;
+	unsigned long flags;
+	bool dest_known;
+	u32 remote_qpn;
+
+	if (!state || !tqp->qpn_allocated || tqp->type == IB_QPT_GSI)
+		return;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	dest_known = tqp->dest_qp_known;
+	remote_qpn = tqp->attr.dest_qp_num;
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	if (!dest_known)
+		return;
+
+	ts = kzalloc(sizeof(*ts), GFP_KERNEL);
+	if (!ts)
+		return;
+
+	ts->qpn = tqp->base.qp_num;
+	ts->remote_qpn = remote_qpn;
+	ts->expires = jiffies + msecs_to_jiffies(TBV_QP_TOMBSTONE_LIFETIME_MS);
+	mutex_lock(&tqp->rx_lock);
+	memcpy(ts->ack_history, tqp->ack_history, sizeof(ts->ack_history));
+	mutex_unlock(&tqp->rx_lock);
+
+	spin_lock_irqsave(&state->qp_tombstone_lock, flags);
+	tbv_qp_prune_tombstones_locked(state, jiffies);
+	list_for_each_entry_safe(pos, tmp, &state->qp_tombstones, node) {
+		if (pos->qpn != ts->qpn || pos->remote_qpn != ts->remote_qpn)
+			continue;
+		list_del(&pos->node);
+		if (state->qp_tombstone_count)
+			state->qp_tombstone_count--;
+		kfree(pos);
+		break;
+	}
+	list_add(&ts->node, &state->qp_tombstones);
+	state->qp_tombstone_count++;
+	while (state->qp_tombstone_count > TBV_QP_TOMBSTONE_MAX) {
+		pos = list_last_entry(&state->qp_tombstones,
+				      struct tbv_qp_tombstone, node);
+		list_del(&pos->node);
+		state->qp_tombstone_count--;
+		kfree(pos);
+	}
+	spin_unlock_irqrestore(&state->qp_tombstone_lock, flags);
+}
+
+static bool tbv_native_data_op_has_send_ack(u8 opcode)
+{
+	return opcode == TBV_NATIVE_DATA_OP_SEND ||
+	       opcode == TBV_NATIVE_DATA_OP_SEND_IMM ||
+	       opcode == TBV_NATIVE_DATA_OP_RDMA_WRITE ||
+	       opcode == TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM;
+}
+
+static bool
+tbv_qp_tombstone_lookup_ack_locked(struct tbv_state *state, u32 qpn,
+				   u32 remote_qpn, u32 psn, int *status,
+				   bool *found_tombstone)
+{
+	struct tbv_qp_tombstone *ts;
+
+	*found_tombstone = false;
+	list_for_each_entry(ts, &state->qp_tombstones, node) {
+		const struct tbv_ack_history_entry *entry;
+
+		if (ts->qpn != qpn || ts->remote_qpn != remote_qpn)
+			continue;
+		*found_tombstone = true;
+		entry = &ts->ack_history[psn % TBV_ACK_HISTORY_SIZE];
+		if (!entry->valid || entry->psn != (psn & TBV_PSN_MASK))
+			return false;
+		*status = entry->status;
+		return true;
+	}
+	return false;
+}
+
+static void tbv_rx_no_qp_ack_or_error(struct tbv_state *state,
+				      struct tbv_path *rx_path,
+				      const struct tbv_native_data_header *hdr)
+{
+	unsigned long flags;
+	bool found_tombstone = false;
+	bool found_ack = false;
+	u32 psn = hdr->psn & TBV_PSN_MASK;
+	int status = TBV_NATIVE_SEND_ACK_ERROR;
+	int ret;
+
+	if (!state || !tbv_native_data_op_has_send_ack(hdr->opcode))
+		return;
+
+	spin_lock_irqsave(&state->qp_tombstone_lock, flags);
+	tbv_qp_prune_tombstones_locked(state, jiffies);
+	found_ack = tbv_qp_tombstone_lookup_ack_locked(
+		state, hdr->dest_qp, hdr->src_qp, psn, &status,
+		&found_tombstone);
+	spin_unlock_irqrestore(&state->qp_tombstone_lock, flags);
+
+	if (found_ack) {
+		atomic64_inc(&state->data_rx_no_qp_reack);
+	} else {
+		if (found_tombstone)
+			atomic64_inc(&state->data_rx_ack_history_miss);
+		atomic64_inc(&state->data_rx_no_qp_error_ack);
+		status = TBV_NATIVE_SEND_ACK_ERROR;
+	}
+
+	ret = tbv_send_ack_on_path(NULL, rx_path, hdr->src_qp, hdr->dest_qp,
+				   psn, status);
+	if (ret) {
+		atomic64_inc(&state->data_tx_ack_send_error);
+	} else if (status == TBV_NATIVE_SEND_ACK_OK) {
+		atomic64_inc(&state->data_tx_ack_ok);
+	} else {
+		atomic64_inc(&state->data_tx_ack_error);
+	}
+
+	pr_warn_ratelimited("native RX no-QP %s dest_qp=0x%x src_qp=0x%x psn=%u opcode=%u ret=%d tombstone=%u\n",
+			    found_ack ? "re-acked" : "error-acked",
+			    hdr->dest_qp, hdr->src_qp, psn, hdr->opcode, ret,
+			    found_tombstone);
 }
 
 static bool tbv_rx_reack_duplicate_locked(struct tbv_state *state,
@@ -1665,14 +1941,23 @@ static bool tbv_qp_send_retry_pending(struct tbv_qp *tqp,
 				      struct tbv_send_ctx *send)
 {
 	unsigned long flags;
+	enum ib_qp_state qp_state;
+	bool closing;
 	bool pending;
 
 	spin_lock_irqsave(&tqp->lock, flags);
-	pending = send->pending && !tqp->closing && tqp->state != IB_QPS_ERR &&
+	closing = tqp->closing;
+	qp_state = tqp->state;
+	pending = send->pending && !closing && qp_state != IB_QPS_ERR &&
 		  !send->rnr_waiting && !atomic_read(&send->tx_pending);
 	if (!pending)
 		send->retrying = false;
 	spin_unlock_irqrestore(&tqp->lock, flags);
+	if (!pending)
+		tbv_note_retransmit_closing_qp(tqp, send,
+					       send->retry_reason,
+					       "retry-pending", qp_state,
+					       closing);
 	return pending;
 }
 
@@ -2683,6 +2968,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 	spin_lock_irqsave(&tqp->lock, flags);
 	tqp->closing = true;
 	spin_unlock_irqrestore(&tqp->lock, flags);
+	tbv_qp_publish_tombstone(tqp);
 
 	if (tqp->type == IB_QPT_GSI && tqp->rail && tqp->rail->ibdev) {
 		mutex_lock(&tqp->owner->lock);
@@ -2762,6 +3048,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 		return -ETIMEDOUT;
 	}
 
+	tbv_qp_publish_tombstone(tqp);
 	if (tqp->owner && tqp->qpn_allocated) {
 		xa_lock_irqsave(&tqp->owner->verbs_qps_xa, flags);
 		__xa_erase(&tqp->owner->verbs_qps_xa, qp->qp_num);
@@ -4418,6 +4705,14 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 		path = tbv_select_native_data_path_for_qp_locked(tqp);
 		mutex_unlock(&tqp->owner->lock);
 		if (!path) {
+			tbv_note_retransmit_no_live_path(ctx, reason,
+							 "zcopy-select");
+			atomic64_inc(&tqp->owner->data_wr_no_path);
+			return -ENOTCONN;
+		}
+		if (tbv_retransmit_path_teardown_observed(ctx, reason, path,
+							  "zcopy-select")) {
+			tbv_release_path_refs(&path, 1);
 			atomic64_inc(&tqp->owner->data_wr_no_path);
 			return -ENOTCONN;
 		}
@@ -4433,6 +4728,14 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 		stream->max_chunk = TBV_NATIVE_DATA_FRAME_SIZE;
 		stream->nsegs = ctx->nsegs;
 		tbv_get_send_segments(stream->segs, ctx->segs, ctx->nsegs);
+
+		if (tbv_retransmit_path_teardown_observed(ctx, reason, path,
+							  "zcopy-send")) {
+			tbv_release_path_refs(&path, 1);
+			tbv_send_page_stream_put(stream);
+			atomic64_inc(&tqp->owner->data_wr_no_path);
+			return -ENOTCONN;
+		}
 
 		tbv_send_ctx_get(ctx);
 		tbv_send_ctx_get(ctx);
@@ -4470,6 +4773,8 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 		path_count = tbv_collect_native_data_paths_for_qp_locked(
 			tqp, paths, ARRAY_SIZE(paths));
 		if (!path_count) {
+			tbv_note_retransmit_no_live_path(ctx, reason,
+							 "striped-select");
 			ret = -ENOTCONN;
 			goto out_unlock_paths;
 		}
@@ -4478,12 +4783,19 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 	} else {
 		path = tbv_select_native_data_path_for_qp_locked(tqp);
 		if (!path) {
+			tbv_note_retransmit_no_live_path(ctx, reason,
+							 "single-select");
 			ret = -ENOTCONN;
 			goto out_unlock_paths;
 		}
 		paths[0] = path;
 		path_count = 1;
 		reservations[0] = nfrags;
+	}
+	if (tbv_retransmit_paths_teardown_observed(ctx, reason, paths,
+						   path_count, "reserve")) {
+		ret = -ENOTCONN;
+		goto out_unlock_paths;
 	}
 
 	for (frag_idx = 0; frag_idx < path_count; frag_idx++) {
@@ -4508,6 +4820,11 @@ out_unlock_paths:
 		tbv_release_path_refs(paths, path_count);
 		atomic64_inc(&tqp->owner->data_wr_no_path);
 		return ret;
+	}
+	if (tbv_retransmit_paths_teardown_observed(ctx, reason, paths,
+						   path_count, "prepare")) {
+		ret = -ENOTCONN;
+		goto err_release_paths;
 	}
 
 	do {
@@ -4565,6 +4882,13 @@ out_unlock_paths:
 		u32 total_frames = 0;
 		u32 queued_frames = 0;
 		u32 refs = 0;
+
+		if (tbv_retransmit_paths_teardown_observed(ctx, reason, paths,
+							   path_count,
+							   "enqueue")) {
+			ret = -ENOTCONN;
+			goto err_release_paths;
+		}
 
 		for (list_idx = 0; list_idx < path_count; list_idx++) {
 			if (!frame_counts[list_idx])
@@ -9343,6 +9667,7 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 			tbv_send_atomic_resp_on_path(NULL, rx_path, hdr->src_qp,
 						     hdr->dest_qp, hdr->psn, 0,
 						     -EINVAL);
+		tbv_rx_no_qp_ack_or_error(state, rx_path, hdr);
 		atomic64_inc(&state->data_rx_no_qp);
 		return;
 	}

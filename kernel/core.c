@@ -35,9 +35,11 @@ int tbv_core_init(struct tbv_state *state,
 	mutex_init(&state->lock);
 	mutex_init(&state->rail_register_lock);
 	mutex_init(&state->dv_poll_lock);
+	spin_lock_init(&state->qp_tombstone_lock);
 	INIT_LIST_HEAD(&state->peers);
 	INIT_LIST_HEAD(&state->configured_links);
 	INIT_LIST_HEAD(&state->dv_poll_qps);
+	INIT_LIST_HEAD(&state->qp_tombstones);
 	init_waitqueue_head(&state->dv_poll_wait);
 	xa_init(&state->verbs_mrs_xa);
 	xa_init(&state->verbs_qps_xa);
@@ -122,6 +124,7 @@ void tbv_core_exit(struct tbv_state *state)
 		pr_warn("unloading with live QP registry entries\n");
 	xa_destroy(&state->verbs_mrs_xa);
 	xa_destroy(&state->verbs_qps_xa);
+	tbv_ibdev_clear_qp_tombstones(state);
 	tbv_tbnet_identity_stop(&state->tbnet_identity);
 	mutex_destroy(&state->dv_poll_lock);
 	mutex_destroy(&state->rail_register_lock);
