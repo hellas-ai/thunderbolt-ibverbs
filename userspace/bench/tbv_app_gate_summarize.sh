@@ -79,7 +79,7 @@ while IFS= read -r rep_dir; do
   t2=$(timing_us "$rank0_log" 2097152)
 
   if [[ $printed -eq 0 ]]; then
-    printf 'mode rep t1_us t2_us wr_retx rnr_retx ack_retry ack64 late_ack dup_ack ack_miss ack_probe ack_probe_fb tx_ack_req tx_ack_req_err rx_ack_req rx_ack_req_reack rx_ack_req_miss rx_ack_req_miss_past rx_ack_req_miss_cur rx_ack_req_miss_cur_active rx_ack_req_miss_cur_reorder rx_ack_req_miss_cur_idle rx_ack_req_miss_fut reord_to reord_retry reord_drop reord_dup_refresh active_to active_retry active_dup_refresh active_merge active_merge_bytes active_merge_complete tx_rnr rx_rnr rnr_exh rnr_exh_cap rnr_exh_close rnr_exh_qperr rnr_wait_notret rnr_wait_retrying rnr_wait_txpend rnr_wait_exh rnr_wait_close rnr_wait_qperr rnr_wait_unknown dv_hard wr_to wr_exh tx_err tx_post tx_comp\n'
+    printf 'mode rep t1_us t2_us wr_retx rnr_retx ack_retry ack64 late_ack dup_ack ack_miss ack_probe ack_probe_fb tx_ack_req tx_ack_req_err rx_ack_req rx_ack_req_reack rx_ack_req_miss rx_ack_req_miss_past rx_ack_req_miss_cur rx_ack_req_miss_cur_active rx_ack_req_miss_cur_reorder rx_ack_req_miss_cur_idle rx_ack_req_miss_fut reord_to reord_retry reord_drop reord_dup_refresh active_to active_retry active_dup_refresh active_merge active_merge_bytes active_merge_complete write_gap_rnr tx_rnr rx_rnr rnr_exh rnr_exh_cap rnr_exh_close rnr_exh_qperr rnr_wait_notret rnr_wait_retrying rnr_wait_txpend rnr_wait_exh rnr_wait_close rnr_wait_qperr rnr_wait_unknown dv_hard wr_to wr_exh tx_err tx_post tx_comp\n'
     printed=1
   fi
 
@@ -115,6 +115,7 @@ while IFS= read -r rep_dir; do
     data_rx_active_write_reorder_merge \
     data_rx_active_write_reorder_merge_bytes \
     data_rx_active_write_reorder_merge_complete \
+    data_rx_write_gap_rnr \
     data_tx_ack_rnr \
     data_rx_ack_rnr \
     data_wr_rnr_retry_exhausted \

@@ -545,6 +545,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_write_imm_reorder_buffered));
 	seq_printf(s, "data_rx_write_imm_reorder_delivered: %lld\n",
 		   atomic64_read(&state->data_rx_write_imm_reorder_delivered));
+	seq_printf(s, "data_rx_write_gap_rnr: %lld\n",
+		   atomic64_read(&state->data_rx_write_gap_rnr));
 	seq_printf(s, "apple_rx_sof: %lld\n",
 		   atomic64_read(&state->apple_rx_sof));
 	seq_printf(s, "apple_rx_eof3: %lld\n",

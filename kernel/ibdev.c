@@ -96,6 +96,7 @@ static uint native_qp_tombstone_max = TBV_QP_TOMBSTONE_DEFAULT_MAX;
 static bool native_unsafe_retransmit_teardown_guard_disable;
 static uint native_ack_repeat = 1;
 static bool native_ack_probe;
+static bool native_write_gap_rnr;
 module_param(roce_netdev, charp, 0444);
 MODULE_PARM_DESC(roce_netdev,
 		 "Netdev used for RoCE GID metadata, for example br0.lan");
@@ -136,6 +137,11 @@ bool tbv_ibdev_native_ack_probe_enabled(void)
 	return READ_ONCE(native_ack_probe);
 }
 
+static bool tbv_ibdev_native_write_gap_rnr_enabled(void)
+{
+	return READ_ONCE(native_write_gap_rnr);
+}
+
 static uint zcopy_min_bytes;
 module_param(zcopy_min_bytes, uint, 0644);
 MODULE_PARM_DESC(zcopy_min_bytes,
@@ -174,6 +180,10 @@ MODULE_PARM_DESC(native_ack_repeat,
 module_param(native_ack_probe, bool, 0644);
 MODULE_PARM_DESC(native_ack_probe,
 		 "Before the first native SEND/WRITE timeout retransmit, send one SEND_ACK_REQ control probe and wait one more timeout; 0 disables");
+
+module_param(native_write_gap_rnr, bool, 0644);
+MODULE_PARM_DESC(native_write_gap_rnr,
+		 "Experimental: when native RDMA_WRITE receives future fragments beyond the active gap, send an RNR ACK for the missing offset before RX timeout");
 
 module_param(native_qp_tombstone_reack, bool, 0644);
 MODULE_PARM_DESC(native_qp_tombstone_reack,
@@ -317,9 +327,16 @@ struct tbv_rx_write {
 	u32 imm_data;
 	u32 total_len;
 	u32 received;
+	u32 first_rail_id;
+	u32 last_rail_id;
+	u64 first_route;
+	u64 last_route;
+	u32 first_path_id;
+	u32 last_path_id;
 	u32 last_offset;
 	u32 last_len;
 	bool active;
+	bool path_seen;
 	bool with_imm;
 	bool solicited;
 };
@@ -353,10 +370,17 @@ struct tbv_rx_reorder_msg {
 	u32 last_offset;
 	u32 last_len;
 	u32 frag_stride;
+	u32 first_rail_id;
+	u32 last_rail_id;
+	u64 first_route;
+	u64 last_route;
+	u32 first_path_id;
+	u32 last_path_id;
 	u16 frag_count;
 	u16 frags_received;
 	DECLARE_BITMAP(frag_seen, TBV_RX_REORDER_MAX_FRAGS);
 	bool complete;
+	bool path_seen;
 	bool with_imm;
 	bool solicited;
 };
@@ -735,6 +759,8 @@ static void tbv_rx_drop_reorder_msg_locked(struct tbv_state *state,
 					   struct tbv_rx_reorder_msg *msg);
 static struct tbv_rx_reorder_msg *tbv_rx_reorder_find(struct tbv_qp *tqp,
 						      u32 psn);
+static u32
+tbv_rx_reorder_first_missing_offset(const struct tbv_rx_reorder_msg *msg);
 static void tbv_rx_drain_reorder_locked(struct tbv_state *state,
 					struct tbv_qp *tqp,
 					struct tbv_path *rx_path);
@@ -4089,15 +4115,22 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 		bool with_imm = tqp->rx_write.with_imm;
 
 		atomic64_inc(&state->data_rx_active_timeout);
-		pr_warn_ratelimited("native RDMA_WRITE active timeout qpn=0x%x src_qp=0x%x psn=%u base=0x%llx received=%u total=%u last_offset=%u last_len=%u with_imm=%u\n",
+		pr_warn_ratelimited("native RDMA_WRITE active timeout qpn=0x%x src_qp=0x%x psn=%u base=0x%llx received=%u total=%u gap_offset=%u last_offset=%u last_len=%u with_imm=%u first_rail=0x%x first_route=0x%llx first_path=%u last_rail=0x%x last_route=0x%llx last_path=%u\n",
 				    tqp->base.qp_num, tqp->rx_write.src_qp,
 				    tqp->rx_write.psn,
 				    tqp->rx_write.remote_addr,
 				    tqp->rx_write.received,
 				    tqp->rx_write.total_len,
+				    tqp->rx_write.received,
 				    tqp->rx_write.last_offset,
 				    tqp->rx_write.last_len,
-				    tqp->rx_write.with_imm);
+				    tqp->rx_write.with_imm,
+				    tqp->rx_write.first_rail_id,
+				    tqp->rx_write.first_route,
+				    tqp->rx_write.first_path_id,
+				    tqp->rx_write.last_rail_id,
+				    tqp->rx_write.last_route,
+				    tqp->rx_write.last_path_id);
 		if (!with_imm) {
 			memset(&tqp->rx_write, 0, sizeof(tqp->rx_write));
 			atomic64_inc(&state->data_rx_active_retry);
@@ -4121,6 +4154,13 @@ reap_reorder:
 		u32 buffered_bytes;
 		u32 last_offset;
 		u32 last_len;
+		u32 gap_offset;
+		u32 first_rail_id;
+		u32 last_rail_id;
+		u64 first_route;
+		u64 last_route;
+		u32 first_path_id;
+		u32 last_path_id;
 		u64 remote_addr;
 		enum tbv_rx_reorder_kind kind;
 		u16 frags_received;
@@ -4148,6 +4188,13 @@ reap_reorder:
 		buffered_bytes = msg->buffered_bytes;
 		last_offset = msg->last_offset;
 		last_len = msg->last_len;
+		gap_offset = tbv_rx_reorder_first_missing_offset(msg);
+		first_rail_id = msg->first_rail_id;
+		first_route = msg->first_route;
+		first_path_id = msg->first_path_id;
+		last_rail_id = msg->last_rail_id;
+		last_route = msg->last_route;
+		last_path_id = msg->last_path_id;
 		remote_addr = msg->remote_addr;
 		kind = msg->kind;
 		frags_received = msg->frags_received;
@@ -4156,12 +4203,14 @@ reap_reorder:
 		with_imm = msg->with_imm;
 		retryable_write = kind == TBV_RX_REORDER_WRITE;
 		expected = psn == tqp->rx_expected_psn;
-		pr_warn_ratelimited("native RX reorder timeout qpn=0x%x expected_psn=%u psn=%u src_qp=0x%x kind=%u complete=%u expected=%u received=%u total=%u frags=%u/%u bytes=%u last_offset=%u last_len=%u with_imm=%u\n",
+		pr_warn_ratelimited("native RX reorder timeout qpn=0x%x expected_psn=%u psn=%u src_qp=0x%x kind=%u complete=%u expected=%u received=%u total=%u gap_offset=%u frags=%u/%u bytes=%u last_offset=%u last_len=%u with_imm=%u first_rail=0x%x first_route=0x%llx first_path=%u last_rail=0x%x last_route=0x%llx last_path=%u\n",
 				    tqp->base.qp_num, tqp->rx_expected_psn,
 				    psn, src_qp, kind, complete, expected,
-				    received, total_len, frags_received,
-				    frag_count, buffered_bytes, last_offset,
-				    last_len, with_imm);
+				    received, total_len, gap_offset,
+				    frags_received, frag_count, buffered_bytes,
+				    last_offset, last_len, with_imm,
+				    first_rail_id, first_route, first_path_id,
+				    last_rail_id, last_route, last_path_id);
 		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
 		atomic64_inc(&state->data_rx_reorder_timeout);
 		if (retryable_write) {
@@ -8196,6 +8245,16 @@ static bool tbv_rx_write_fragment_shape(u32 total_len, u32 offset, u32 len,
 					 frag_count);
 }
 
+static u32 tbv_rx_write_fragment_stride(u32 offset, u32 len, bool last,
+					u32 frag_idx)
+{
+	if (frag_idx)
+		return offset / frag_idx;
+	if (!last)
+		return len;
+	return len ? len : TBV_NATIVE_DATA_MAX_PAYLOAD;
+}
+
 static bool tbv_rx_write_fragment_shape_stride(u32 total_len, u32 stride,
 					       u32 offset, u32 len, bool last,
 					       u32 *frag_idx,
@@ -8482,6 +8541,62 @@ static void tbv_rx_note_active_path(struct tbv_rx_message *msg,
 		msg->first_rail_id = rail_id;
 		msg->first_route = route;
 		msg->first_path_id = path_id;
+	}
+
+	msg->last_rail_id = rail_id;
+	msg->last_route = route;
+	msg->last_path_id = path_id;
+	msg->last_offset = offset;
+	msg->last_len = len;
+}
+
+static void tbv_rx_note_write_path(struct tbv_rx_write *wrx,
+				   struct tbv_path *rx_path, u32 offset,
+				   u32 len)
+{
+	u32 rail_id = 0;
+	u64 route = 0;
+	u32 path_id = 0;
+
+	if (rx_path && rx_path->rail) {
+		rail_id = rx_path->rail->rail_id;
+		route = rx_path->rail->key.route;
+		path_id = rx_path->rail->key.path_id;
+	}
+
+	if (!wrx->path_seen) {
+		wrx->first_rail_id = rail_id;
+		wrx->first_route = route;
+		wrx->first_path_id = path_id;
+		wrx->path_seen = true;
+	}
+
+	wrx->last_rail_id = rail_id;
+	wrx->last_route = route;
+	wrx->last_path_id = path_id;
+	wrx->last_offset = offset;
+	wrx->last_len = len;
+}
+
+static void tbv_rx_note_reorder_path(struct tbv_rx_reorder_msg *msg,
+				     struct tbv_path *rx_path, u32 offset,
+				     u32 len)
+{
+	u32 rail_id = 0;
+	u64 route = 0;
+	u32 path_id = 0;
+
+	if (rx_path && rx_path->rail) {
+		rail_id = rx_path->rail->rail_id;
+		route = rx_path->rail->key.route;
+		path_id = rx_path->rail->key.path_id;
+	}
+
+	if (!msg->path_seen) {
+		msg->first_rail_id = rail_id;
+		msg->first_route = route;
+		msg->first_path_id = path_id;
+		msg->path_seen = true;
 	}
 
 	msg->last_rail_id = rail_id;
@@ -8883,6 +8998,24 @@ static void tbv_rx_clear_rnr_locked(struct tbv_qp *tqp, u32 src_qp, u32 psn)
 		tqp->rx_rnr_active = false;
 }
 
+static void tbv_rx_maybe_mark_write_gap_rnr_locked(
+	struct tbv_state *state, struct tbv_qp *tqp, struct tbv_path *rx_path,
+	const struct tbv_native_data_header *hdr, u32 psn, u32 gap_offset)
+{
+	if (!tbv_ibdev_native_write_gap_rnr_enabled())
+		return;
+	if (tqp->rx_rnr_active)
+		return;
+	if (!tbv_rx_reorder_find(tqp, psn))
+		return;
+
+	atomic64_inc(&state->data_rx_write_gap_rnr);
+	tbv_rx_mark_rnr_locked(tqp, hdr->src_qp, psn, hdr->remote_addr,
+			       gap_offset);
+	tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp, hdr->dest_qp, psn,
+			     TBV_NATIVE_SEND_ACK_RNR);
+}
+
 static void tbv_rx_buffer_read_req_locked(
 	struct tbv_state *state, struct tbv_qp *tqp, struct tbv_path *rx_path,
 	const struct tbv_native_data_header *hdr, u32 psn)
@@ -9076,6 +9209,7 @@ static void tbv_rx_buffer_write_fragment_locked(
 	u32 imm_data = with_imm ? hdr->imm_data : 0;
 	u32 frag_idx;
 	u32 frag_count;
+	u32 frag_stride;
 	int ret;
 
 	if (delta < 0) {
@@ -9096,6 +9230,8 @@ static void tbv_rx_buffer_write_fragment_locked(
 				     psn, TBV_NATIVE_SEND_ACK_ERROR);
 		return;
 	}
+	frag_stride = tbv_rx_write_fragment_stride(offset, hdr->length, last,
+						   frag_idx);
 
 	msg = tbv_rx_reorder_find(tqp, psn);
 	if (!msg) {
@@ -9125,6 +9261,7 @@ static void tbv_rx_buffer_write_fragment_locked(
 		msg->imm_data = imm_data;
 		msg->rkey = hdr->rkey;
 		msg->frag_count = frag_count;
+		msg->frag_stride = frag_stride;
 		msg->with_imm = with_imm;
 		msg->solicited = hdr->flags & TBV_NATIVE_DATA_F_SOLICITED;
 		list_add_tail(&msg->node, &tqp->rx_reorder);
@@ -9138,7 +9275,8 @@ static void tbv_rx_buffer_write_fragment_locked(
 		   msg->with_imm != with_imm ||
 		   msg->imm_data != imm_data ||
 		   msg->rkey != hdr->rkey ||
-		   msg->frag_count != frag_count) {
+		   msg->frag_count != frag_count ||
+		   msg->frag_stride != frag_stride) {
 		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
 		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp, hdr->dest_qp,
 				     psn, TBV_NATIVE_SEND_ACK_ERROR);
@@ -9172,8 +9310,7 @@ static void tbv_rx_buffer_write_fragment_locked(
 	set_bit(frag_idx, msg->frag_seen);
 	msg->frags_received++;
 	msg->received += hdr->length;
-	msg->last_offset = offset;
-	msg->last_len = hdr->length;
+	tbv_rx_note_reorder_path(msg, rx_path, offset, hdr->length);
 	msg->first_jiffies = jiffies;
 	if (msg->frags_received == msg->frag_count)
 		msg->complete = true;
@@ -9308,8 +9445,7 @@ static void tbv_rx_buffer_write_imm_fragment_locked(
 	set_bit(frag_idx, msg->frag_seen);
 	msg->frags_received++;
 	msg->received += hdr->length;
-	msg->last_offset = offset;
-	msg->last_len = hdr->length;
+	tbv_rx_note_reorder_path(msg, rx_path, offset, hdr->length);
 	msg->first_jiffies = jiffies;
 	if (msg->frag_count && msg->frags_received == msg->frag_count)
 		msg->complete = true;
@@ -9663,6 +9799,27 @@ tbv_rx_reorder_find_frag_locked(struct tbv_rx_reorder_msg *msg, u32 offset)
 	return NULL;
 }
 
+static u32 tbv_rx_reorder_first_missing_offset(const struct tbv_rx_reorder_msg *msg)
+{
+	u32 stride = msg->frag_stride ? msg->frag_stride :
+					    TBV_NATIVE_DATA_MAX_PAYLOAD;
+	u16 i;
+
+	if (!msg->frag_count)
+		return U32_MAX;
+
+	for (i = 0; i < msg->frag_count; i++) {
+		u64 offset;
+
+		if (test_bit(i, msg->frag_seen))
+			continue;
+		offset = (u64)i * stride;
+		return offset > U32_MAX ? U32_MAX : (u32)offset;
+	}
+
+	return U32_MAX;
+}
+
 static void tbv_rx_reorder_remove_frag_locked(struct tbv_qp *tqp,
 					      struct tbv_rx_reorder_msg *msg,
 					      struct tbv_rx_reorder_frag *frag)
@@ -9902,8 +10059,8 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 			u32 duplicate = wrx->received - offset;
 
 			if (duplicate >= hdr->length) {
-				wrx->last_offset = offset;
-				wrx->last_len = hdr->length;
+				tbv_rx_note_write_path(wrx, rx_path, offset,
+						       hdr->length);
 				tbv_rx_refresh_active_duplicate(
 					state, &wrx->started_jiffies);
 				mutex_unlock(&tqp->rx_lock);
@@ -9915,13 +10072,19 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 			copy_offset = wrx->received;
 			copy_len = hdr->length - duplicate;
 		} else if (offset > wrx->received) {
-			if (!with_imm)
+			if (!with_imm) {
+				u32 gap_offset = wrx->received;
+
 				tbv_rx_buffer_write_fragment_locked(
 					state, tqp, rx_path, hdr, psn,
 					total_len, offset, last, with_imm,
 					payload);
-			else
+				tbv_rx_maybe_mark_write_gap_rnr_locked(
+					state, tqp, rx_path, hdr, psn,
+					gap_offset);
+			} else {
 				atomic64_inc(&state->data_rx_write_imm_gap);
+			}
 			mutex_unlock(&tqp->rx_lock);
 			return;
 		}
@@ -9950,6 +10113,8 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 				tbv_rx_buffer_write_fragment_locked(
 					state, tqp, rx_path, hdr, psn,
 					total_len, offset, last, with_imm, payload);
+				tbv_rx_maybe_mark_write_gap_rnr_locked(
+					state, tqp, rx_path, hdr, psn, 0);
 				mutex_unlock(&tqp->rx_lock);
 				return;
 			}
@@ -10025,8 +10190,7 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 
 		wrx->received = copy_offset + copy_len;
 		wrx->started_jiffies = jiffies;
-		wrx->last_offset = copy_offset;
-		wrx->last_len = copy_len;
+		tbv_rx_note_write_path(wrx, rx_path, copy_offset, copy_len);
 
 		if (tbv_rx_merge_active_write_reorder_locked(state, tqp,
 							     rx_path)) {
