@@ -117,55 +117,85 @@
         awk -F': *' -v key="$1" '$1 == key { print $2; found=1; exit } END { if (!found) exit 1 }' "$summary"
       }
 
-      if ! grep -q '^thunderbolt_ibverbs ' /proc/modules; then
-        fail "module thunderbolt_ibverbs is not loaded"
-      fi
+      last_error=""
+
+      check_ready() {
+        if ! grep -q '^thunderbolt_ibverbs ' /proc/modules; then
+          last_error="module thunderbolt_ibverbs is not loaded"
+          return 1
+        fi
+
+        if [ ! -r "$summary" ]; then
+          last_error="debugfs summary is missing at $summary"
+          return 1
+        fi
+
+        if [ -n "$expected_profile" ]; then
+          actual_profile="$(get_summary profile || true)"
+          if [ "$actual_profile" != "$expected_profile" ]; then
+            last_error="profile mismatch: expected $expected_profile, got ''${actual_profile:-<missing>}"
+            return 1
+          fi
+        fi
+
+        if [ -n "$expected_native_control" ]; then
+          actual_native_control="$(get_summary native_control || true)"
+          if [ "$actual_native_control" != "$expected_native_control" ]; then
+            last_error="native_control mismatch: expected $expected_native_control, got ''${actual_native_control:-<missing>}"
+            return 1
+          fi
+        fi
+
+        if [ "$require_verbs" = "1" ]; then
+          verbs_registered="$(get_summary verbs_registered || true)"
+          if [ "$verbs_registered" != "1" ]; then
+            last_error="verbs device is not registered"
+            return 1
+          fi
+        fi
+
+        if [ -n "$min_ready_rails" ]; then
+          if [ ! -r "$peers" ]; then
+            last_error="debugfs peers file is missing at $peers"
+            return 1
+          fi
+          ready_rails="$(grep -o 'data_ready=1' "$peers" | wc -l | tr -d ' ')"
+          if [ "$ready_rails" -lt "$min_ready_rails" ]; then
+            last_error="ready rail count too low: expected >= $min_ready_rails, got $ready_rails"
+            return 1
+          fi
+        fi
+
+        if [ -n "$expected_speed" ]; then
+          if [ ! -r "$peers" ]; then
+            last_error="debugfs peers file is missing at $peers"
+            return 1
+          fi
+          bad_speed_lines="$(grep 'data_ready=1' "$peers" | grep -v "link_speed=$expected_speed" || true)"
+          if [ -n "$bad_speed_lines" ]; then
+            last_error="at least one ready rail is not $expected_speed: $bad_speed_lines"
+            return 1
+          fi
+        fi
+
+        if [ "$fail_on_legacy_ambiguity" = "1" ]; then
+          legacy_limited="$(get_summary native_legacy_ambiguous_limited || echo 0)"
+          if [ "$legacy_limited" != "0" ]; then
+            last_error="legacy source-blind ambiguity counter is nonzero: $legacy_limited"
+            return 1
+          fi
+        fi
+
+        return 0
+      }
 
       deadline=$((SECONDS + timeout))
-      while [ ! -r "$summary" ]; do
+      until check_ready; do
         if [ "$SECONDS" -ge "$deadline" ]; then
-          fail "debugfs summary did not appear at $summary within ''${timeout}s"
+          fail "not ready after ''${timeout}s: $last_error"
         fi
         sleep 1
       done
-
-      if [ -n "$expected_profile" ]; then
-        actual_profile="$(get_summary profile || true)"
-        [ "$actual_profile" = "$expected_profile" ] ||
-          fail "profile mismatch: expected $expected_profile, got ''${actual_profile:-<missing>}"
-      fi
-
-      if [ -n "$expected_native_control" ]; then
-        actual_native_control="$(get_summary native_control || true)"
-        [ "$actual_native_control" = "$expected_native_control" ] ||
-          fail "native_control mismatch: expected $expected_native_control, got ''${actual_native_control:-<missing>}"
-      fi
-
-      if [ "$require_verbs" = "1" ]; then
-        verbs_registered="$(get_summary verbs_registered || true)"
-        [ "$verbs_registered" = "1" ] ||
-          fail "verbs device is not registered"
-      fi
-
-      if [ -n "$min_ready_rails" ]; then
-        [ -r "$peers" ] || fail "debugfs peers file is missing at $peers"
-        ready_rails="$(grep -o 'data_ready=1' "$peers" | wc -l | tr -d ' ')"
-        [ "$ready_rails" -ge "$min_ready_rails" ] ||
-          fail "ready rail count too low: expected >= $min_ready_rails, got $ready_rails"
-      fi
-
-      if [ -n "$expected_speed" ]; then
-        [ -r "$peers" ] || fail "debugfs peers file is missing at $peers"
-        bad_speed_lines="$(grep 'data_ready=1' "$peers" | grep -v "link_speed=$expected_speed" || true)"
-        [ -z "$bad_speed_lines" ] ||
-          fail "at least one ready rail is not $expected_speed: $bad_speed_lines"
-      fi
-
-      if [ "$fail_on_legacy_ambiguity" = "1" ]; then
-        legacy_limited="$(get_summary native_legacy_ambiguous_limited || echo 0)"
-        [ "$legacy_limited" = "0" ] ||
-          fail "legacy source-blind ambiguity counter is nonzero: $legacy_limited"
-      fi
 
       echo "thunderbolt-ibverbs-check: ok"
     '';
