@@ -735,3 +735,61 @@ TX posted/completed was balanced by the end of each failed rep, so the pending
 TX completions were not permanently lost. The next fix is therefore to make the
 RNR-wait branch defer and reschedule when `tx_pending > 0`, then retry/fail only
 after TX completions drain.
+
+## RNR-Wait Tx-Pending Fix
+
+Implemented the RNR-wait timeout-worker fix:
+
+```text
+thunderbolt-ibverbs: d0a6b88 kernel: defer RNR retry while TX pending
+deploy worktree:     40a2c7e kernel: defer RNR retry while TX pending
+nixos-config:        693fbbd strix: deploy RNR tx-pending defer
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-rnrwaitdefer30-qptimeout14-20260606-160107
+status: fail, 29/30 app reps passed
+failed rep: 27
+data_tx_posted/completed: balanced in every rep
+```
+
+The old `status=255` signature disappeared in this run. All former RNR-wait
+terminal buckets stayed at zero across the 30 reps:
+
+```text
+data_wr_rnr_retry_exhausted: 0
+data_wr_rnr_wait_not_retryable/retrying/tx_pending/retry_exhausted/closing_qp/qp_error/unknown:
+  0/0/0/0/0/0/0
+```
+
+That validates the previous localization: the RNR-wait branch was prematurely
+completing a send with `-EAGAIN` while old TX frames were still pending. After
+the defer/reschedule fix, the heavy-retry rows that previously produced
+`status=255` ran through without RNR retry exhaustion.
+
+Rep 27 failed with the older `status=5` class instead:
+
+```text
+rank0 strix-1: USB4 GDA CQE error status=5 opcode=3 byte_len=2097152
+rank1 strix-2: USB4 alltoall DATA wait timed out ctx=9 expected=9 observed=7
+
+data_wr_retransmit: 26 on strix-1
+data_wr_timeout/data_wr_retry_exhausted: 1/1 on strix-1
+data_wr_rnr_retransmit: 1 on strix-1
+data_wr_rnr_retry_exhausted: 0
+data_wr_rnr_wait_*: all 0
+data_wr_retransmit_closing_qp/no_live_path/teardown_path: 0/0/0
+data_rx_active_timeout/active_retry: 1/1 on strix-2
+data_rx_reorder_timeout/reorder_retry/reorder_dropped: 2/2/2 on strix-2
+data_rx_no_qp*: 0
+data_tx_errors: 0
+data_tx_posted/data_tx_completed: 19648/19648
+```
+
+So the RNR tx-pending bug is fixed, but the application-level path is still not
+stable enough for long benchmarks. The remaining correctness issue is ordinary
+RDMA_WRITE retry exhaustion paired with receiver-side partial-write active and
+reorder timeouts. In the failing rep, the receiver timed out partially received
+2 MiB writes after seeing late fragments near the tail offset, e.g. one reorder
+timeout at 492/519 fragments and one active timeout at about 1.89 MiB/2 MiB.
+
+Next target: classify why the large WRITE retry path still exhausts after
+partial receive progress. The existing counters prove it is not the RNR-wait
+bug, not teardown/no-QP, and not a local TX completion imbalance.
