@@ -79,7 +79,7 @@ while IFS= read -r rep_dir; do
   t2=$(timing_us "$rank0_log" 2097152)
 
   if [[ $printed -eq 0 ]]; then
-    printf 'mode rep t1_us t2_us wr_retx rnr_retx ack_retry ack64 late_ack dup_ack ack_miss ack_probe ack_probe_fb tx_ack_req tx_ack_req_err rx_ack_req rx_ack_req_reack rx_ack_req_miss reord_to reord_retry reord_drop active_to active_retry tx_rnr rx_rnr rnr_exh dv_hard wr_to wr_exh tx_err tx_post tx_comp\n'
+    printf 'mode rep t1_us t2_us wr_retx rnr_retx ack_retry ack64 late_ack dup_ack ack_miss ack_probe ack_probe_fb tx_ack_req tx_ack_req_err rx_ack_req rx_ack_req_reack rx_ack_req_miss rx_ack_req_miss_past rx_ack_req_miss_cur rx_ack_req_miss_fut reord_to reord_retry reord_drop active_to active_retry tx_rnr rx_rnr rnr_exh dv_hard wr_to wr_exh tx_err tx_post tx_comp\n'
     printed=1
   fi
 
@@ -99,6 +99,9 @@ while IFS= read -r rep_dir; do
     data_rx_ack_req \
     data_rx_ack_req_reack \
     data_rx_ack_req_miss \
+    data_rx_ack_req_miss_past \
+    data_rx_ack_req_miss_current \
+    data_rx_ack_req_miss_future \
     data_rx_reorder_timeout \
     data_rx_reorder_retry \
     data_rx_reorder_dropped \

@@ -320,3 +320,71 @@ does not remove the ACK tail: four of five reps still needed ACK-loss recovery,
 and the matched-after-retry ACKs again track duplicate-data re-ACKs. The smaller
 run did not exercise the heavier RX reorder/RNR failure mode seen in the
 10-rep sweep.
+
+## READY ACK Recovery Redeploy and ACK Probe A/B
+
+After the next paired Strix reboot, the topology initially reproduced a native
+READY_ACK loss during rail bring-up: some rails had `remote_ready=1`,
+`ready_sent=0`, and `last_error=-110`. The active Nix profile had also not been
+setting the new native READY recovery module parameters on strix-1/strix-2.
+
+Committed and deployed:
+
+```text
+thunderbolt-ibverbs: 5cad50b kernel: tolerate READY ACK loss after peer READY
+nixos-config:        1f72d54 strix: restore native READY timeout handling
+nixos-config:        2fc83c0 strix: enable native READY recovery options
+```
+
+The Strix profile now sets:
+
+```text
+native_control_trace=Y
+native_ready_timeout_optimistic=Y
+hardware.thunderbolt-ibverbs.check.minReadyRails=4
+```
+
+The optimistic READY timeout path is intentionally narrow: it only converts a
+READY_ACK timeout to success after peer READY has already been observed on that
+rail. After redeploy and reboot, both hosts came back with 4 QPs, all rails
+`data_ready=1 ready_sent=1 remote_ready=1 last_error=0`, and clean TX/RX
+counters.
+
+With the recovered topology, a 5-rep PyTorch hoststream A/B was run at the
+current application baseline (`ROCSHMEM_GDA_QP_TIMEOUT=14`,
+`native_ack_repeat=1`).
+
+ACK probe off:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-ackprobe-off-20260606-141906
+status: pass
+wr_retx total: 49
+ack_retry/ack64 total: 33/33
+data_wr_timeout/data_wr_retry_exhausted: 0/0
+data_tx_posted/completed: balanced in every rep
+loaded RCCL: /mnt/Home/tmp/rccl-hoststream-waitbudget-install/lib/librccl.so.1.0
+```
+
+ACK probe on:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-ackprobe-on-20260606-142030
+status: pass
+wr_retx total: 5
+ack_retry/ack64 total: 4/4
+ack_probe/ack_probe_fb: 4/4
+tx_ack_req/tx_ack_req_err: 4/0
+rx_ack_req/rx_ack_req_reack/rx_ack_req_miss: 4/0/4
+data_wr_timeout/data_wr_retry_exhausted: 0/0
+data_tx_posted/completed: balanced in every rep
+loaded RCCL: /mnt/Home/tmp/rccl-hoststream-waitbudget-install/lib/librccl.so.1.0
+```
+
+The A/B does not prove that ACK-query recovery works yet. Every ACK probe
+reached the peer, but every peer lookup missed ACK history and fell back to full
+data retransmission. The lower retransmit count in the probe-on run is therefore
+not attributable to successful ACK-query repair; with only five reps it should
+be treated as workload variance or timing. The useful new fact is narrower:
+the ACK-probe request path is live and non-fatal under PyTorch hoststream load,
+but the re-ACK lookup path is not matching the missing ACKs.

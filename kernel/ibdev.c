@@ -1709,6 +1709,20 @@ static bool tbv_native_ack_req_header_valid(const struct tbv_native_data_header 
 	return hdr->flags == 0 && hdr->length == 0 && hdr->imm_data == 0;
 }
 
+static void tbv_count_ack_req_miss_position_locked(struct tbv_state *state,
+						   struct tbv_qp *tqp,
+						   u32 psn)
+{
+	s32 delta = tbv_psn_delta(psn, tqp->rx_expected_psn);
+
+	if (delta < 0)
+		atomic64_inc(&state->data_rx_ack_req_miss_past);
+	else if (!delta)
+		atomic64_inc(&state->data_rx_ack_req_miss_current);
+	else
+		atomic64_inc(&state->data_rx_ack_req_miss_future);
+}
+
 static void tbv_rx_no_qp_send_ack_req(struct tbv_state *state,
 				      struct tbv_path *rx_path,
 				      const struct tbv_native_data_header *hdr)
@@ -1762,6 +1776,8 @@ static void tbv_rx_send_ack_req(struct tbv_state *state, struct tbv_qp *tqp,
 
 	mutex_lock(&tqp->rx_lock);
 	found = tbv_qp_ack_history_lookup_locked(tqp, psn, &status);
+	if (!found)
+		tbv_count_ack_req_miss_position_locked(state, tqp, psn);
 	mutex_unlock(&tqp->rx_lock);
 	if (!found) {
 		atomic64_inc(&state->data_rx_ack_req_miss);

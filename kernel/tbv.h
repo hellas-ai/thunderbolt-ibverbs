@@ -565,6 +565,9 @@ struct tbv_state {
 	atomic64_t data_rx_ack_req;
 	atomic64_t data_rx_ack_req_reack;
 	atomic64_t data_rx_ack_req_miss;
+	atomic64_t data_rx_ack_req_miss_past;
+	atomic64_t data_rx_ack_req_miss_current;
+	atomic64_t data_rx_ack_req_miss_future;
 	atomic64_t data_rx_no_qp_reack;
 	atomic64_t data_rx_no_qp_error_ack;
 	atomic64_t data_qp_tombstone_evicted;
