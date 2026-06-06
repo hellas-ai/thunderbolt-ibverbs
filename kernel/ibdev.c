@@ -282,7 +282,10 @@ struct tbv_recv_wqe {
 
 struct tbv_send_segment {
 	struct tbv_mr *mr;
+	struct scatterlist *sg;
 	u64 addr;
+	size_t sg_offset;
+	unsigned int sg_index;
 	u32 length;
 };
 
@@ -4588,6 +4591,104 @@ static void tbv_get_send_segments(struct tbv_send_segment *dst,
 	}
 }
 
+static int tbv_prepare_send_segment_cursor(struct tbv_send_segment *seg)
+{
+	struct tbv_mr *mr = seg->mr;
+	struct sg_table *sgt = &mr->umem->sgt_append.sgt;
+	struct scatterlist *sg;
+	size_t offset;
+	u64 end;
+	u64 mr_end;
+	unsigned int i;
+
+	if (!seg->length)
+		return -EINVAL;
+	if (mr->dma_mr)
+		return -EOPNOTSUPP;
+	if (check_add_overflow(seg->addr, (u64)seg->length, &end))
+		return -EINVAL;
+	if (check_add_overflow(mr->start, mr->length, &mr_end))
+		return -EINVAL;
+	if (seg->addr < mr->start || end > mr_end)
+		return -EFAULT;
+
+	offset = ib_umem_offset(mr->umem) + seg->addr - mr->start;
+	for_each_sgtable_sg(sgt, sg, i) {
+		if (offset >= sg->length) {
+			offset -= sg->length;
+			continue;
+		}
+
+		seg->sg = sg;
+		seg->sg_offset = offset;
+		seg->sg_index = i;
+		return 0;
+	}
+
+	return -EFAULT;
+}
+
+static int tbv_send_segment_copy_from(void *dst,
+				      const struct tbv_send_segment *seg,
+				      u32 seg_off, u32 len)
+{
+	struct sg_table *sgt = &seg->mr->umem->sgt_append.sgt;
+	struct scatterlist *sg = seg->sg;
+	size_t copied = 0;
+	size_t offset;
+	unsigned int i = seg->sg_index;
+
+	if (!len)
+		return 0;
+	if (!sg)
+		return -EFAULT;
+	if (seg_off > seg->length || len > seg->length - seg_off)
+		return -EFAULT;
+	if (check_add_overflow(seg->sg_offset, (size_t)seg_off, &offset))
+		return -EINVAL;
+
+	while (sg && i < sgt->orig_nents) {
+		if (offset < sg->length)
+			break;
+		offset -= sg->length;
+		sg = sg_next(sg);
+		i++;
+	}
+
+	while (sg && i < sgt->orig_nents && copied < len) {
+		size_t seg_len = sg->length - offset;
+		size_t seg_pos = sg->offset + offset;
+
+		offset = 0;
+		while (seg_len && copied < len) {
+			struct page *page;
+			size_t page_off = offset_in_page(seg_pos);
+			size_t chunk = min_t(size_t, PAGE_SIZE - page_off,
+					     seg_len);
+			void *kaddr;
+
+			chunk = min_t(size_t, chunk, len - copied);
+			page = pfn_to_page(page_to_pfn(sg_page(sg)) +
+					   (seg_pos >> PAGE_SHIFT));
+			kaddr = kmap_local_page(page);
+			memcpy((u8 *)dst + copied, (u8 *)kaddr + page_off,
+			       chunk);
+			kunmap_local(kaddr);
+
+			copied += chunk;
+			seg_pos += chunk;
+			seg_len -= chunk;
+		}
+
+		if (copied == len)
+			return 0;
+		sg = sg_next(sg);
+		i++;
+	}
+
+	return -EFAULT;
+}
+
 static int tbv_prepare_send_segments(struct tbv_qp *tqp,
 				     const struct ib_send_wr *wr,
 				     struct tbv_send_segment *segs,
@@ -4629,8 +4730,16 @@ static int tbv_prepare_send_segments(struct tbv_qp *tqp,
 		}
 
 		segs[nsegs].mr = mr;
+		segs[nsegs].sg = NULL;
 		segs[nsegs].addr = addr;
+		segs[nsegs].sg_offset = 0;
+		segs[nsegs].sg_index = 0;
 		segs[nsegs].length = sge->length;
+		ret = tbv_prepare_send_segment_cursor(&segs[nsegs]);
+		if (ret) {
+			tbv_mr_put(mr);
+			goto err_release;
+		}
 		nsegs++;
 	}
 
@@ -4714,10 +4823,8 @@ static int tbv_copy_send_range(const struct tbv_send_segment *segs, int nsegs,
 				if (ret)
 					return ret;
 			}
-			ret = tbv_ib_umem_copy_from((u8 *)dst + copied,
-						    seg->mr->umem, seg->mr->start,
-						    seg->mr->length,
-						    seg->addr + seg_off, chunk);
+			ret = tbv_send_segment_copy_from((u8 *)dst + copied,
+							 seg, seg_off, chunk);
 			if (seg->mr->umem->is_dmabuf) {
 				struct ib_umem_dmabuf *umem_dmabuf =
 					to_ib_umem_dmabuf(seg->mr->umem);

@@ -4870,3 +4870,106 @@ Interpretation:
 Next discriminator: determine whether the slow CPU read is tied to virtual
 address/slot offset, physical backing, NUMA/CCX locality, PAT/cacheability, or
 first-touch/migration behavior of the coherent rocSHMEM scratch allocation.
+
+### 2026-06-06 DV WRITE SG cursor fix
+
+The source-copy split suggested a local source-read problem, but the full source
+slot curve exposed the real shape:
+
+```text
+pre-fix payload-only roots:
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-copybucket-src0-dst0-20260606-2150
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-copybucket-src1-dst0-20260606-2210
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-copybucket-src2-dst0-20260606-2210
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-copybucket-src3-dst0-20260606-2150
+
+source bucket  copy_ms  postcopy_ms  total_ms  pytorch_avg_us
+0                0.229       1.264     1.493        1875.7
+1                9.133       1.071    10.204       11116.1
+2               19.121       1.075    20.197       20714.1
+3               29.582       1.082    30.665       42508.8
+```
+
+The near-linear +10 ms per 64 MiB source bucket contradicted a localized
+cacheability, NUMA, or physical-backing cliff. The kernel implementation then
+confirmed the mechanism: `ib_umem_copy_from()` calls `sg_pcopy_to_buffer()` with
+`skip = offset + ib_umem_offset(umem)`, so every high-offset WRITE walks the
+registered MR scatterlist from the beginning before copying the 1 MiB payload.
+The rocSHMEM host scratch pool is one large registered MR, so rotating to later
+64 MiB slots paid an O(MR offset) cost on every copied DV WRITE.
+
+Fix:
+
+```text
+kernel/ibdev.c:
+  tbv_send_segment now stores the starting scatterlist entry, entry index, and
+  entry-local offset resolved once in tbv_prepare_send_segments().
+
+  tbv_copy_send_range() copies from that prepared cursor instead of calling the
+  generic ib_umem_copy_from() helper for copied send/WRITE payloads.
+```
+
+Post-fix deployment:
+
+```text
+thunderbolt-ibverbs derivation:
+  /nix/store/xvfhqm5x28h8cryn6bp32a27lbpnaii5-thunderbolt-ibverbs-0.1.0
+
+strix-1 system:
+  /nix/store/4rnwyrmial9y1ncgl08giyrq6wx4ni04-nixos-system-strix-1-26.11pre-git
+strix-2 system:
+  /nix/store/0saia7gi984q937sccfdmn0znrk1gxk5-nixos-system-strix-2-26.11pre-git
+```
+
+Post-fix payload-only controls:
+
+```text
+roots:
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-sgcursor-src0-dst0-20260606-2203
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-sgcursor-src3-dst0-20260606-2203
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-sgcursor-rotate-20260606-2203
+
+case          pytorch_avg_us  bucket writes bytes    total_ms copy_ms postcopy_ms
+src0/dst0           1596.9      0      16  16777216    1.094   0.052     1.041
+src3/dst0           1619.0      3      16  16777216    1.088   0.052     1.036
+rotate              1680.8      0       4   4194304    1.188   0.061     1.127
+rotate              1680.8      1       4   4194304    1.094   0.061     1.033
+rotate              1680.8      2       4   4194304    1.089   0.064     1.025
+rotate              1680.8      3       4   4194304    1.083   0.061     1.022
+```
+
+Validated full host-stream PyTorch all-to-all, with copy-in/exchange/copy-out
+enabled and rotating source/destination slots:
+
+```text
+root:
+  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-sgcursor-full-rotate-20260606-2203
+
+pytorch all_to_all_single 1 MiB:
+  reps: 2
+  avg: 2783.5 us
+  min/max: 1577.6 / 3989.4 us
+  validation: pass
+
+kernel buckets:
+  bucket 0: total 1.122 ms, copy 0.054 ms, postcopy 1.067 ms
+  bucket 1: total 1.104 ms, copy 0.046 ms, postcopy 1.058 ms
+  bucket 2: total 1.073 ms, copy 0.043 ms, postcopy 1.030 ms
+  bucket 3: total 1.057 ms, copy 0.043 ms, postcopy 1.014 ms
+```
+
+All post-fix roots completed with balanced TX posted/completed counters, no DV
+hard error, no WR timeout, no retry exhaustion, no TX error, and no RX canceled
+frames. Small RNR/write-gap recovery still appears in some runs and recovers
+cleanly.
+
+Interpretation:
+
+1. The source-slot performance bug is fixed at root cause. The copy time no
+   longer scales with MR offset; bucket 3 improved from 29.582 ms to 0.052 ms.
+2. Source-slot pinning is no longer required for the 1 MiB host-stream
+   all-to-all path. Rotating through all four scratch slots is flat at the
+   kernel copy layer and passes validated PyTorch.
+3. The remaining per-WR span is post-copy/native TX completion, about 1.0-1.1
+   ms for 1 MiB. That is now the next performance target for application-level
+   benchmarking, not the rocSHMEM scratch slot selection.
