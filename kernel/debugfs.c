@@ -357,6 +357,10 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->native_rx_read_req));
 	seq_printf(s, "native_rx_read_resp: %lld\n",
 		   atomic64_read(&state->native_rx_read_resp));
+	seq_printf(s, "native_rx_atomic_req: %lld\n",
+		   atomic64_read(&state->native_rx_atomic_req));
+	seq_printf(s, "native_rx_atomic_resp: %lld\n",
+		   atomic64_read(&state->native_rx_atomic_resp));
 	seq_printf(s, "data_rx_bad_frame: %lld\n",
 		   atomic64_read(&state->data_rx_bad_frame));
 	seq_printf(s, "data_rx_bad_header: %lld\n",
@@ -481,6 +485,20 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_read_req_resp_busy));
 	seq_printf(s, "data_rx_read_req_resp_error: %lld\n",
 		   atomic64_read(&state->data_rx_read_req_resp_error));
+	seq_printf(s, "data_rx_atomic_req: %lld\n",
+		   atomic64_read(&state->data_rx_atomic_req));
+	seq_printf(s, "data_rx_atomic_replay: %lld\n",
+		   atomic64_read(&state->data_rx_atomic_replay));
+	seq_printf(s, "data_rx_atomic_history_miss: %lld\n",
+		   atomic64_read(&state->data_rx_atomic_history_miss));
+	seq_printf(s, "data_rx_atomic_reorder_buffered: %lld\n",
+		   atomic64_read(&state->data_rx_atomic_reorder_buffered));
+	seq_printf(s, "data_rx_atomic_reorder_delivered: %lld\n",
+		   atomic64_read(&state->data_rx_atomic_reorder_delivered));
+	seq_printf(s, "data_tx_atomic_resp_ok: %lld\n",
+		   atomic64_read(&state->data_tx_atomic_resp_ok));
+	seq_printf(s, "data_tx_atomic_resp_error: %lld\n",
+		   atomic64_read(&state->data_tx_atomic_resp_error));
 	seq_printf(s, "data_rx_no_qp: %lld\n",
 		   atomic64_read(&state->data_rx_no_qp));
 	seq_printf(s, "data_rx_no_qp_apple: %lld\n",

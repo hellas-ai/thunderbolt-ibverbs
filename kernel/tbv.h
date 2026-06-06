@@ -546,6 +546,8 @@ struct tbv_state {
 	atomic64_t native_rx_read_ack;
 	atomic64_t native_rx_read_req;
 	atomic64_t native_rx_read_resp;
+	atomic64_t native_rx_atomic_req;
+	atomic64_t native_rx_atomic_resp;
 	atomic64_t data_rx_bad_frame;
 	atomic64_t data_rx_bad_header;
 	atomic64_t data_rx_send;
@@ -608,6 +610,13 @@ struct tbv_state {
 	atomic64_t data_rx_read_req_alloc_error;
 	atomic64_t data_rx_read_req_resp_busy;
 	atomic64_t data_rx_read_req_resp_error;
+	atomic64_t data_rx_atomic_req;
+	atomic64_t data_rx_atomic_replay;
+	atomic64_t data_rx_atomic_history_miss;
+	atomic64_t data_rx_atomic_reorder_buffered;
+	atomic64_t data_rx_atomic_reorder_delivered;
+	atomic64_t data_tx_atomic_resp_ok;
+	atomic64_t data_tx_atomic_resp_error;
 	atomic64_t data_rx_no_qp;
 	atomic64_t data_rx_no_qp_apple;
 	atomic64_t data_rx_no_qp_mad;
