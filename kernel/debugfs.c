@@ -445,6 +445,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_send_sequence_error));
 	seq_printf(s, "data_rx_active_timeout: %lld\n",
 		   atomic64_read(&state->data_rx_active_timeout));
+	seq_printf(s, "data_rx_active_retry: %lld\n",
+		   atomic64_read(&state->data_rx_active_retry));
 	seq_printf(s, "data_rx_reorder_buffered: %lld\n",
 		   atomic64_read(&state->data_rx_reorder_buffered));
 	seq_printf(s, "data_rx_reorder_delivered: %lld\n",

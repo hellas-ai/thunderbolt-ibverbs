@@ -2065,6 +2065,7 @@ static bool tbv_qp_note_rnr_ack(struct tbv_qp *tqp, u32 psn,
 
 		send->rnr_waiting = true;
 		send->retrying = false;
+		send->retries = 0;
 		tbv_send_mark_queued(send, jiffies);
 		if (tbv_send_rnr_waits_for_recv_credit(send)) {
 			if (tqp->remote_recv_credits)
@@ -3890,6 +3891,11 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 	}
 	if (tqp->rx_write.active &&
 	    tbv_qp_entry_expired(tqp->rx_write.started_jiffies, now, timeout)) {
+		u32 src_qp = tqp->rx_write.src_qp;
+		u32 psn = tqp->rx_write.psn;
+		u64 remote_addr = tqp->rx_write.remote_addr;
+		bool with_imm = tqp->rx_write.with_imm;
+
 		atomic64_inc(&state->data_rx_active_timeout);
 		pr_warn_ratelimited("native RDMA_WRITE active timeout qpn=0x%x src_qp=0x%x psn=%u base=0x%llx received=%u total=%u last_offset=%u last_len=%u with_imm=%u\n",
 				    tqp->base.qp_num, tqp->rx_write.src_qp,
@@ -3900,11 +3906,20 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 				    tqp->rx_write.last_offset,
 				    tqp->rx_write.last_len,
 				    tqp->rx_write.with_imm);
+		if (!with_imm) {
+			memset(&tqp->rx_write, 0, sizeof(tqp->rx_write));
+			atomic64_inc(&state->data_rx_active_retry);
+			tbv_rx_mark_rnr_locked(tqp, src_qp, psn, remote_addr, 0);
+			tbv_send_ack(tqp, src_qp, tqp->base.qp_num, psn,
+				     TBV_NATIVE_SEND_ACK_RNR);
+			goto reap_reorder;
+		}
 		tbv_rx_fail_active_write_locked(state, tqp, NULL,
 						    IB_WC_GENERAL_ERR);
 		fatal_timeout = true;
 	}
 
+reap_reorder:
 	for (;;) {
 		struct tbv_rx_reorder_msg *msg;
 		u32 src_qp;

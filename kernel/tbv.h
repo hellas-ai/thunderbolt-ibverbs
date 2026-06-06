@@ -601,6 +601,7 @@ struct tbv_state {
 	atomic64_t data_rx_send_bad_fragment;
 	atomic64_t data_rx_send_sequence_error;
 	atomic64_t data_rx_active_timeout;
+	atomic64_t data_rx_active_retry;
 	atomic64_t data_rx_reorder_buffered;
 	atomic64_t data_rx_reorder_delivered;
 	atomic64_t data_rx_reorder_dropped;
