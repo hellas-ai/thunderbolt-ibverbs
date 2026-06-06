@@ -158,6 +158,64 @@ data_tx_errors=0
 data_rx_canceled=0
 ```
 
+### QP timeout 14, ACK repeat 2
+
+The native ACK repeat module parameter was then raised from 1 to 2 on both
+hosts and restored to 1 after the run:
+
+```text
+native_ack_repeat=2
+ROCSHMEM_GDA_QP_TIMEOUT=14
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-innerpython-reps10-qptimeout14-ackrepeat2-20260606-132635
+status: fail
+```
+
+Aggregate summary:
+
+```text
+reps=10
+2MiB timing count=8
+2MiB max=275917.5 us/iter
+data_wr_retransmit=119
+data_wr_rnr_retransmit=3
+data_rx_ack_match_retried=48
+data_rx_ack_match_over_64ms=48
+data_rx_reorder_timeout=6
+data_rx_active_timeout=2
+data_tx_ack_rnr/data_rx_ack_rnr=8/4
+dv_hard_error=2
+data_wr_timeout=2
+data_wr_retry_exhausted=2
+data_wr_rnr_retry_exhausted=0
+data_tx_errors=0
+data_tx_posted/completed=129573/129573
+```
+
+The failure symptoms were device-side ROCSHMEM failures, not a host wedge:
+
+```text
+rep 5: USB4 GDA CQE error status=5 opcode=3 byte_len=2097152
+       USB4 alltoall DATA wait timed out ctx=7 expected=7 observed=5
+
+rep 8: USB4 GDA CQE error status=5 opcode=3 byte_len=1048576
+       USB4 alltoall DATA wait timed out ctx=1 expected=1 observed=0
+```
+
+Post-run host check after restoring `native_ack_repeat=1`:
+
+```text
+thunderbolt-ibverbs-check: ok on strix-1 and strix-2
+verbs_registered=1
+verbs_qps=4
+data_tx_posted == data_tx_completed on both hosts
+data_tx_errors=0
+data_rx_canceled=0
+data_rx_repost_failed=0
+```
+
+Doubling ACK repeat is therefore not a safe quick fix for the ACK-retry tail.
+It adds control pressure and produced real PyTorch/GDA failures in this run.
+
 ## Conclusions
 
 1. The inner-Python gate fixes the prior PyTorch loader abort. All timeout
@@ -175,7 +233,11 @@ data_rx_canceled=0
    later reps, but one rep hit RNR retry exhaustion and a ROCSHMEM device-side
    wait timeout.
 
-5. The next bottleneck is not `RDMA_WRITE_WITH_IMM` correctness. It is latency
+5. ACK repeat 2 is not a viable default from this data. It increased control
+   traffic and produced two device-side failures at the otherwise safer QP
+   timeout 14 setting.
+
+6. The next bottleneck is not `RDMA_WRITE_WITH_IMM` correctness. It is latency
    from the control/retry path: ordinary ACK retry latency appears in many reps,
    while retryable RX reorder timeouts/RNR events cause the worst tails.
 
@@ -185,8 +247,9 @@ The useful next experiments are:
 
 ```text
 1. Keep QP timeout 14 as the baseline for application-level benchmarks.
-2. Instrument or improve ACK recovery latency, because many tails have no
-   RX reorder timeout and are explained by ACK matches after retry.
+2. Instrument or improve ACK recovery latency without increasing blind ACK
+   fanout; the ACK repeat 2 run shows that extra control pressure can make the
+   data path fail.
 3. For RX reorder/RNR tails, determine whether the missing fragments are true
    frame loss, delayed delivery beyond the reorder window, or receiver-side
    processing starvation under PyTorch hoststream pressure.
