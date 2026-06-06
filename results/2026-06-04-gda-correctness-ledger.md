@@ -4502,3 +4502,127 @@ counters. It is not performance-stable yet. The next bottleneck is the
 host-stream exchange variance itself, not copy-in/copy-out: at 4 MiB RCCL
 `msgSize`, average copy-in plus copy-out is about 0.12 ms while exchange averages
 74 ms and tails to 360 ms.
+
+### 2026-06-06 ACK Repeat And rocSHMEM Wait-Budget Follow-Up
+
+After a Colmena boot/reboot deployment of the rebased stack, both Strix hosts
+came back on kernel 7.0.10. One operational issue remains: after manual reboots,
+`thunderbolt_ibverbs` did not autoload until `thunderbolt-ibverbs-reload-system`
+was run on each host. After reload, `thunderbolt-ibverbs-check` was clean and
+each host exposed four USB4 RDMA devices. Treat this as a Nix/module-service
+ordering issue to fix before unattended benchmark loops.
+
+`native_ack_repeat` is now packaged and runtime-tunable, but repeat greater than
+one is not a correctness fix under PyTorch host-stream pressure:
+
+```text
+repeat=2, qptimeout=14, 4 MiB threshold:
+  /tmp/tbv-app-gate-pytorch-hoststream-ackrepeat2-threshold4m-qptimeout14-20260606-093200
+  pass 5/5, data_wr_retransmit=7, no timeout/hard error
+
+repeat=3, same row:
+  /tmp/tbv-app-gate-pytorch-hoststream-ackrepeat3-threshold4m-qptimeout14-20260606-093332
+  fail rep 5, dv_hard_error=1, data_wr_retransmit=28,
+  data_wr_timeout=1, data_wr_retry_exhausted=1
+
+repeat=2 rerun with expanded counters:
+  /tmp/tbv-app-gate-pytorch-hoststream-ackrepeat2-counters-threshold4m-qptimeout14-20260606-093733
+  fail rep 4, data_tx_ack_error=2, data_rx_active_timeout=1,
+  data_wr_retransmit=18, no WR timeout
+```
+
+The repeat-2 rerun is the important correction: the failing symptom was not
+plain lost OK ACKs. The receiver hit `data_rx_active_timeout`, sent an error ACK,
+and the sender surfaced a DV/CQ/HSA failure. Increasing ACK copies can add
+reverse-channel pressure and can make this worse. Keep `native_ack_repeat=1` as
+the packaged baseline.
+
+The QP timeout sweep also exposed an application-layer timeout independent of
+kernel hard counters. With QP timeout exponent 15, full mode and exchange-only
+mode failed without `dv_hard_error`, `data_rx_active_timeout`, `data_tx_errors`,
+WR timeout, or retry exhaustion. The decisive exchange-only error was:
+
+```text
+/tmp/tbv-app-gate-pytorch-hoststream-exchangeonly-threshold4m-qptimeout15-20260606-094353
+USB4 alltoall DATA wait timed out ctx=8 my_pe=1 src_team=0 src_world=0
+expected=8 observed=6 sync_word=... seq=7
+projects/rocshmem/src/gda/context_gda_tmpl_device.hpp:997
+```
+
+That made the rocSHMEM device wait budget load-bearing. Increasing
+`USB4_ALLTOALLV_WAIT_ABORT_SPINS` from `1 << 15` to `1 << 20` was validated and
+committed in rocm-systems:
+
+```text
+rocm-systems: d308b46e28 rocshmem: relax USB4 alltoall wait budget
+local rocSHMEM install:
+  /mnt/Home/tmp/rocshmem-waitbudget-install
+local RCCL install linked against it:
+  /mnt/Home/tmp/rccl-hoststream-waitbudget-install
+```
+
+Post-fix PyTorch results with payload validation:
+
+```text
+exchange-only mode 2, qptimeout=15:
+  /tmp/tbv-app-gate-pytorch-hoststream-exchangeonly-waitbudget-threshold4m-qptimeout15-20260606-100408
+  pass 5/5, data_wr_retransmit=31, data_wr_timeout/retry_exhausted=0,
+  data_tx_posted == data_tx_completed == 49084,
+  data_rx_active_timeout/reorder fatal/dv_hard_error=0
+
+full mode 0, qptimeout=15:
+  /tmp/tbv-app-gate-pytorch-hoststream-full-waitbudget-threshold4m-qptimeout15-20260606-100559
+  pass 5/5, data_wr_retransmit=9, data_wr_timeout/retry_exhausted=0,
+  data_tx_posted == data_tx_completed == 48567,
+  dv_admission_attempts=dv_poll_wqes=200, dv_hard_error=0
+
+full mode 0, qptimeout=14:
+  /tmp/tbv-app-gate-pytorch-hoststream-full-waitbudget-threshold4m-qptimeout14-20260606-100744
+  pass 5/5, data_wr_retransmit=11, data_wr_timeout/retry_exhausted=0,
+  data_tx_posted == data_tx_completed == 48837,
+  dv_admission_attempts=dv_poll_wqes=200, dv_hard_error=0
+```
+
+The larger 4 MiB / 8 MiB PyTorch smoke needed a methodology correction. The
+first run succeeded at the application level but failed the app gate because
+`--dv-check auto` expected DV WQEs:
+
+```text
+/tmp/tbv-app-gate-pytorch-hoststream-large-waitbudget-threshold4m-qptimeout14-20260606-100932
+app logs: successful timings for 4 MiB and 8 MiB in all reps
+gate failure: expected dv_poll_wqes delta >= 1, got 0
+dv_admission_attempts=dv_poll_wqes=dv_hard_error=0
+data_tx_posted == data_tx_completed == 92109
+data_wr_retransmit=16, data_wr_timeout/retry_exhausted=0
+```
+
+Re-running the same row with `--dv-check forbid` turned it into a clean routing
+discriminator:
+
+```text
+/tmp/tbv-app-gate-pytorch-hoststream-large-waitbudget-threshold4m-qptimeout14-dvforbid-20260606-101338
+status: pass 3/3
+dv_admission_attempts=dv_poll_wqes=dv_hard_error=0
+data_wr_retransmit=15, data_wr_timeout/retry_exhausted=0
+data_tx_posted == data_tx_completed == 92099
+data_rx_active_timeout/reorder fatal/data_tx_ack_error=0
+```
+
+Source explains the route: `ncclAlltoAll_impl()` computes
+`msgSize = count * ncclTypeSize(datatype) * comm->nRanks` and uses GDA only when
+`msgSize <= comm->rocshmemThreshold`. With two ranks and
+`RCCL_ROCSHMEM_THRESHOLD=4194304`, PyTorch's 1 MiB and 2 MiB per-rank cases map
+to 2 MiB and 4 MiB RCCL message sizes and exercise host-stream DV. The 4 MiB and
+8 MiB per-rank cases map to 8 MiB and 16 MiB and correctly fall back.
+
+Current app-level benchmark readiness:
+
+1. PyTorch/RCCL all-to-all through USB4 GDA host-stream is now correctness-clean
+   for the 1 MiB and 2 MiB per-rank threshold window under repeated validation.
+2. Larger 4 MiB and 8 MiB PyTorch all-to-all passes in this configuration but is
+   not a GDA/DV benchmark at the 4 MiB threshold; use `--dv-check forbid` to
+   record that intentionally.
+3. The next reusable packaging task is to carry the rocSHMEM wait-budget patch in
+   the Nix recipe, just like the RCCL threshold and host-stream patches.
+4. The next performance task is still the rocSHMEM exchange-phase tail, not a
+   currently observed kernel correctness counter.
