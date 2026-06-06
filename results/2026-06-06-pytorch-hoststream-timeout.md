@@ -908,3 +908,73 @@ clear, and duplicate replay/merge does not close the gap. The next falsifier
 should capture or change the first-gap repair policy: log the missing offset
 and active/reorder rail/path IDs at timeout, or send an early targeted RNR when
 the receiver first observes future fragments beyond an active WRITE gap.
+
+## Targeted WRITE Gap RNR Probe
+
+Added a disabled-by-default experiment:
+
+```text
+native_write_gap_rnr=N by default
+data_rx_write_gap_rnr counter
+active/reorder WRITE timeout logs now include gap_offset and first/last rail,
+route, and path IDs
+```
+
+When enabled, the receiver sends `SEND_ACK_RNR` as soon as it observes a future
+non-imm `RDMA_WRITE` fragment beyond the active gap. The RNR is targeted at the
+missing byte offset, not always offset 0. Prefix replay fragments are then
+suppressed until the retry reaches that gap; when the gap arrives, the existing
+active/reorder merge path can advance the active WRITE.
+
+Deployed as:
+
+```text
+thunderbolt-ibverbs: f06acf1 kernel: add WRITE gap RNR probe
+deploy worktree:     df3d052 kernel: add WRITE gap RNR probe
+nixos-config:        8892f24 strix: deploy WRITE gap RNR probe
+```
+
+After redeploy and reboot, both hosts came up healthy:
+
+```text
+strix-1 current system: /nix/store/6ybgwkf1n9qq5likla167dgv0grvd8g1-nixos-system-strix-1-26.11pre-git
+strix-2 current system: /nix/store/046pqbwdswj7ndar9dfg7s290yw80fnw-nixos-system-strix-2-26.11pre-git
+kernel: 7.0.10
+verbs_qps: 4 on both hosts
+native_write_gap_rnr: N by default
+```
+
+The knob was then enabled at runtime on both hosts and the same 30-rep PyTorch
+hoststream gate was run:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-writegaprnr30-qptimeout14-20260606-171117
+status: pass, 30/30
+loaded RCCL: /mnt/Home/tmp/rccl-hoststream-waitbudget-install/lib/librccl.so.1.0
+```
+
+Aggregate summary:
+
+```text
+2MiB timing count/max: 30 / 221343.9 us
+data_wr_retransmit: 0
+data_wr_rnr_retransmit: 258
+data_rx_ack_match_retried/data_rx_ack_match_over_64ms: 5163/1759
+data_rx_write_gap_rnr: 10835
+data_tx_ack_rnr/data_rx_ack_rnr: 10835/10835
+data_rx_active_timeout/data_rx_reorder_timeout: 0/0
+data_wr_timeout/data_wr_retry_exhausted: 0/0
+data_wr_rnr_retry_exhausted: 0
+dv_hard_error: 0
+data_tx_errors: 0
+data_tx_posted/data_tx_completed: 393356/393356
+```
+
+This is the first positive result against the remaining `status=5` WRITE gap
+class. It does not prove the feature should be enabled by default yet, but it
+does prove the targeted gap path is live and changes the failure dynamics:
+large-WR gaps are repaired by bounded RNR retries before the receiver active or
+reorder timeout fires. The cost is more RNR/control traffic and more
+matched-after-retry ACK accounting, so the next validation should be a longer
+run with the knob enabled plus a same-boot disabled control if we want a clean
+A/B probability estimate.
