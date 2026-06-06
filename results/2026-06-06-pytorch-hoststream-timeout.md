@@ -2141,3 +2141,71 @@ but the upstream LL_MoE example hangs in its first `ll_dispatch()` kernel even
 with one local PE and no transport traffic. Treat LL_MoE as an example-kernel
 debug target, not as a GDA transport benchmark, until its dispatch-side GPU
 synchronization/protocol issue is fixed.
+
+### LL_MoE Follow-Up: Wavefront Fixes and Clean Failing Gate
+
+The LL_MoE hang above was traced to wavefront-size assumptions in
+`examples/LL_MoE/LL_MoE_Kernels.hpp`. The example hardcoded a 64-lane wave for
+lane IDs, reductions, copy strides, and launch sizing. On the Strix `gfx1151`
+target the HIP wavefront size is 32, so the dispatch metadata reduction
+double-counted the expected token count and waited forever at values like
+`2047/2048`. The patch now uses HIP `warpSize` in device code and launches
+`num_waves * device_prop.warpSize` threads while keeping the existing
+64-lane launch bound as a maximum.
+
+Two other example-level correctness fixes were made:
+
+```text
+1. Dispatch no longer has a block-wide __syncthreads() inside
+   responsible_expert_id < num_experts. The barrier is now reached by inactive
+   wave groups too, which matters for small/non-multiple expert counts.
+2. The deterministic verifier now copies both X and combined_x back to host
+   before comparing, and the standalone example exits nonzero if any rank
+   detects a mismatch.
+```
+
+Validated local run:
+
+```text
+log root: /mnt/Home/tmp/tbv-rocshmem-example/ll-moe-verify-np1-20260606-234349
+command: ll_moe -n 4 -h 64 -k 1 -e 4 -i 1 -m d
+result: PASS, zero TBV transport deltas
+```
+
+The two-host LL_MoE case now fails as a real data-verification failure instead
+of hanging:
+
+```text
+log root: /mnt/Home/tmp/tbv-rocshmem-example/ll-moe-cleanfail-np2-20260606-234621
+command: ll_moe -n 4 -h 64 -k 1 -e 2 -i 1 -m d
+result: exit 1, deterministic combined_x mismatches
+counter deltas: dv_poll=+12 tx=+25/+25 ack_match=+4 hard=0 retry=0 timeout=0
+```
+
+This clean failure keeps USB4 GDA transport mostly out of the immediate blame:
+all posted WRs completed, no hard errors fired, and the primitive all-to-all
+still passed immediately afterward:
+
+```text
+log root: /mnt/Home/tmp/tbv-rocshmem-example/alltoall-post-llmoe-20260606-234638
+command: rocshmem_alltoall_test 4
+result: PASS
+counter deltas: dv_poll=+4 tx=+12/+12 ack_match=+4 hard=0
+```
+
+One rejected experiment is worth preserving: adding device-side
+`rocshmem_fence()` after LL_MoE's nonblocking wave PUTs and before its signal
+path caused USB4 CQE hard errors (`status=5 opcode=3 byte_len=128`), retry
+exhaustion, and process abort:
+
+```text
+log root: /mnt/Home/tmp/tbv-rocshmem-example/ll-moe-fence-np2-20260606-234524
+result: exit 141, dv_hard_error=+4, retry_exhausted=+4, timeout=+4
+```
+
+Interpretation: LL_MoE is now useful as a clean failing application-level gate.
+The wavefront deadlock and invalid verifier are fixed, but the two-rank
+dispatch/combine protocol still returns zeros for the peer-routed tokens. The
+next fix should target LL_MoE's remote combine return path or the GDA device
+fence/ordering path with a minimal repro, not the already-passing primitive
+rocSHMEM examples.
