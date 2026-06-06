@@ -103,15 +103,44 @@ require_dir "wrapper" "$wrapper"
 require_dir "rccl install" "$rccl_install"
 require_dir "rocshmem install" "$rocshmem_install"
 
-python=$wrapper/bin/python3
-vllm=$wrapper/bin/vllm
-ray=$wrapper/bin/ray
-if [[ ! -x "$python" || ! -x "$vllm" || ! -x "$ray" ]]; then
+resolve_wrapped_bin() {
+  local path=$1
+  local target
+
+  target=$(sed -n 's/^exec "\([^"]*\)".*/\1/p' "$path" | head -n 1 || true)
+  if [[ -n "$target" && -x "$target" ]]; then
+    printf '%s\n' "$target"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+python_wrapper=$wrapper/bin/python3
+vllm_wrapper=$wrapper/bin/vllm
+ray_wrapper=$wrapper/bin/ray
+if [[ ! -x "$python_wrapper" || ! -x "$vllm_wrapper" || ! -x "$ray_wrapper" ]]; then
   echo "wrapper must provide bin/python3, bin/vllm, and bin/ray: $wrapper" >&2
   exit 2
 fi
 
+python=$(resolve_wrapped_bin "$python_wrapper")
+vllm=$(resolve_wrapped_bin "$vllm_wrapper")
+ray=$(resolve_wrapped_bin "$ray_wrapper")
+if [[ ! -x "$python" || ! -x "$vllm" || ! -x "$ray" ]]; then
+  echo "resolved wrapper commands must be executable: python=$python vllm=$vllm ray=$ray" >&2
+  exit 2
+fi
+
 mkdir -p "$log_root"
+{
+  echo "wrapper=$wrapper"
+  echo "python=$python"
+  echo "vllm=$vllm"
+  echo "ray=$ray"
+  echo "rccl_install=$rccl_install"
+  echo "rocshmem_install=$rocshmem_install"
+  echo "model=$model"
+} > "$log_root/config.txt"
 
 if [[ "$prepare_tiny_model" == 1 ]]; then
   "$python" - "$hf_source" "$model" > "$log_root/prepare-model.log" <<'PY'
