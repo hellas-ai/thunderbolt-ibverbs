@@ -6,7 +6,8 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 hosts=${TBV_APP_HOSTS:-strix-1,strix-2}
 counter_hosts=${TBV_COUNTER_HOSTS:-$hosts}
 iface=${TBV_APP_IFACE:-eno1}
-log_root=${TBV_APP_LOG_ROOT:-/tmp/tbv-app-gate/$(date +%Y%m%d-%H%M%S)}
+log_parent=${TBV_APP_LOG_PARENT:-/tmp/tbv-app-gate}
+log_root=${TBV_APP_LOG_ROOT:-$log_parent/$(date +%Y%m%d-%H%M%S)}
 ssh_cmd=${TBV_SSH:-ssh}
 timeout_s=${TBV_APP_TIMEOUT:-300}
 dv_check=${TBV_DV_CHECK:-auto}
@@ -60,6 +61,7 @@ Options:
   --counter-hosts H1,H2     Default: hosts
   --iface IFACE             Default: $iface
   --log-root DIR            Default: $log_root
+                            Set TBV_APP_LOG_PARENT for dated logs under a parent directory
   --timeout SECONDS         RCCL test timeout. Default: $timeout_s
   --dv-check MODE           auto, require, forbid, off. Default: $dv_check
   --rccl-tests-dir DIR      Directory containing alltoall_perf/alltoallv_perf
