@@ -74,6 +74,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   tbv_ibdev_native_qp_tombstone_max());
 	seq_printf(s, "native_retransmit_teardown_guard: %u\n",
 		   tbv_ibdev_native_retransmit_teardown_guard_enabled());
+	seq_printf(s, "native_ack_repeat: %u\n",
+		   tbv_ibdev_native_ack_repeat());
 	seq_printf(s, "configured_links: %u\n", tbv_link_count(state));
 	seq_printf(s, "tbnet_identity: %s\n",
 		   tbv_tbnet_identity_name(state->cfg.tbnet_identity));

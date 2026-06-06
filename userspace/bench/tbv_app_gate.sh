@@ -655,6 +655,9 @@ build_torch_remote_command() {
   if [[ -n "$torch_rccl_lib" ]]; then
     cmd+=("TBV_TORCH_RCCL_LIB=$torch_rccl_lib")
   fi
+  if [[ -n "${RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID:-}" ]]; then
+    cmd+=("RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID=$RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID")
+  fi
   if [[ -n "$torch_ld_preload" ]]; then
     cmd+=("LD_PRELOAD=$torch_ld_preload")
   fi

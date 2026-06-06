@@ -94,6 +94,7 @@ static char *roce_netdev;
 static bool native_qp_tombstone_reack = true;
 static uint native_qp_tombstone_max = TBV_QP_TOMBSTONE_DEFAULT_MAX;
 static bool native_unsafe_retransmit_teardown_guard_disable;
+static uint native_ack_repeat = 1;
 module_param(roce_netdev, charp, 0444);
 MODULE_PARM_DESC(roce_netdev,
 		 "Netdev used for RoCE GID metadata, for example br0.lan");
@@ -118,6 +119,15 @@ u32 tbv_ibdev_native_qp_tombstone_max(void)
 bool tbv_ibdev_native_retransmit_teardown_guard_enabled(void)
 {
 	return !READ_ONCE(native_unsafe_retransmit_teardown_guard_disable);
+}
+
+u32 tbv_ibdev_native_ack_repeat(void)
+{
+	uint repeat = READ_ONCE(native_ack_repeat);
+
+	if (!repeat)
+		return 1;
+	return min_t(uint, repeat, 16);
 }
 
 static uint zcopy_min_bytes;
@@ -145,6 +155,10 @@ static uint native_ack_drop_every;
 module_param(native_ack_drop_every, uint, 0644);
 MODULE_PARM_DESC(native_ack_drop_every,
 		 "Fault injection: silently drop every Nth native OK SEND_ACK before rail fan-out; 0 disables");
+
+module_param(native_ack_repeat, uint, 0644);
+MODULE_PARM_DESC(native_ack_repeat,
+		 "Number of times to send each native OK SEND_ACK fanout across live rails; 0 maps to 1, capped at 16");
 
 module_param(native_qp_tombstone_reack, bool, 0644);
 MODULE_PARM_DESC(native_qp_tombstone_reack,
@@ -6491,13 +6505,28 @@ static int tbv_send_ack_on_path(struct tbv_qp *tqp,
 	 * existing retry/error timing.
 	 */
 	if (status == TBV_NATIVE_SEND_ACK_OK) {
-		if (tbv_should_inject_native_ok_ack_drop(tqp ? tqp->owner : NULL))
-			ret = 0;
-		else
-			ret = tbv_send_control_frame_on_all_native_paths(tqp,
-									rx_path,
-									frame,
-									len);
+		u32 repeat = tbv_ibdev_native_ack_repeat();
+		u32 i;
+		bool sent = false;
+		int first_ret = 0;
+
+		for (i = 0; i < repeat; i++) {
+			if (tbv_should_inject_native_ok_ack_drop(tqp ?
+								tqp->owner :
+								NULL)) {
+				ret = 0;
+			} else {
+				ret = tbv_send_control_frame_on_all_native_paths(
+					tqp, rx_path, frame, len);
+			}
+			if (ret) {
+				if (!first_ret)
+					first_ret = ret;
+			} else {
+				sent = true;
+			}
+		}
+		ret = sent ? 0 : first_ret;
 	} else {
 		ret = tbv_send_control_frame_on_path(tqp, rx_path, frame, len);
 	}

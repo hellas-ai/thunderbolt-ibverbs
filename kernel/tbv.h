@@ -864,6 +864,7 @@ void tbv_ibdev_clear_qp_tombstones(struct tbv_state *state);
 bool tbv_ibdev_native_qp_tombstone_reack_enabled(void);
 u32 tbv_ibdev_native_qp_tombstone_max(void);
 bool tbv_ibdev_native_retransmit_teardown_guard_enabled(void);
+u32 tbv_ibdev_native_ack_repeat(void);
 int tbv_configfs_start(struct tbv_state *state);
 void tbv_configfs_stop(struct tbv_state *state);
 
