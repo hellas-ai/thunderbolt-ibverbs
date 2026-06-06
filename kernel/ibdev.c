@@ -335,6 +335,8 @@ struct tbv_rx_reorder_msg {
 	u32 rkey;
 	u32 received;
 	u32 buffered_bytes;
+	u32 last_offset;
+	u32 last_len;
 	u16 frag_count;
 	u16 frags_received;
 	DECLARE_BITMAP(frag_seen, TBV_RX_REORDER_MAX_FRAGS);
@@ -3906,7 +3908,15 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 		u32 src_qp;
 		u32 psn;
 		u32 total_len;
+		u32 received;
+		u32 buffered_bytes;
+		u32 last_offset;
+		u32 last_len;
 		enum tbv_rx_reorder_kind kind;
+		u16 frags_received;
+		u16 frag_count;
+		bool complete;
+		bool with_imm;
 		bool expected;
 		bool found = false;
 
@@ -3923,8 +3933,22 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 		src_qp = msg->src_qp;
 		psn = msg->psn;
 		total_len = msg->total_len;
+		received = msg->received;
+		buffered_bytes = msg->buffered_bytes;
+		last_offset = msg->last_offset;
+		last_len = msg->last_len;
 		kind = msg->kind;
+		frags_received = msg->frags_received;
+		frag_count = msg->frag_count;
+		complete = msg->complete;
+		with_imm = msg->with_imm;
 		expected = psn == tqp->rx_expected_psn;
+		pr_warn_ratelimited("native RX reorder timeout qpn=0x%x expected_psn=%u psn=%u src_qp=0x%x kind=%u complete=%u expected=%u received=%u total=%u frags=%u/%u bytes=%u last_offset=%u last_len=%u with_imm=%u\n",
+				    tqp->base.qp_num, tqp->rx_expected_psn,
+				    psn, src_qp, kind, complete, expected,
+				    received, total_len, frags_received,
+				    frag_count, buffered_bytes, last_offset,
+				    last_len, with_imm);
 		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
 		atomic64_inc(&state->data_rx_reorder_timeout);
 		if (expected)
@@ -8609,6 +8633,9 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 	set_bit(frag_idx, msg->frag_seen);
 	msg->frags_received++;
 	msg->received += hdr->length;
+	msg->last_offset = offset;
+	msg->last_len = hdr->length;
+	msg->first_jiffies = jiffies;
 	if (msg->frags_received == msg->frag_count)
 		msg->complete = true;
 	if (msg->complete)
@@ -8720,6 +8747,9 @@ static void tbv_rx_buffer_write_fragment_locked(
 	set_bit(frag_idx, msg->frag_seen);
 	msg->frags_received++;
 	msg->received += hdr->length;
+	msg->last_offset = offset;
+	msg->last_len = hdr->length;
+	msg->first_jiffies = jiffies;
 	if (msg->frags_received == msg->frag_count)
 		msg->complete = true;
 	if (msg->complete)
