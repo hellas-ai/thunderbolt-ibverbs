@@ -115,6 +115,7 @@
               tools/ci/distro-package-rdma.sh \
               tools/ci/distro-package.sh \
               userspace/bench/tbv_app_gate.sh \
+              userspace/bench/tbv_app_gate_summarize.sh \
               tools/ci/vm-guest-smoke.sh \
               tools/ci/vm-smoke.sh
             python3 -m py_compile \

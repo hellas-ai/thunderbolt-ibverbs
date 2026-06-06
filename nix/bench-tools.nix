@@ -34,6 +34,7 @@ let
 
   scripts = [
     "tbv_app_gate.sh"
+    "tbv_app_gate_summarize.sh"
     "tbv_perftest_runner.py"
     "tbv_pytorch_smoke.py"
     "tbv_rdma_sweep.py"
