@@ -79,7 +79,7 @@ while IFS= read -r rep_dir; do
   t2=$(timing_us "$rank0_log" 2097152)
 
   if [[ $printed -eq 0 ]]; then
-    printf 'mode rep t1_us t2_us wr_retx rnr_retx ack_retry ack64 late_ack dup_ack ack_miss ack_probe ack_probe_fb tx_ack_req tx_ack_req_err rx_ack_req rx_ack_req_reack rx_ack_req_miss rx_ack_req_miss_past rx_ack_req_miss_cur rx_ack_req_miss_cur_active rx_ack_req_miss_cur_reorder rx_ack_req_miss_cur_idle rx_ack_req_miss_fut reord_to reord_retry reord_drop active_to active_retry tx_rnr rx_rnr rnr_exh dv_hard wr_to wr_exh tx_err tx_post tx_comp\n'
+    printf 'mode rep t1_us t2_us wr_retx rnr_retx ack_retry ack64 late_ack dup_ack ack_miss ack_probe ack_probe_fb tx_ack_req tx_ack_req_err rx_ack_req rx_ack_req_reack rx_ack_req_miss rx_ack_req_miss_past rx_ack_req_miss_cur rx_ack_req_miss_cur_active rx_ack_req_miss_cur_reorder rx_ack_req_miss_cur_idle rx_ack_req_miss_fut reord_to reord_retry reord_drop active_to active_retry tx_rnr rx_rnr rnr_exh rnr_exh_cap rnr_exh_close rnr_exh_qperr dv_hard wr_to wr_exh tx_err tx_post tx_comp\n'
     printed=1
   fi
 
@@ -113,6 +113,9 @@ while IFS= read -r rep_dir; do
     data_tx_ack_rnr \
     data_rx_ack_rnr \
     data_wr_rnr_retry_exhausted \
+    data_wr_rnr_complete_retry_exhausted \
+    data_wr_rnr_complete_closing_qp \
+    data_wr_rnr_complete_qp_error \
     dv_hard_error \
     data_wr_timeout \
     data_wr_retry_exhausted \

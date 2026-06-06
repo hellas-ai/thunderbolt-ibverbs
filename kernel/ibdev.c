@@ -2173,6 +2173,7 @@ static bool tbv_qp_note_rnr_ack(struct tbv_qp *tqp, u32 psn,
 				struct list_head *complete,
 				struct tbv_send_ctx **matched_out)
 {
+	struct tbv_state *state = tqp->owner;
 	struct tbv_send_ctx *send, *tmp;
 	unsigned long flags;
 	unsigned long delay;
@@ -2184,14 +2185,27 @@ static bool tbv_qp_note_rnr_ack(struct tbv_qp *tqp, u32 psn,
 	spin_lock_irqsave(&tqp->lock, flags);
 	delay = tbv_rnr_timer_jiffies(tqp->attr.min_rnr_timer);
 	list_for_each_entry_safe(send, tmp, &tqp->pending_sends, node) {
+		bool retry_exhausted;
+		bool qp_closing;
+		bool qp_error;
+
 		if (send->psn != (psn & TBV_PSN_MASK))
 			continue;
 
 		matched = true;
 		if (matched_out && refcount_inc_not_zero(&send->refs))
 			*matched_out = send;
-		if (tbv_send_rnr_retry_exhausted(send) || tqp->closing ||
-		    tqp->state == IB_QPS_ERR) {
+		retry_exhausted = tbv_send_rnr_retry_exhausted(send);
+		qp_closing = tqp->closing;
+		qp_error = tqp->state == IB_QPS_ERR;
+		if (retry_exhausted || qp_closing || qp_error) {
+			if (retry_exhausted)
+				atomic64_inc(
+					&state->data_wr_rnr_complete_retry_exhausted);
+			else if (qp_closing)
+				atomic64_inc(&state->data_wr_rnr_complete_closing_qp);
+			else
+				atomic64_inc(&state->data_wr_rnr_complete_qp_error);
 			if (!send->ready) {
 				send->ready = true;
 				send->completion_status = -EAGAIN;

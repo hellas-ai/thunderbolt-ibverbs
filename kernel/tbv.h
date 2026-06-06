@@ -503,6 +503,9 @@ struct tbv_state {
 	atomic64_t data_wr_retry_enqueue_error;
 	atomic64_t data_wr_retry_exhausted;
 	atomic64_t data_wr_rnr_retry_exhausted;
+	atomic64_t data_wr_rnr_complete_retry_exhausted;
+	atomic64_t data_wr_rnr_complete_closing_qp;
+	atomic64_t data_wr_rnr_complete_qp_error;
 	atomic64_t data_wr_timeout;
 	atomic64_t data_wr_send_timeout;
 	atomic64_t data_wr_timeout_last_psn;

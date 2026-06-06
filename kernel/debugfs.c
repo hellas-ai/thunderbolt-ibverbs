@@ -250,6 +250,12 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_retry_exhausted));
 	seq_printf(s, "data_wr_rnr_retry_exhausted: %lld\n",
 		   atomic64_read(&state->data_wr_rnr_retry_exhausted));
+	seq_printf(s, "data_wr_rnr_complete_retry_exhausted: %lld\n",
+		   atomic64_read(&state->data_wr_rnr_complete_retry_exhausted));
+	seq_printf(s, "data_wr_rnr_complete_closing_qp: %lld\n",
+		   atomic64_read(&state->data_wr_rnr_complete_closing_qp));
+	seq_printf(s, "data_wr_rnr_complete_qp_error: %lld\n",
+		   atomic64_read(&state->data_wr_rnr_complete_qp_error));
 	seq_printf(s, "data_wr_timeout: %lld\n",
 		   atomic64_read(&state->data_wr_timeout));
 	seq_printf(s, "data_wr_send_timeout: %lld\n",
