@@ -4053,3 +4053,99 @@ Because the no-QP increments did not pair with `data_rx_no_qp_reack` or
 path. The remaining no-QP sites include MAD and non-ackable native opcodes
 arriving after QP teardown. Add opcode/site-specific no-QP instrumentation
 before relaxing the gate or treating this as benign teardown noise.
+
+### 2026-06-06 no-QP split deployment and mode-5 retest
+
+Added and deployed site/opcode-specific no-QP counters:
+
+```text
+GDA branch commit: 8261572 kernel: split no-QP receive counters
+NixOS config commits:
+  e8e4cb2 thunderbolt: ignore self UUID XDomain peers
+  60bcb9a thunderbolt: pin GDA no-QP diagnostics
+deploy command:
+  nix run .#colmena -- --impure apply --on strix-1,strix-2 --reboot boot
+post-reboot reload:
+  sudo thunderbolt-ibverbs-reload-system
+```
+
+Both Strix hosts rebooted into the new `7.0.10` generation, the reload helper
+reported `thunderbolt-ibverbs-check: ok`, and the new debugfs counters were
+present and zero before testing:
+
+```text
+data_rx_no_qp_apple: 0
+data_rx_no_qp_mad: 0
+data_rx_no_qp_native_ackable: 0
+data_rx_no_qp_native_non_ack: 0
+data_rx_no_qp_opcode_0..15: 0
+```
+
+First classified mode-5 rerun:
+
+```text
+log root: /tmp/tbv-app-gate-pytorch-hoststream-mode5-noqp-split-a9c630-20260606-071858
+status: pass
+loaded_collective_lib: /mnt/Home/tmp/rccl-hoststream-timing-install-a9c630/lib/librccl.so.1.0
+dv_poll_wqes sum: +16
+data_rx_no_qp: +0
+data_rx_no_qp_mad: +0
+data_rx_no_qp_native_ackable: +0
+data_rx_no_qp_native_non_ack: +0
+data_rx_canceled: +0
+data_wr_retransmit: +0
+data_wr_timeout: +0
+data_tx_posted == data_tx_completed == +680
+```
+
+Eight additional mode-5 reps, same rebuilt RCCL and PyTorch loader override:
+
+```text
+log root: /tmp/tbv-app-gate-pytorch-hoststream-mode5-repeat-a9c630-20260606-071941
+status: pass
+reps: 8/8
+data_rx_no_qp: +0 in every rep
+data_rx_no_qp_mad/native_ackable/native_non_ack: +0 in every rep
+data_rx_canceled: +0 in every rep
+data_wr_timeout: +0 in every rep
+data_tx_posted == data_tx_completed in every rep
+data_wr_retransmit: +2 total, both completed without teardown-guard hits
+```
+
+Per-rep key deltas:
+
+```text
+rep retransmit timeout no_qp canceled tx_posted/tx_completed
+1   +0         +0      +0    +0       +684/+684
+2   +0         +0      +0    +0       +684/+684
+3   +0         +0      +0    +0       +688/+688
+4   +1         +0      +0    +0       +753/+753
+5   +0         +0      +0    +0       +684/+684
+6   +0         +0      +0    +0       +688/+688
+7   +1         +0      +0    +0       +753/+753
+8   +0         +0      +0    +0       +684/+684
+```
+
+Mode-5 phase means across the 8-rep set:
+
+```text
+msgSize symId n  copyIn_ms exchange_ms copyOut_ms total_ms
+131072  0     16 0.002     0.253       0.008      0.264
+131072  1     16 0.002     1.596       0.008      1.607
+524288  0     16 0.002     9.602       0.014      9.618
+524288  1     16 0.002     15.588      0.014      15.605
+```
+
+Interpretation:
+
+1. The earlier `data_rx_no_qp +2` did not reproduce after reboot plus clean
+   helper reload, so it remains an intermittent lifecycle event rather than a
+   classified steady-state mode-5 failure.
+2. The split counters are now deployed and included in the gate, so the next
+   no-QP occurrence will identify whether it is MAD, ackable native traffic, or
+   non-ackable native traffic.
+3. The PyTorch all-to-all GDA path is good enough for cautious application-level
+   smoke and short benchmark runs. The current hard stop is no longer basic
+   correctness of PyTorch/RCCL all-to-all, but performance variability in the
+   rocSHMEM exchange phase and the fact that vLLM's dominant collectives still
+   do not exercise this GDA path.
