@@ -388,3 +388,51 @@ not attributable to successful ACK-query repair; with only five reps it should
 be treated as workload variance or timing. The useful new fact is narrower:
 the ACK-probe request path is live and non-fatal under PyTorch hoststream load,
 but the re-ACK lookup path is not matching the missing ACKs.
+
+## ACK Probe Miss Classifier
+
+Added live-QP ACK_REQ miss classifiers:
+
+```text
+data_rx_ack_req_miss_past     psn < rx_expected_psn, delivered but history miss
+data_rx_ack_req_miss_current  psn == rx_expected_psn, receiver has not consumed it
+data_rx_ack_req_miss_future   psn > rx_expected_psn, request raced ahead
+```
+
+Also added them to `tbv_app_gate_summarize.sh`. The first classifier run showed
+the kernel counters but exposed a bench-tool allowlist gap: the app-gate
+`TBV_COUNTER_KEYS` list did not capture the new fields, so the summarizer
+printed `NA`. Live post-run counters on strix-2 nevertheless showed:
+
+```text
+data_rx_ack_req=14
+data_rx_ack_req_reack=0
+data_rx_ack_req_miss=14
+data_rx_ack_req_miss_past=0
+data_rx_ack_req_miss_current=14
+data_rx_ack_req_miss_future=0
+```
+
+After adding the classifiers to `tbv_app_gate.sh`, the logged rerun was:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-ackprobe-classify2-20260606-143500
+status: pass
+wr_retx total: 2
+ack_retry/ack64 total: 2/2
+ack_probe/ack_probe_fb: 2/2
+tx_ack_req/tx_ack_req_err: 2/0
+rx_ack_req/rx_ack_req_reack/rx_ack_req_miss: 2/0/2
+rx_ack_req_miss_past/current/future: 0/2/0
+data_wr_timeout/data_wr_retry_exhausted: 0/0
+data_tx_posted/completed: balanced in every rep
+```
+
+This changes the ACK-probe interpretation. The ACK_REQ mechanism is not usually
+probing a delivered PSN whose ACK history exists or was overwritten. In these
+two runs, all misses were for the receiver's current expected PSN, which means
+the receiver had not consumed that operation when the sender's first timeout
+fired. Full data retransmission is therefore the correct recovery for these
+events; a pure ACK query cannot repair them. The remaining tail should be
+treated as data/fragments arriving late or being lost before receiver PSN
+consumption, not just reverse-channel SEND_ACK loss.
