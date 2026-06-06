@@ -620,6 +620,8 @@ struct tbv_state {
 	atomic64_t data_rx_write_imm_future_psn;
 	atomic64_t data_rx_write_imm_gap;
 	atomic64_t data_rx_write_imm_nonzero_first;
+	atomic64_t data_rx_write_imm_reorder_buffered;
+	atomic64_t data_rx_write_imm_reorder_delivered;
 	atomic64_t apple_rx_sof;
 	atomic64_t apple_rx_eof3;
 	atomic64_t apple_rx_eof_other;

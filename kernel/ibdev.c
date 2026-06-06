@@ -337,6 +337,7 @@ struct tbv_rx_reorder_msg {
 	u32 buffered_bytes;
 	u32 last_offset;
 	u32 last_len;
+	u32 frag_stride;
 	u16 frag_count;
 	u16 frags_received;
 	DECLARE_BITMAP(frag_seen, TBV_RX_REORDER_MAX_FRAGS);
@@ -7935,6 +7936,108 @@ static bool tbv_rx_write_fragment_shape(u32 total_len, u32 offset, u32 len,
 					 frag_count);
 }
 
+static bool tbv_rx_write_fragment_shape_stride(u32 total_len, u32 stride,
+					       u32 offset, u32 len, bool last,
+					       u32 *frag_idx,
+					       u32 *frag_count)
+{
+	if (stride != TBV_NATIVE_DATA_MAX_PAYLOAD &&
+	    stride != TBV_NATIVE_DATA_FRAME_SIZE)
+		return false;
+
+	return tbv_rx_fragment_shape_max(total_len, stride, offset, len, last,
+					 frag_idx, frag_count);
+}
+
+static bool tbv_rx_write_imm_fragment_shape(u32 known_total_len,
+					    u32 known_stride, u32 offset,
+					    u32 len, bool last,
+					    u32 *total_len,
+					    u32 *frag_idx,
+					    u32 *frag_count,
+					    u32 *frag_stride)
+{
+	u64 end;
+	u32 count = 0;
+	u32 idx = 0;
+	u32 stride = known_stride;
+
+	if (!total_len || !frag_idx || !frag_count || !frag_stride)
+		return false;
+	if (check_add_overflow((u64)offset, (u64)len, &end) ||
+	    end > TBV_NATIVE_DATA_MAX_MSG_SIZE)
+		return false;
+
+	if (last) {
+		if (end > U32_MAX)
+			return false;
+		if (stride) {
+			if (!tbv_rx_write_fragment_shape_stride((u32)end,
+							       stride, offset,
+							       len, true, &idx,
+							       &count))
+				return false;
+		} else if (tbv_rx_fragment_shape_max((u32)end,
+						     TBV_NATIVE_DATA_MAX_PAYLOAD,
+						     offset, len, true, &idx,
+						     &count)) {
+			stride = TBV_NATIVE_DATA_MAX_PAYLOAD;
+		} else if (tbv_rx_fragment_shape_max((u32)end,
+						     TBV_NATIVE_DATA_FRAME_SIZE,
+						     offset, len, true, &idx,
+						     &count)) {
+			stride = TBV_NATIVE_DATA_FRAME_SIZE;
+		} else {
+			return false;
+		}
+		if (known_total_len && known_total_len != (u32)end)
+			return false;
+		*total_len = (u32)end;
+		*frag_idx = idx;
+		*frag_count = count;
+		*frag_stride = stride;
+		return true;
+	}
+
+	if (!len)
+		return false;
+	if (known_total_len) {
+		if (!tbv_rx_write_fragment_shape_stride(known_total_len, stride,
+						       offset, len, false,
+						       &idx, &count))
+			return false;
+		*total_len = known_total_len;
+		*frag_idx = idx;
+		*frag_count = count;
+		*frag_stride = stride;
+		return true;
+	}
+
+	if (!stride) {
+		if (len == TBV_NATIVE_DATA_MAX_PAYLOAD &&
+		    offset % TBV_NATIVE_DATA_MAX_PAYLOAD == 0) {
+			stride = TBV_NATIVE_DATA_MAX_PAYLOAD;
+		} else if (len == TBV_NATIVE_DATA_FRAME_SIZE &&
+			   offset % TBV_NATIVE_DATA_FRAME_SIZE == 0) {
+			stride = TBV_NATIVE_DATA_FRAME_SIZE;
+		} else {
+			return false;
+		}
+	} else if (len != stride || offset % stride) {
+		return false;
+	}
+
+	idx = offset / stride;
+	if (idx >= TBV_RX_REORDER_MAX_FRAGS)
+		return false;
+
+	*total_len = 0;
+	*frag_idx = idx;
+	*frag_count = 0;
+	*frag_stride = stride;
+	return true;
+}
+
 static void tbv_rx_reorder_unlink_msg_locked(struct tbv_qp *tqp,
 					     struct tbv_rx_reorder_msg *msg)
 {
@@ -8348,6 +8451,7 @@ static bool tbv_rx_deliver_reorder_write_locked(struct tbv_state *state,
 				    IB_WC_RECV;
 		wc.qp = &tqp->base;
 		wc.src_qp = msg->src_qp;
+		wc.byte_len = msg->total_len;
 		wc.pkey_index = 0;
 		wc.port_num = 1;
 		if (status == IB_WC_SUCCESS) {
@@ -8370,6 +8474,8 @@ static bool tbv_rx_deliver_reorder_write_locked(struct tbv_state *state,
 	tbv_send_ack_on_path(tqp, rx_path, msg->src_qp, tqp->base.qp_num,
 			     msg->psn, ack_status);
 	atomic64_inc(&state->data_rx_reorder_delivered);
+	if (msg->with_imm)
+		atomic64_inc(&state->data_rx_write_imm_reorder_delivered);
 	tbv_rx_reorder_free_msg(msg);
 	return ret != -EAGAIN;
 }
@@ -8799,6 +8905,141 @@ static void tbv_rx_buffer_write_fragment_locked(
 		tbv_rx_drain_reorder_locked(state, tqp, rx_path);
 }
 
+static void tbv_rx_buffer_write_imm_fragment_locked(
+	struct tbv_state *state, struct tbv_qp *tqp, struct tbv_path *rx_path,
+	const struct tbv_native_data_header *hdr, u32 psn, u32 offset,
+	bool last, const void *payload)
+{
+	struct tbv_rx_reorder_msg *msg;
+	s32 delta = tbv_psn_delta(psn, tqp->rx_expected_psn);
+	u32 total_len = 0;
+	u32 frag_idx;
+	u32 frag_count;
+	u32 frag_stride;
+	int ret;
+
+	if (delta < 0) {
+		tbv_rx_reack_duplicate_locked(state, tqp, rx_path,
+					      hdr->src_qp, hdr->dest_qp, psn);
+		return;
+	}
+	if (delta >= TBV_RX_REORDER_MAX_MESSAGES) {
+		atomic64_inc(&state->data_rx_reorder_window);
+		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp, hdr->dest_qp,
+				     psn, TBV_NATIVE_SEND_ACK_ERROR);
+		return;
+	}
+
+	msg = tbv_rx_reorder_find(tqp, psn);
+	if (!msg) {
+		if (!tbv_rx_write_imm_fragment_shape(0, 0, offset,
+						     hdr->length, last,
+						     &total_len, &frag_idx,
+						     &frag_count,
+						     &frag_stride)) {
+			atomic64_inc(&state->data_rx_send_bad_fragment);
+			tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
+					     hdr->dest_qp, psn,
+					     TBV_NATIVE_SEND_ACK_ERROR);
+			return;
+		}
+		if (tqp->rx_reorder_count >= TBV_RX_REORDER_MAX_MESSAGES) {
+			atomic64_inc(&state->data_rx_reorder_window);
+			tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
+					     hdr->dest_qp, psn,
+					     TBV_NATIVE_SEND_ACK_ERROR);
+			return;
+		}
+
+		msg = kzalloc(sizeof(*msg), GFP_KERNEL);
+		if (!msg) {
+			tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
+					     hdr->dest_qp, psn,
+					     TBV_NATIVE_SEND_ACK_ERROR);
+			return;
+		}
+
+		INIT_LIST_HEAD(&msg->frags);
+		msg->first_jiffies = jiffies;
+		msg->kind = TBV_RX_REORDER_WRITE;
+		msg->remote_addr = hdr->remote_addr;
+		msg->src_qp = hdr->src_qp;
+		msg->psn = psn;
+		msg->total_len = total_len;
+		msg->imm_data = hdr->imm_data;
+		msg->rkey = hdr->rkey;
+		msg->frag_count = frag_count;
+		msg->frag_stride = frag_stride;
+		msg->with_imm = true;
+		msg->solicited = hdr->flags & TBV_NATIVE_DATA_F_SOLICITED;
+		list_add_tail(&msg->node, &tqp->rx_reorder);
+		tqp->rx_reorder_count++;
+		atomic64_inc(&state->data_rx_reorder_buffered);
+		atomic64_inc(&state->data_rx_write_imm_reorder_buffered);
+		tbv_qp_schedule_timeout(tqp);
+	} else {
+		if (!tbv_rx_write_imm_fragment_shape(msg->total_len,
+						     msg->frag_stride, offset,
+						     hdr->length, last,
+						     &total_len, &frag_idx,
+						     &frag_count,
+						     &frag_stride) ||
+		    msg->kind != TBV_RX_REORDER_WRITE ||
+		    msg->src_qp != hdr->src_qp ||
+		    msg->remote_addr != hdr->remote_addr ||
+		    !msg->with_imm ||
+		    msg->imm_data != hdr->imm_data ||
+		    msg->rkey != hdr->rkey ||
+		    (msg->frag_count && frag_count &&
+		     msg->frag_count != frag_count) ||
+		    msg->frag_stride != frag_stride) {
+			tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
+			tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
+					     hdr->dest_qp, psn,
+					     TBV_NATIVE_SEND_ACK_ERROR);
+			return;
+		}
+		if (total_len) {
+			msg->total_len = total_len;
+			msg->frag_count = frag_count;
+		}
+		if (test_bit(frag_idx, msg->frag_seen)) {
+			if (!tbv_rx_reorder_fragment_matches_locked(
+				    msg, offset, payload, hdr->length)) {
+				tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
+				tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
+						     hdr->dest_qp, psn,
+						     TBV_NATIVE_SEND_ACK_ERROR);
+				return;
+			}
+			if (msg->complete)
+				tbv_rx_drain_reorder_locked(state, tqp, rx_path);
+			return;
+		}
+	}
+
+	ret = tbv_rx_reorder_store_fragment_locked(tqp, msg, offset, payload,
+						   hdr->length);
+	if (ret) {
+		if (ret == -ENOSPC)
+			atomic64_inc(&state->data_rx_reorder_window);
+		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
+		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp, hdr->dest_qp,
+				     psn, TBV_NATIVE_SEND_ACK_ERROR);
+		return;
+	}
+	set_bit(frag_idx, msg->frag_seen);
+	msg->frags_received++;
+	msg->received += hdr->length;
+	msg->last_offset = offset;
+	msg->last_len = hdr->length;
+	msg->first_jiffies = jiffies;
+	if (msg->frag_count && msg->frags_received == msg->frag_count)
+		msg->complete = true;
+	if (msg->complete)
+		tbv_rx_drain_reorder_locked(state, tqp, rx_path);
+}
+
 static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 					struct tbv_qp *tqp,
 					const struct tbv_native_data_header *hdr,
@@ -9084,6 +9325,7 @@ static int tbv_rx_finish_write_locked(struct tbv_state *state,
 				    IB_WC_RECV;
 		wc.qp = &tqp->base;
 		wc.src_qp = src_qp;
+		wc.byte_len = wrx->received;
 		wc.pkey_index = 0;
 		wc.port_num = 1;
 		if (status == IB_WC_SUCCESS) {
@@ -9170,6 +9412,14 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 
 	if (tbv_rx_reack_duplicate_locked(state, tqp, rx_path, hdr->src_qp,
 					  hdr->dest_qp, psn)) {
+		mutex_unlock(&tqp->rx_lock);
+		return;
+	}
+
+	if (with_imm) {
+		tbv_rx_buffer_write_imm_fragment_locked(state, tqp, rx_path, hdr,
+							psn, offset, last,
+							payload);
 		mutex_unlock(&tqp->rx_lock);
 		return;
 	}
