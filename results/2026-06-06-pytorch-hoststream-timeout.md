@@ -1803,3 +1803,72 @@ lookup as the source of the slot penalty. The remaining target is the posted
 RDMA WRITE completion path: rocSHMEM's wait on the GDA QP, thunderbolt-ibverbs'
 DV WR completion path, NHI transfer/completion behavior, or an interaction
 with the RNR/write-gap recovery that scales with the absolute heap address.
+
+### USB4 Source vs Destination Slot Split
+
+Added RCCL host-stream diagnostic knobs to decouple the source and destination
+scratch slots:
+
+```text
+RCCL_ROCSHMEM_HOST_STREAM_FIXED_SRC_SYMID
+RCCL_ROCSHMEM_HOST_STREAM_FIXED_DST_SYMID
+```
+
+The app gate exposes them as `--hoststream-fixed-src-symid` and
+`--hoststream-fixed-dst-symid`. Defaults preserve the old behavior: if these
+are unset, both sides use `RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID` or the
+rotating `comm->symId`.
+
+Smoke root proving the new selectors reached RCCL and rocSHMEM:
+
+```text
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-srcdst-smoke-src0-dst3-20260606-205832
+srcSymId=0 dstSymId=3 srcSlotOffset=0 dstSlotOffset=201326592
+```
+
+Then ran payload-only mode with `numSymBuf=4`, fixed base sym ID 0,
+validation disabled, `iters=3`, `reps=3`, and the same rebuilt RCCL/rocSHMEM
+installs:
+
+```text
+src_sym dst_sym src_slot_offset dst_slot_offset exchange_avg exchange_p50 exchange_p90 exchange_max post_avg_combined quiet_avg_combined quiet_p90_max tx_post tx_comp wr_retx rnr_retx ack_retry write_gap_rnr dv_hard wr_to wr_exh tx_err
+0       0       0               0               17.717ms     12.144ms     40.523ms     49.602ms     677.4             1724809.8          4912848       17913   17913   0       42       595       1082          0       0     0      0
+3       0       201326592       0               60.608ms     62.503ms     96.732ms     99.077ms     766.7             6011486.9          9853668       9753    9753    0       15       144       385           0       0     0      0
+0       3       0               201326592       24.721ms     20.406ms     34.501ms     101.730ms    579.8             2424401.1          10115992      17767   17767   0       42       428       1155          0       0     0      0
+3       3       201326592       201326592       85.597ms     69.414ms     173.789ms    177.069ms    709.6             8503472.0          17586604      11387   11387   0       19       354       947           0       0     0      0
+```
+
+Directional USB4 timing, in raw `wall_clock64()` ticks:
+
+```text
+src dst direction src_heap_off dst_heap_off count post_avg quiet_avg quiet_p90 quiet_max total_avg total_p90 total_max
+0   0   0->1      1084672      268471680    9     692.9    1480252.9 2832096   2832096   1480945.8 2833204   2833204
+0   0   1->0      36096        269520256    9     661.8    1979366.7 4912848   4912848   1980028.4 4913636   4913636
+3   0   0->1      202411264    268471680    9     830.7    7191348.9 9853668   9853668   7192179.6 9854012   9854012
+3   0   1->0      201362688    269520256    9     702.7    4831624.9 6857992   6857992   4832327.6 6858792   6858792
+0   3   0->1      1084672      469798272    9     672.4    2167304.0 3403700   3403700   2167976.4 3404564   3404564
+0   3   1->0      36096        470846848    9     487.1    2691498.2 10115992  10115992  2691985.3 10116416  10116416
+3   3   0->1      202411264    469798272    9     768.9    8291212.9 17586604  17586604  8291981.8 17587652  17587652
+3   3   1->0      201362688    470846848    9     650.2    8715731.1 17304600  17304600  8716381.3 17305012  17305012
+```
+
+Log roots:
+
+```text
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-srcdst-src0-dst0-20260606-205933
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-srcdst-src3-dst0-20260606-205958
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-srcdst-src0-dst3-20260606-210024
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-srcdst-src3-dst3-20260606-210049
+```
+
+All four roots passed. Post cost remains flat and tiny. The large effect follows
+the local source slot: `src3/dst0` is about 3.4x slower than `src0/dst0`, while
+`src0/dst3` is only about 1.4x slower than `src0/dst0`. `src3/dst3` is slower
+again, so destination offset may add tail latency, but it is not the primary
+driver.
+
+Interpretation: the slot penalty is now localized further to the sender-side
+payload completion path for RDMA WRITEs whose local source address is high in
+the coherent rocSHMEM scratch allocation. The next kernel-side split should
+measure DV WQE admission, native WRITE send completion, and DV CQE publication
+by WQE local address bucket; remote destination offset is secondary.

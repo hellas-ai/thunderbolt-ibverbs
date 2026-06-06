@@ -30,6 +30,8 @@ rccl_source_heap=${TBV_RCCL_SOURCE_HEAP:-${RCCL_ROCSHMEM_SOURCE_HEAP:-}}
 rccl_dest_heap=${TBV_RCCL_DEST_HEAP:-${RCCL_ROCSHMEM_DEST_HEAP:-}}
 rccl_num_sym_buf=${TBV_RCCL_NUM_SYM_BUF:-${RCCL_ROCSHMEM_NUM_SYM_BUF:-}}
 hoststream_fixed_symid=${TBV_RCCL_HOSTSTREAM_FIXED_SYMID:-${RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID:-}}
+hoststream_fixed_src_symid=${TBV_RCCL_HOSTSTREAM_FIXED_SRC_SYMID:-${RCCL_ROCSHMEM_HOST_STREAM_FIXED_SRC_SYMID:-}}
+hoststream_fixed_dst_symid=${TBV_RCCL_HOSTSTREAM_FIXED_DST_SYMID:-${RCCL_ROCSHMEM_HOST_STREAM_FIXED_DST_SYMID:-}}
 hoststream_addr_log=${TBV_RCCL_HOSTSTREAM_ADDR_LOG:-${RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG:-}}
 usb4_a2a_post_log=${TBV_ROCSHMEM_USB4_A2A_POST_LOG:-${ROCSHMEM_GDA_USB4_A2A_POST_LOG:-}}
 usb4_a2a_timing_log=${TBV_ROCSHMEM_USB4_A2A_TIMING_LOG:-${ROCSHMEM_GDA_USB4_A2A_TIMING_LOG:-}}
@@ -92,6 +94,10 @@ Options:
   --rocshmem-num-sym-buf N  Set RCCL_ROCSHMEM_NUM_SYM_BUF
   --hoststream-fixed-symid N
                             Set RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID
+  --hoststream-fixed-src-symid N
+                            Set RCCL_ROCSHMEM_HOST_STREAM_FIXED_SRC_SYMID
+  --hoststream-fixed-dst-symid N
+                            Set RCCL_ROCSHMEM_HOST_STREAM_FIXED_DST_SYMID
   --hoststream-addr-log 0|1
                             Set RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG
   --usb4-a2a-post-log N     Set ROCSHMEM_GDA_USB4_A2A_POST_LOG
@@ -143,6 +149,8 @@ while (($#)); do
     --dest-heap) rccl_dest_heap=$2; shift 2 ;;
     --rocshmem-num-sym-buf) rccl_num_sym_buf=$2; shift 2 ;;
     --hoststream-fixed-symid) hoststream_fixed_symid=$2; shift 2 ;;
+    --hoststream-fixed-src-symid) hoststream_fixed_src_symid=$2; shift 2 ;;
+    --hoststream-fixed-dst-symid) hoststream_fixed_dst_symid=$2; shift 2 ;;
     --hoststream-addr-log) hoststream_addr_log=$2; shift 2 ;;
     --usb4-a2a-post-log) usb4_a2a_post_log=$2; shift 2 ;;
     --usb4-a2a-timing-log) usb4_a2a_timing_log=$2; shift 2 ;;
@@ -615,7 +623,9 @@ run_rccl_case() {
       -x RCCL_ROCSHMEM_SOURCE_HEAP -x RCCL_ROCSHMEM_DEST_HEAP -x RCCL_ROCSHMEM_NUM_SYM_BUF \
       -x RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL \
       -x RCCL_ROCSHMEM_GDA_BENCH_MODE -x RCCL_ROCSHMEM_HOST_STREAM_TIMING \
-      -x RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID -x RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG \
+      -x RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID \
+      -x RCCL_ROCSHMEM_HOST_STREAM_FIXED_SRC_SYMID -x RCCL_ROCSHMEM_HOST_STREAM_FIXED_DST_SYMID \
+      -x RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG \
       -x RCCL_FORCE_ENABLE_DMABUF -x RCCL_INIT_CHANNELS -x NCCL_DEBUG \
       "$rccl_tests_dir/$bin" -b "$min_size" -e "$max_size" -f "$factor" \
       -n "$iters" -w "$warmup" -g 1 -c 1 -a 1
@@ -731,6 +741,9 @@ build_torch_remote_command() {
     "RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=$RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL"
     "RCCL_ROCSHMEM_GDA_BENCH_MODE=$RCCL_ROCSHMEM_GDA_BENCH_MODE"
     "RCCL_ROCSHMEM_HOST_STREAM_TIMING=$RCCL_ROCSHMEM_HOST_STREAM_TIMING"
+    "RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID=${RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID:--1}"
+    "RCCL_ROCSHMEM_HOST_STREAM_FIXED_SRC_SYMID=${RCCL_ROCSHMEM_HOST_STREAM_FIXED_SRC_SYMID:--1}"
+    "RCCL_ROCSHMEM_HOST_STREAM_FIXED_DST_SYMID=${RCCL_ROCSHMEM_HOST_STREAM_FIXED_DST_SYMID:--1}"
     "RCCL_INIT_CHANNELS=${RCCL_INIT_CHANNELS:-1}"
     "NCCL_DEBUG=${NCCL_DEBUG:-WARN}"
     "TBV_TORCH_SIZES=$pytorch_sizes"
@@ -834,6 +847,12 @@ setup_app_env
 if [[ -n "$hoststream_fixed_symid" ]]; then
   export RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID=$hoststream_fixed_symid
 fi
+if [[ -n "$hoststream_fixed_src_symid" ]]; then
+  export RCCL_ROCSHMEM_HOST_STREAM_FIXED_SRC_SYMID=$hoststream_fixed_src_symid
+fi
+if [[ -n "$hoststream_fixed_dst_symid" ]]; then
+  export RCCL_ROCSHMEM_HOST_STREAM_FIXED_DST_SYMID=$hoststream_fixed_dst_symid
+fi
 if [[ -n "$hoststream_addr_log" ]]; then
   export RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG=$hoststream_addr_log
 fi
@@ -865,6 +884,8 @@ echo "  source_heap=${rccl_source_heap:-gda-default}"
 echo "  dest_heap=${rccl_dest_heap:-gda-default}"
 echo "  rocshmem_num_sym_buf=${rccl_num_sym_buf:-2}"
 echo "  hoststream_fixed_symid=${hoststream_fixed_symid:-auto}"
+echo "  hoststream_fixed_src_symid=${hoststream_fixed_src_symid:-auto}"
+echo "  hoststream_fixed_dst_symid=${hoststream_fixed_dst_symid:-auto}"
 echo "  hoststream_addr_log=${hoststream_addr_log:-0}"
 echo "  usb4_a2a_post_log=${usb4_a2a_post_log:-0}"
 echo "  usb4_a2a_timing_log=${usb4_a2a_timing_log:-0}"
