@@ -281,3 +281,42 @@ is an explicit ACK-query/re-ACK request before full data retransmission, with a
 fallback to the existing data retransmit path if the query is lost or the peer
 cannot answer from ACK history. That would need a new native control opcode and
 new counters; it should be gated behind a module parameter until validated.
+
+## Post-Reboot Focused Smoke
+
+After both Strix hosts were rebooted and checked healthy, a shorter PyTorch
+hoststream smoke was run with the current application baseline:
+
+```text
+ROCSHMEM_GDA_QP_TIMEOUT=14
+ROCSHMEM_GDA_QP_RETRY_CNT=7
+ROCSHMEM_GDA_QP_RNR_RETRY=7
+native_ack_repeat=1
+sizes=1048576,2097152
+iters=4
+reps=5
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-qptimeout14-postreboot-reps5-20260606-133623
+status: pass
+```
+
+Per-rep summary from `tbv_app_gate_summarize.sh`:
+
+```text
+rep 1: 1MiB=34106.4us 2MiB=157485.1us wr_retx=8 ack_retry=7 dup_ack=7 reord_to=0 dv_hard=0 tx=12778/12778
+rep 2: 1MiB=36238.4us 2MiB=115362.4us wr_retx=5 ack_retry=5 dup_ack=5 reord_to=0 dv_hard=0 tx=11163/11163
+rep 3: 1MiB=12255.4us 2MiB=24373.7us  wr_retx=1 ack_retry=1 dup_ack=1 reord_to=0 dv_hard=0 tx=9020/9020
+rep 4: 1MiB=14557.6us 2MiB=22638.1us  wr_retx=0 ack_retry=0 dup_ack=0 reord_to=0 dv_hard=0 tx=8748/8748
+rep 5: 1MiB=29387.6us 2MiB=104482.8us wr_retx=6 ack_retry=5 dup_ack=5 reord_to=0 dv_hard=0 tx=11431/11431
+```
+
+The loader check again mapped exactly one RCCL:
+
+```text
+10 /mnt/Home/tmp/rccl-hoststream-waitbudget-install/lib/librccl.so.1.0
+```
+
+This is a clean application-level smoke result for the current baseline. It
+does not remove the ACK tail: four of five reps still needed ACK-loss recovery,
+and the matched-after-retry ACKs again track duplicate-data re-ACKs. The smaller
+run did not exercise the heavier RX reorder/RNR failure mode seen in the
+10-rep sweep.
