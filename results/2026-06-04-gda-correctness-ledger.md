@@ -4367,3 +4367,138 @@ available for lifecycle work. For application-level benchmark runs, use mode 0
 with payload validation and QP timeout exponent 14; include
 `--allow-late-send-ack-no-qp` only when the benchmark harness should tolerate
 classified late duplicate OK ACK teardown noise.
+
+### 2026-06-06 PyTorch App-Level Threshold Routing
+
+Ran a PyTorch all-to-all host-stream-vs-fallback application matrix with
+payload validation enabled, QP timeout exponent 14, and the classified late
+`SEND_ACK_OK` no-QP allowance enabled:
+
+```text
+log root:
+  /tmp/tbv-app-gate-pytorch-hoststream-vs-fallback-qptimeout14-sizes-20260606-085448
+sizes: 65536,131072,262144,524288,1048576,2097152
+iters: 8
+reps: 5
+RCCL_ROCSHMEM_THRESHOLD=1048576
+```
+
+Fallback mode did not exercise GDA and failed two later reps in regular RCCL
+NET/IB handling, not in the USB4 GDA counters:
+
+```text
+fallback status: fail reps 4/5
+fallback DV WQEs: +0
+fallback dv_hard_error/data_wr_retransmit/data_wr_timeout/data_rx_canceled: +0
+fallback data_tx_posted == data_tx_completed == +114795
+fallback data_rx_no_qp: +2, both data_rx_no_qp_send_ack_ok from rep 1
+observed RCCL errors: IBV_WC_GENERAL_ERR on RECV, IBV_WC_WR_FLUSH_ERR on RDMA_WRITE,
+  and one ibv_post_send() Invalid argument / Bad WR
+```
+
+Host-stream mode passed all five reps:
+
+```text
+hoststream status: pass 5/5
+dv_poll_wqes: +720
+dv_hard_error: +0
+data_wr_retransmit: +39
+data_wr_timeout/retry_exhausted: +0
+data_rx_no_qp: +0
+data_tx_posted == data_tx_completed == +148676
+```
+
+PyTorch rank-0 application timing still has large tail variance:
+
+```text
+fallback app us/iter:
+  65536   n=4 avg=325.8  p50=131.3  p90=909.7   max=909.7
+  131072  n=4 avg=515.3  p50=171.2  p90=937.8   max=937.8
+  262144  n=4 avg=374.2  p50=318.0  p90=548.5   max=548.5
+  524288  n=3 avg=1494.1 p50=1284.3 p90=2558.0  max=2558.0
+  1048576 n=3 avg=1884.2 p50=2121.5 p90=2129.2  max=2129.2
+  2097152 n=3 avg=3026.8 p50=2871.7 p90=3583.8  max=3583.8
+
+hoststream app us/iter:
+  65536   n=5 avg=4715.7   p50=1287.6 p90=19045.8   max=19045.8
+  131072  n=5 avg=10831.8  p50=11023.6 p90=20543.4  max=20543.4
+  262144  n=5 avg=12638.5  p50=13836.5 p90=22943.5  max=22943.5
+  524288  n=5 avg=25802.7  p50=6868.1 p90=84153.5  max=84153.5
+  1048576 n=5 avg=1199.3   p50=1077.6 p90=1487.7   max=1487.7
+  2097152 n=5 avg=221233.5 p50=3114.3 p90=1094822.6 max=1094822.6
+```
+
+The internal host-stream timing exposed a routing problem in the benchmark
+recipe rather than a scratch-buffer limit. With `RCCL_ROCSHMEM_THRESHOLD=1048576`
+and two ranks, RCCL sees `msgSize = per_peer_bytes * world_size`, so PyTorch
+per-peer sizes above 512 KiB fell back inside RCCL. Timing lines appeared only
+up to `msgSize=1048576`:
+
+```text
+msgSize 131072  n=90 exchange_avg=4.193  exchange_p50=0.841  exchange_p90=2.365  exchange_max=76.615  total_avg=4.211
+msgSize 262144  n=90 exchange_avg=9.981  exchange_p50=2.634  exchange_p90=68.550 exchange_max=78.810  total_avg=10.002
+msgSize 524288  n=90 exchange_avg=12.893 exchange_p50=4.854  exchange_p90=70.695 exchange_max=87.471  total_avg=12.920
+msgSize 1048576 n=90 exchange_avg=25.913 exchange_p50=10.151 exchange_p90=90.106 exchange_max=164.807 total_avg=25.953
+```
+
+Code/recipe fix carried forward:
+
+```text
+rocm-systems: c896cdeb24 rccl: allow larger GDA alltoall thresholds
+nix-strix-halo gda: e58fc85 therock: carry GDA threshold routing patch
+```
+
+The durable RCCL change removes the redundant 1 MiB cap in
+`rcclUseAlltoAllGda()`. The call site already checks `msgSize <=
+comm->rocshmemThreshold`, and the host-stream implementation separately checks
+`msgSize <= comm->bufThreshold`. The nix-strix patch also carries
+`RCCL_ROCSHMEM_FORCE_ENABLE` through the pinned TheRock source so the 2-host
+Strix topology can exercise the path intentionally.
+
+After rebuilding the local standalone RCCL install with the cap removed, ran a
+focused threshold-raised validation:
+
+```text
+log root:
+  /tmp/tbv-app-gate-pytorch-hoststream-threshold4m-qptimeout14-20260606-091337
+status: pass 3/3
+sizes: 1048576,2097152
+iters: 4
+RCCL_ROCSHMEM_THRESHOLD=4194304
+loaded RCCL:
+  /mnt/Home/tmp/rccl-hoststream-qptimeout-host-goodbc-install/lib/librccl.so.1.0
+```
+
+Counters stayed clean while the larger sizes exercised host-stream GDA:
+
+```text
+dv_poll_wqes: +120
+dv_hard_error: +0
+data_wr_retransmit: +10
+data_wr_timeout/retry_exhausted: +0
+data_wr_retransmit_closing_qp/no_live_path/teardown_path: +0
+data_rx_no_qp/send_ack/send_ack_ok: +0
+data_rx_canceled: +0
+data_tx_posted == data_tx_completed == +30803
+```
+
+The key routing proof is that host-stream timing lines now include the two
+larger RCCL message sizes:
+
+```text
+hoststream internal timing:
+  msgSize 2097152 n=30 exchange_avg=24.599 exchange_p50=19.176 exchange_p90=75.578  exchange_max=148.830 total_avg=24.667
+  msgSize 4194304 n=30 exchange_avg=74.066 exchange_p50=38.766 exchange_p90=279.285 exchange_max=360.107 total_avg=74.187
+
+PyTorch rank-0 app timing:
+  1048576 n=3 avg=30308.1 p50=12639.8 min=10467.1 p90=67817.3  max=67817.3
+  2097152 n=3 avg=72236.6 p50=23570.7 min=21737.4 p90=171401.7 max=171401.7
+```
+
+Conclusion: the stack is now close enough for application-level benchmark
+experiments in the correctness sense: validated PyTorch all-to-all can use the
+USB4 GDA host-stream path at 1 MiB and 2 MiB per-peer sizes with clean hard
+counters. It is not performance-stable yet. The next bottleneck is the
+host-stream exchange variance itself, not copy-in/copy-out: at 4 MiB RCCL
+`msgSize`, average copy-in plus copy-out is about 0.12 ms while exchange averages
+74 ms and tails to 360 ms.
