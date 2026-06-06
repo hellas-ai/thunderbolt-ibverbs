@@ -44,6 +44,7 @@ expected_rccl_lib=${RCCL_EXPECTED_LIB:-}
 counter_summary=${TBV_DEBUGFS_SUMMARY:-/sys/kernel/debug/thunderbolt_ibverbs/summary}
 counter_keys=${TBV_COUNTER_KEYS:-"dv_poll_wqes dv_admission_attempts dv_backpressure_retry dv_fence_retry dv_hard_error data_wr_copy_error data_wr_retransmit data_wr_timeout data_wr_retry_exhausted data_wr_retransmit_closing_qp data_wr_retransmit_no_live_path data_wr_retransmit_teardown_path data_tx_errors data_rx_canceled data_rx_no_qp data_rx_no_qp_apple data_rx_no_qp_mad data_rx_no_qp_native_ackable data_rx_no_qp_native_non_ack data_rx_no_qp_send_ack data_rx_no_qp_send_ack_ok data_rx_no_qp_send_ack_rnr data_rx_no_qp_send_ack_error data_rx_no_qp_send_ack_bad_status data_rx_no_qp_opcode_1 data_rx_no_qp_opcode_2 data_rx_no_qp_opcode_3 data_rx_no_qp_opcode_4 data_rx_no_qp_opcode_5 data_rx_no_qp_opcode_6 data_rx_no_qp_opcode_7 data_rx_no_qp_opcode_8 data_rx_no_qp_opcode_9 data_rx_no_qp_opcode_10 data_rx_no_qp_opcode_11 data_rx_no_qp_opcode_12 data_rx_no_qp_opcode_13 data_rx_no_qp_reack data_rx_no_qp_error_ack data_rx_duplicate_ack data_qp_tombstone_evicted data_tx_posted data_tx_completed"}
 hard_error_keys=${TBV_HARD_ERROR_KEYS:-"dv_hard_error data_wr_copy_error data_wr_timeout data_wr_retry_exhausted data_wr_retransmit_closing_qp data_wr_retransmit_no_live_path data_wr_retransmit_teardown_path data_tx_errors data_rx_canceled data_rx_no_qp data_rx_no_qp_reack data_rx_no_qp_error_ack data_qp_tombstone_evicted"}
+allow_late_send_ack_no_qp=${TBV_ALLOW_LATE_SEND_ACK_NO_QP:-0}
 
 usage() {
   cat <<EOF
@@ -85,6 +86,8 @@ Options:
   --master-addr ADDR        Default: $pytorch_master_addr
   --master-port PORT        Default: $pytorch_master_port
   --expected-rccl-lib PATH  Require this RCCL path to appear in PyTorch logs
+  --allow-late-send-ack-no-qp
+                            Do not fail when all data_rx_no_qp frames are OK SEND_ACKs
 EOF
 }
 
@@ -123,6 +126,7 @@ while (($#)); do
     --master-addr) pytorch_master_addr=$2; shift 2 ;;
     --master-port) pytorch_master_port=$2; shift 2 ;;
     --expected-rccl-lib) expected_rccl_lib=$2; shift 2 ;;
+    --allow-late-send-ack-no-qp) allow_late_send_ack_no_qp=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -268,10 +272,22 @@ assert_clean_counters() {
   local target_hosts=$4
   local key
   local delta
+  local no_qp
+  local send_ack
+  local send_ack_ok
   local failed=0
 
   for key in $hard_error_keys; do
     delta=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" "$key")
+    if [[ "$key" == data_rx_no_qp && "$allow_late_send_ack_no_qp" == 1 && "$delta" -gt 0 ]]; then
+      no_qp=$delta
+      send_ack=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" data_rx_no_qp_send_ack)
+      send_ack_ok=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" data_rx_no_qp_send_ack_ok)
+      if ((no_qp == send_ack && send_ack == send_ack_ok)); then
+        echo "INFO: allowing $no_qp late OK SEND_ACK no-QP frames" >&2
+        continue
+      fi
+    fi
     if ((delta != 0)); then
       echo "ERROR: expected $key delta == 0, got $delta" >&2
       failed=1
