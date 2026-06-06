@@ -3624,3 +3624,259 @@ Interpretation:
 3. The kernel/driver path remains clean under these PyTorch collectives:
    software verbs traffic moves (`data_tx_posted/completed` grows), TX
    completions balance, and no hard correctness counter moves.
+
+### vLLM tiny TP=2/Ray smoke
+
+Follow-up runner hardening:
+
+- added `--torch-validate 0|1`, so exploratory partial-mode PyTorch/RCCL runs
+  can bypass value validation while still capturing timings and driver deltas.
+
+Validation after the runner change:
+
+```text
+bash -n userspace/bench/tbv_app_gate.sh
+nix build .#bench-tools --no-link --print-out-paths
+  /nix/store/c1gfxcv78qzmsxx1irgsl9vx3z3jb45w-thunderbolt-ibverbs-bench-tools-0.1.0
+nix build .#checks.x86_64-linux.script-syntax --no-link --print-out-paths
+  /nix/store/cwwaih19zn82ndgcxqnvsglqj5qpv5wi-thunderbolt-ibverbs-script-syntax-0.1.0
+```
+
+The packaged vLLM/PyTorch wrapper contains `vllm`, `ray`, `transformers`, and
+`torch`:
+
+```text
+/nix/store/3mr3fgrn6znah88jrc42r2wh692x24km-vllm-env-therock-usb4-hostheap-gfx1151
+```
+
+No real cached HF model was suitable for a network-free TP=2 smoke, so both
+hosts were given a local dummy-load Qwen3-shaped model:
+
+```text
+/tmp/tbv-vllm-tiny-qwen3
+source tokenizer/config: mlx-community/Qwen3-0.6B-4bit
+hidden_size=128 intermediate_size=384 layers=2 heads=2 kv_heads=2
+max_position_embeddings=512 dtype=float16
+```
+
+The first single-node vLLM smoke failed in vLLM's memory profiler because ROCm
+reports the APU's unified memory as roughly `121.0 GiB` GPU memory and the
+profiler asserts when initialization does not reduce the free-memory sample.
+Explicit KV cache sizing bypasses that profiler path:
+
+```text
+single-node output:
+  /tmp/tbv-vllm-tiny-single-kv-20260606-054728.json
+  elapsed_time: 15.1156 s
+  requests_per_second: 0.1323
+  tokens_per_second: 1.5884
+```
+
+Two-node TP=2/Ray run:
+
+```text
+log root: /tmp/tbv-vllm-tiny-tp2-20260606-054849
+model: /tmp/tbv-vllm-tiny-qwen3
+load_format: dummy
+tensor_parallel_size: 2
+distributed_executor_backend: ray
+kv_cache_memory_bytes: 16777216
+num_prompts: 2
+random_input_len/random_output_len: 8/4
+dtype: float16
+flags: --enforce-eager --disable-custom-all-reduce --disable-detokenize
+status: pass
+```
+
+Relevant vLLM/Ray facts from the log:
+
+```text
+connected to Ray at 192.168.23.136:6379
+world_size=2 backend=nccl
+rank 0: strix-1, TP rank 0
+rank 1: ip=192.168.23.192, TP rank 1
+vLLM is using nccl==2.28.9
+manual KV cache: reserved 0.02 GiB, skipped memory profiling
+```
+
+Benchmark output:
+
+```text
+elapsed_time: 20.450205951998214
+num_requests: 2
+total_num_tokens: 24
+requests_per_second: 0.09779852607325833
+tokens_per_second: 1.1735823128790999
+```
+
+Driver deltas across the TP=2 run:
+
+```text
+dv_poll_wqes sum                         +0
+data_wr_retransmit sum                   +0
+data_wr_timeout sum                      +0
+data_wr_retry_exhausted sum              +0
+data_wr_retransmit_closing_qp sum        +0
+data_wr_retransmit_no_live_path sum      +0
+data_wr_retransmit_teardown_path sum     +0
+data_tx_errors sum                       +0
+data_rx_canceled sum                     +0
+data_rx_no_qp sum                        +0
+data_qp_tombstone_evicted sum            +0
+data_tx_posted/completed strix-1         +2467/+2467
+data_tx_posted/completed strix-2         +2469/+2469
+```
+
+The Ray teardown prints an expected SIGTERM stack in the vLLM log, followed by
+vLLM's own "please ignore" Ray shutdown message. The command exited 0 and both
+hosts reported no running Ray instance afterward.
+
+Interpretation:
+
+1. vLLM TP=2 over Ray/NCCL now passes as an end-to-end lifecycle smoke on the
+   Strix pair with the USB4 RCCL wrapper in the environment.
+2. `dv_poll_wqes` stayed flat, matching the source-level scope check above:
+   this vLLM smoke exercises the distributed stack, not the current GDA
+   all-to-all path.
+3. The explicit `--kv-cache-memory-bytes` flag is required for this APU smoke
+   unless vLLM's ROCm memory profiler is fixed or taught about unified memory.
+
+### PyTorch host-stream component matrix
+
+Ran the PyTorch all-to-all smoke against the RCCL
+`RCCL_ROCSHMEM_GDA_BENCH_MODE` component switch to isolate where the host-stream
+GDA time is going. Validation was disabled because modes 1-5 intentionally run
+partial pieces of the algorithm, not a full semantic all-to-all.
+
+```text
+log root: /tmp/tbv-app-gate-pytorch-hoststream-components-20260606-055226
+collective: all_to_all
+mode: hoststream
+sizes: 65536, 262144
+iters/reps: 2/1
+torch validation: disabled
+expected RCCL:
+  /nix/store/74kx31vim3ynwpivjlxq04wbdl62nrbg-rccl-usb4-hostheap-gfx1151-2.28.9-local/lib/librccl.so.1
+status: pass for modes 1, 2, 3, 4, 5, 0
+```
+
+Mode meanings:
+
+```text
+0: full copy-in + rocSHMEM exchange + copy-out
+1: copy-in only
+2: rocSHMEM exchange only
+3: copy-out only
+4: copy-in + copy-out
+5: rocSHMEM exchange + copy-out
+```
+
+Timing and selected driver deltas:
+
+```text
+mode 1 copy-in only:
+  65536:  1630.2 us/iter, gpu 1600.5
+  262144: 39835.6 us/iter, gpu 39831.0
+  dv_poll_wqes +16, retransmit +2, tx +823/+823
+
+mode 2 rocSHMEM exchange only:
+  65536:  1669.0 us/iter, gpu 1651.8
+  262144: 39725.1 us/iter, gpu 39720.2
+  dv_poll_wqes +16, retransmit +1, tx +753/+753
+
+mode 3 copy-out only:
+  65536:  3102.4 us/iter, gpu 3085.2
+  262144: 39834.6 us/iter, gpu 39829.8
+  dv_poll_wqes +16, retransmit +1, tx +754/+754
+
+mode 4 copy-in + copy-out:
+  65536:  1057.3 us/iter, gpu 1040.2
+  262144: 3146.7 us/iter, gpu 3142.8
+  dv_poll_wqes +16, retransmit +0, tx +686/+686
+
+mode 5 rocSHMEM exchange + copy-out:
+  65536:  1257.2 us/iter, gpu 1239.9
+  262144: 79984.3 us/iter, gpu 79971.5
+  dv_poll_wqes +16, retransmit +2, tx +823/+823
+
+mode 0 full:
+  65536:  2099.3 us/iter, gpu 2080.3
+  262144: 43573.7 us/iter, gpu 43569.2
+  dv_poll_wqes +16, retransmit +1, tx +753/+753
+```
+
+Hard correctness deltas were zero in all six modes:
+
+```text
+data_wr_timeout sum                    +0
+data_wr_retry_exhausted sum            +0
+data_wr_retransmit_closing_qp sum      +0
+data_wr_retransmit_no_live_path sum    +0
+data_wr_retransmit_teardown_path sum   +0
+data_tx_errors sum                     +0
+data_rx_canceled sum                   +0
+data_rx_no_qp sum                      +0
+data_qp_tombstone_evicted sum          +0
+dv_backpressure_retry sum              +0
+dv_fence_retry sum                     +0
+```
+
+Live health after the component matrix:
+
+```text
+strix-1:
+verbs_qps=4
+dv_poll_wqes=3002
+data_wr_retransmit=27
+data_wr_timeout=0
+data_wr_retry_exhausted=0
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_tx_posted=221160
+data_tx_completed=221160
+data_tx_errors=0
+data_rx_canceled=4096
+data_rx_no_qp=0
+data_qp_tombstone_evicted=0
+
+strix-2:
+verbs_qps=4
+dv_poll_wqes=3002
+data_wr_retransmit=30
+data_wr_timeout=0
+data_wr_retry_exhausted=0
+data_wr_retransmit_closing_qp=0
+data_wr_retransmit_no_live_path=0
+data_wr_retransmit_teardown_path=0
+data_tx_posted=220800
+data_tx_completed=220800
+data_tx_errors=0
+data_rx_canceled=0
+data_rx_no_qp=0
+data_qp_tombstone_evicted=0
+```
+
+No matching `BUG`, `Oops`, `panic`, watchdog, lockup, hard-error, timeout,
+GPU-fault, or AMDGPU reset/timeout appeared in the dmesg error scan after the
+vLLM/component runs. The visible ACPI/Overdrive/watchdog/ramoops lines are boot
+baseline noise, not new driver faults.
+
+Interpretation:
+
+1. The host-stream GDA path is still correctness-clean under PyTorch, but the
+   256 KiB timing is dominated by a roughly 39-40 ms serialized component that
+   appears in copy-in, exchange-only, and copy-out-only modes individually.
+2. Copy-in+copy-out together is only 3.1 ms at 256 KiB, which contradicts a
+   simple "both HIP copies are inherently 40 ms" explanation. The benchmark
+   switch is likely changing synchronization/lifetime behavior around each
+   partial component, so the next measurement needs RCCL/rocSHMEM-side phase
+   timing rather than more end-to-end PyTorch repetition.
+3. `dv_poll_wqes` is exactly +16 per mode and admission/fence/backpressure
+   counters are clean, so the kernel DV path is not the obvious source of the
+   40 ms plateau.
+4. Small successful ACK retransmits still occur under these application-level
+   runs (`data_wr_retransmit` +0..+2 per mode), but no timeout, retry
+   exhaustion, teardown guard, or tombstone eviction counter moved. This remains
+   expected control-channel loss handled by the current software reliability
+   layer, not a correctness failure.

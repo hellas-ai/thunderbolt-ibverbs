@@ -32,6 +32,7 @@ pytorch_wrapper=${VLLM_USB4_ENV:-${TBV_PYTORCH_WRAPPER:-}}
 pytorch_sizes=${TBV_TORCH_SIZES:-65536,262144}
 pytorch_iters=${TBV_TORCH_ITERS:-2}
 pytorch_collectives=${TBV_TORCH_COLLECTIVES:-all_to_all}
+pytorch_validate=${TBV_TORCH_VALIDATE:-1}
 pytorch_master_addr=${TBV_TORCH_MASTER_ADDR:-192.168.23.136}
 pytorch_master_port=${TBV_TORCH_MASTER_PORT:-29617}
 pytorch_timeout=${TBV_TORCH_TIMEOUT:-240}
@@ -73,6 +74,7 @@ Options:
   --pytorch-wrapper DIR     vLLM/PyTorch wrapper prefix
   --pytorch-sizes CSV       Default: $pytorch_sizes
   --pytorch-iters N         Default: $pytorch_iters
+  --torch-validate 0|1      Default: $pytorch_validate
   --pytorch-timeout SECONDS Default: $pytorch_timeout
   --pytorch-remote-script P Remote script path. Default: $pytorch_remote_script
   --torch-collectives CSV   Default: $pytorch_collectives
@@ -108,6 +110,7 @@ while (($#)); do
     --pytorch-wrapper) pytorch_wrapper=$2; shift 2 ;;
     --pytorch-sizes) pytorch_sizes=$2; shift 2 ;;
     --pytorch-iters) pytorch_iters=$2; shift 2 ;;
+    --torch-validate) pytorch_validate=$2; shift 2 ;;
     --pytorch-timeout) pytorch_timeout=$2; shift 2 ;;
     --pytorch-remote-script) pytorch_remote_script=$2; shift 2 ;;
     --torch-collectives) pytorch_collectives=$2; shift 2 ;;
@@ -520,7 +523,7 @@ build_torch_remote_command() {
     "TBV_TORCH_SIZES=$pytorch_sizes"
     "TBV_TORCH_ITERS=$pytorch_iters"
     "TBV_TORCH_COLLECTIVES=$pytorch_collectives"
-    "TBV_TORCH_VALIDATE=1"
+    "TBV_TORCH_VALIDATE=$pytorch_validate"
     "PYTHONUNBUFFERED=1"
   )
   cmd+=(
