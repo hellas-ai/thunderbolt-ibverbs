@@ -404,6 +404,16 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_no_qp_native_ackable));
 	seq_printf(s, "data_rx_no_qp_native_non_ack: %lld\n",
 		   atomic64_read(&state->data_rx_no_qp_native_non_ack));
+	seq_printf(s, "data_rx_no_qp_send_ack: %lld\n",
+		   atomic64_read(&state->data_rx_no_qp_send_ack));
+	seq_printf(s, "data_rx_no_qp_send_ack_ok: %lld\n",
+		   atomic64_read(&state->data_rx_no_qp_send_ack_ok));
+	seq_printf(s, "data_rx_no_qp_send_ack_rnr: %lld\n",
+		   atomic64_read(&state->data_rx_no_qp_send_ack_rnr));
+	seq_printf(s, "data_rx_no_qp_send_ack_error: %lld\n",
+		   atomic64_read(&state->data_rx_no_qp_send_ack_error));
+	seq_printf(s, "data_rx_no_qp_send_ack_bad_status: %lld\n",
+		   atomic64_read(&state->data_rx_no_qp_send_ack_bad_status));
 	for (i = 0; i < TBV_RX_NO_QP_OPCODE_SLOTS; i++)
 		seq_printf(s, "data_rx_no_qp_opcode_%u: %lld\n", i,
 			   atomic64_read(&state->data_rx_no_qp_opcode[i]));

@@ -582,6 +582,11 @@ struct tbv_state {
 	atomic64_t data_rx_no_qp_mad;
 	atomic64_t data_rx_no_qp_native_ackable;
 	atomic64_t data_rx_no_qp_native_non_ack;
+	atomic64_t data_rx_no_qp_send_ack;
+	atomic64_t data_rx_no_qp_send_ack_ok;
+	atomic64_t data_rx_no_qp_send_ack_rnr;
+	atomic64_t data_rx_no_qp_send_ack_error;
+	atomic64_t data_rx_no_qp_send_ack_bad_status;
 	atomic64_t data_rx_no_qp_opcode[TBV_RX_NO_QP_OPCODE_SLOTS];
 	atomic64_t data_rx_bad_peer;
 	atomic64_t data_rx_unconnected_qp;
