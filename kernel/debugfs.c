@@ -193,6 +193,12 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		seq_printf(s, "dv_write_tx_mr_bucket_%u_bytes: %lld\n", i,
 			   atomic64_read(
 				   &state->dv_write_tx_mr_bucket_bytes[i]));
+		seq_printf(s, "dv_write_copy_mr_bucket_%u_ns: %lld\n", i,
+			   atomic64_read(
+				   &state->dv_write_copy_mr_bucket_ns[i]));
+		seq_printf(s, "dv_write_postcopy_mr_bucket_%u_ns: %lld\n", i,
+			   atomic64_read(
+				   &state->dv_write_postcopy_mr_bucket_ns[i]));
 		seq_printf(s, "dv_write_tx_addr_bucket_%u_count: %lld\n", i,
 			   atomic64_read(
 				   &state->dv_write_tx_addr_bucket_count[i]));

@@ -672,6 +672,8 @@ struct tbv_state {
 	atomic64_t dv_write_tx_mr_bucket_count[TBV_DV_WRITE_LOCAL_BUCKETS];
 	atomic64_t dv_write_tx_mr_bucket_ns[TBV_DV_WRITE_LOCAL_BUCKETS];
 	atomic64_t dv_write_tx_mr_bucket_bytes[TBV_DV_WRITE_LOCAL_BUCKETS];
+	atomic64_t dv_write_copy_mr_bucket_ns[TBV_DV_WRITE_LOCAL_BUCKETS];
+	atomic64_t dv_write_postcopy_mr_bucket_ns[TBV_DV_WRITE_LOCAL_BUCKETS];
 	atomic64_t dv_write_tx_addr_bucket_count[TBV_DV_WRITE_LOCAL_BUCKETS];
 	atomic64_t dv_write_tx_addr_bucket_ns[TBV_DV_WRITE_LOCAL_BUCKETS];
 	atomic64_t dv_write_tx_addr_bucket_bytes[TBV_DV_WRITE_LOCAL_BUCKETS];

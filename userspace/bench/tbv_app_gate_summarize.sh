@@ -625,11 +625,15 @@ print_dv_write_tx_mr_bucket_aggregates() {
             count_key = "dv_write_tx_mr_bucket_" i "_count"
             ns_key = "dv_write_tx_mr_bucket_" i "_ns"
             bytes_key = "dv_write_tx_mr_bucket_" i "_bytes"
+            copy_ns_key = "dv_write_copy_mr_bucket_" i "_ns"
+            postcopy_ns_key = "dv_write_postcopy_mr_bucket_" i "_ns"
             count = (after[count_key] + 0) - (before[count_key] + 0)
             ns = (after[ns_key] + 0) - (before[ns_key] + 0)
             bytes = (after[bytes_key] + 0) - (before[bytes_key] + 0)
-            if (count || ns || bytes)
-              print suite, collective, mode, i, count, ns, bytes
+            copy_ns = (after[copy_ns_key] + 0) - (before[copy_ns_key] + 0)
+            postcopy_ns = (after[postcopy_ns_key] + 0) - (before[postcopy_ns_key] + 0)
+            if (count || ns || bytes || copy_ns || postcopy_ns)
+              print suite, collective, mode, i, count, ns, bytes, copy_ns, postcopy_ns
           }
         }
       ' "$before" "$after"
@@ -640,6 +644,8 @@ print_dv_write_tx_mr_bucket_aggregates() {
       count[key] += $5
       ns[key] += $6
       bytes[key] += $7
+      copy_ns[key] += $8
+      postcopy_ns[key] += $9
     }
     END {
       if (!length(count))
@@ -647,8 +653,11 @@ print_dv_write_tx_mr_bucket_aggregates() {
       for (key in count) {
         split(key, p, SUBSEP)
         avg_ms = count[key] ? ns[key] / count[key] / 1000000 : 0
-        printf "%s %s %s %s %d %d %.3f\n",
-          p[1], p[2], p[3], p[4], count[key], bytes[key], avg_ms
+        copy_avg_ms = count[key] ? copy_ns[key] / count[key] / 1000000 : 0
+        postcopy_avg_ms = count[key] ? postcopy_ns[key] / count[key] / 1000000 : 0
+        printf "%s %s %s %s %d %d %.3f %.3f %.3f\n",
+          p[1], p[2], p[3], p[4], count[key], bytes[key], avg_ms,
+          copy_avg_ms, postcopy_avg_ms
       }
     }
   ' | sort -V | awk '
@@ -658,7 +667,7 @@ print_dv_write_tx_mr_bucket_aggregates() {
     {
       if (!printed) {
         printf "\ndv_write_tx_mr_bucket aggregates:\n"
-        printf "suite collective mode bucket count bytes avg_ms\n"
+        printf "suite collective mode bucket count bytes avg_ms copy_avg_ms postcopy_avg_ms\n"
         printed = 1
       }
       print

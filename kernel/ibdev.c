@@ -595,6 +595,7 @@ struct tbv_send_ctx {
 	u32 dv_byte_len;
 	u32 dv_imm_data;
 	u64 dv_tx_start_ns;
+	u64 dv_copy_ns;
 	u32 dv_local_mr_bucket;
 	u32 dv_local_addr_bucket;
 	atomic_t apple_pending;
@@ -3901,6 +3902,8 @@ static void tbv_send_tx_done(void *ctx, int status)
 	if (note_dv_write_timing) {
 		struct tbv_state *state = tqp->owner;
 		u64 elapsed = ktime_get_ns() - send->dv_tx_start_ns;
+		u64 copy_ns = send->dv_copy_ns;
+		u64 postcopy_ns = elapsed > copy_ns ? elapsed - copy_ns : 0;
 		u32 mr_bucket = send->dv_local_mr_bucket;
 		u32 addr_bucket = send->dv_local_addr_bucket;
 
@@ -3908,6 +3911,10 @@ static void tbv_send_tx_done(void *ctx, int status)
 		atomic64_add(elapsed, &state->dv_write_tx_mr_bucket_ns[mr_bucket]);
 		atomic64_add(send->total_len,
 			     &state->dv_write_tx_mr_bucket_bytes[mr_bucket]);
+		atomic64_add(copy_ns,
+			     &state->dv_write_copy_mr_bucket_ns[mr_bucket]);
+		atomic64_add(postcopy_ns,
+			     &state->dv_write_postcopy_mr_bucket_ns[mr_bucket]);
 		atomic64_inc(&state->dv_write_tx_addr_bucket_count[addr_bucket]);
 		atomic64_add(elapsed,
 			     &state->dv_write_tx_addr_bucket_ns[addr_bucket]);
@@ -5331,6 +5338,7 @@ out_unlock_paths:
 		u32 packet_len = TBV_NATIVE_DATA_HDR_SIZE + payload_len;
 		struct tbv_path_owned_frame *owned;
 		u8 *frame;
+		u64 copy_start_ns = 0;
 
 		frame = kmalloc(packet_len, GFP_KERNEL);
 		if (!frame) {
@@ -5338,9 +5346,13 @@ out_unlock_paths:
 			goto err_release_paths;
 		}
 
+		if (ctx->dv_write_timing_valid)
+			copy_start_ns = ktime_get_ns();
 		ret = tbv_copy_send_range(ctx->segs, ctx->nsegs, offset,
 					  frame + TBV_NATIVE_DATA_HDR_SIZE,
 					  payload_len);
+		if (copy_start_ns)
+			ctx->dv_copy_ns += ktime_get_ns() - copy_start_ns;
 		if (ret) {
 			kfree(frame);
 			atomic64_inc(&tqp->owner->data_wr_copy_error);
