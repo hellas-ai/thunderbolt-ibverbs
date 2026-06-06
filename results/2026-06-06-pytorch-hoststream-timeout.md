@@ -436,3 +436,86 @@ fired. Full data retransmission is therefore the correct recovery for these
 events; a pure ACK query cannot repair them. The remaining tail should be
 treated as data/fragments arriving late or being lost before receiver PSN
 consumption, not just reverse-channel SEND_ACK loss.
+
+## Current-PSN ACK Probe Split
+
+Added a second split for `data_rx_ack_req_miss_current`:
+
+```text
+data_rx_ack_req_miss_current_active   current PSN is actively assembling
+data_rx_ack_req_miss_current_reorder  current PSN is buffered in reorder
+data_rx_ack_req_miss_current_idle     no active/reorder state for current PSN
+```
+
+Deployed as:
+
+```text
+thunderbolt-ibverbs: 8d4ea5b kernel: classify current ACK probe misses
+deploy worktree:     620d1d3 kernel: classify current ACK probe misses
+nixos-config:        2846cd5 strix: deploy current ACK probe classifier
+```
+
+The ACK-probe classifier run:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-ackprobe-current2-20260606-144201
+status: fail, rep 3 failed
+ack_probe/ack_probe_fb: 21/21
+rx_ack_req/rx_ack_req_reack/rx_ack_req_miss: 21/0/21
+rx_ack_req_miss_past/current/future: 0/21/0
+rx_ack_req_miss_current_active/reorder/idle: 21/0/0
+data_wr_timeout/data_wr_retry_exhausted: 0/0
+data_tx_posted/completed: balanced
+```
+
+Rep 3 failed with the known heavier PyTorch/GDA symptom:
+
+```text
+rank0: USB4 alltoall DATA wait timed out ctx=7 expected=7 observed=5
+rank1: USB4 GDA CQE error status=255 opcode=3 byte_len=2097152
+dv_hard_error=1
+data_wr_rnr_retry_exhausted=1
+data_rx_active_timeout/data_rx_active_retry=1/1
+data_rx_reorder_timeout/data_rx_reorder_retry/data_rx_reorder_dropped=1/1/1
+```
+
+Kernel timeout logs on strix-1 explain the active state:
+
+```text
+native RX reorder timeout qpn=0x9c2 expected_psn=0 psn=0 src_qp=0x9c3
+  kind=1 complete=0 received=1060864 total=2097152 frags=263/519
+  last_offset=2096864 last_len=288 with_imm=0
+
+native RDMA_WRITE active timeout qpn=0x9c2 src_qp=0x9c3 psn=0
+  received=1967328 total=2097152 last_offset=1963280 last_len=4048
+  with_imm=0
+```
+
+So the first timeout is firing while the receiver has already started the PSN.
+In the failed case it had received about half of one 2 MiB write in reorder and
+about 1.88 MiB of another active 2 MiB write before the active timeout/RNR
+path fired. This is not an idle receiver, not an overwritten ACK-history entry,
+and not primarily missing reverse ACK delivery.
+
+For contrast, the same classifier build with `native_ack_probe=N`:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-current2-probeoff-20260606-144454
+status: pass
+wr_retx total: 23
+ack_retry/ack64 total: 15/15
+ack_probe/ack_probe_fb: 0/0
+rx_ack_req/rx_ack_req_reack/rx_ack_req_miss: 0/0/0
+data_rx_active_timeout=0
+data_rx_reorder_timeout=0
+data_wr_timeout/data_wr_retry_exhausted=0/0
+data_tx_posted/completed: balanced in every rep
+```
+
+Conclusion: keep `native_ack_probe` disabled. It is useful instrumentation, but
+the current implementation cannot repair the dominant PyTorch tail because the
+receiver is still assembling the data when probed. The next correctness target
+is the RX active/reorder timeout and RNR recovery path for large RDMA_WRITE
+operations: why a partially received 2 MiB write stalls near completion, and
+why the RNR retry path can surface as a DV hard error even though host TX
+completion accounting stays balanced.
