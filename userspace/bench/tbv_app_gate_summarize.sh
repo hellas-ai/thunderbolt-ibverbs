@@ -289,6 +289,83 @@ print_hoststream_addr_layouts() {
   ' "${logs[@]}" | sort -V
 }
 
+print_usb4_a2a_post_layouts() {
+  local -a logs=("$@")
+
+  ((${#logs[@]} > 0)) || return 0
+  if ! grep -h 'USB4_GDA_A2A_POST' "${logs[@]}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  printf '\nusb4_a2a_post layouts:\n'
+  printf 'app_mode my_pe team_my_pe pe_size seq dest_pe qpn bytes count src_heap src_sync dst_heap dst_sync sync_remote_sync src_heap_off src_sync_off dst_heap_off dst_sync_off sync_remote_off src_lkey dst_rkey heap_lkey heap_rkey sync_lkey sync_rkey src dst sync_remote base_delta\n'
+  awk '
+    function file_mode(path, parts, n, i) {
+      n = split(path, parts, "/")
+      for (i = 1; i <= n; i++) {
+        if (parts[i] == "pytorch" && i + 1 <= n)
+          return parts[i + 1]
+      }
+      return "unknown"
+    }
+    function field(name, m) {
+      if (match($0, name "=([^[:space:]]+)", m))
+        return m[1]
+      return "NA"
+    }
+    FNR == 1 {
+      app_mode = file_mode(FILENAME)
+    }
+    /USB4_GDA_A2A_POST/ {
+      my_pe = field("my_pe")
+      team_my_pe = field("team_my_pe")
+      pe_size = field("pe_size")
+      seq = field("seq")
+      dest_pe = field("dest_pe")
+      qpn = field("qpn")
+      bytes = field("bytes")
+      src_heap = field("src_heap")
+      src_sync = field("src_sync")
+      dst_heap = field("dst_heap")
+      dst_sync = field("dst_sync")
+      sync_remote_sync = field("sync_remote_sync")
+      src_heap_off = field("src_heap_off")
+      src_sync_off = field("src_sync_off")
+      dst_heap_off = field("dst_heap_off")
+      dst_sync_off = field("dst_sync_off")
+      sync_remote_off = field("sync_remote_off")
+      src_lkey = field("src_lkey")
+      dst_rkey = field("dst_rkey")
+      heap_lkey = field("heap_lkey")
+      heap_rkey = field("heap_rkey")
+      sync_lkey = field("sync_lkey")
+      sync_rkey = field("sync_rkey")
+      src = field("src")
+      dst = field("dst")
+      sync_remote = field("sync_remote")
+      base_delta = field("base_delta")
+      key = app_mode SUBSEP my_pe SUBSEP team_my_pe SUBSEP pe_size SUBSEP seq \
+        SUBSEP dest_pe SUBSEP qpn SUBSEP bytes SUBSEP src_heap SUBSEP src_sync \
+        SUBSEP dst_heap SUBSEP dst_sync SUBSEP sync_remote_sync SUBSEP src_heap_off \
+        SUBSEP src_sync_off SUBSEP dst_heap_off SUBSEP dst_sync_off \
+        SUBSEP sync_remote_off SUBSEP src_lkey SUBSEP dst_rkey SUBSEP heap_lkey \
+        SUBSEP heap_rkey SUBSEP sync_lkey SUBSEP sync_rkey SUBSEP src SUBSEP dst \
+        SUBSEP sync_remote SUBSEP base_delta
+      count[key]++
+    }
+    END {
+      for (key in count) {
+        split(key, p, SUBSEP)
+        printf "%s %s %s %s %s %s %s %s %d %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s\n",
+          p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], count[key],
+          p[9], p[10], p[11], p[12], p[13], p[14], p[15], p[16], p[17],
+          p[18], p[19], p[20], p[21], p[22], p[23], p[24], p[25], p[26],
+          p[27], p[28]
+      }
+    }
+  ' "${logs[@]}" | sort -V
+}
+
 print_rccl_timing_aggregates() {
   local -a logs=("$@")
 
@@ -494,6 +571,7 @@ mapfile -d '' -t counter_logs < <(
 print_pytorch_timing_aggregates "${pytorch_rank0_logs[@]}"
 print_hoststream_phase_aggregates "${pytorch_rank_logs[@]}"
 print_hoststream_addr_layouts "${pytorch_rank_logs[@]}"
+print_usb4_a2a_post_layouts "${pytorch_rank_logs[@]}"
 print_loaded_collective_lib_counts "${pytorch_rank_logs[@]}"
 print_rccl_timing_aggregates "${rccl_logs[@]}"
 print_counter_aggregates "${counter_logs[@]}"

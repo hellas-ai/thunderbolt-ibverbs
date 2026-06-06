@@ -1472,3 +1472,161 @@ second half of the symmetric scratch allocation on both ranks. The next
 performance discriminator should move below RCCL's local pointer view and log
 the rocSHMEM USB4 backend's chosen remote address/rkey/lkey or memory-region
 classification for those same source/destination slots.
+
+### rocSHMEM USB4 Post-Key Diagnostic
+
+Added an opt-in rocSHMEM/GDA device-side diagnostic:
+
+```text
+ROCSHMEM_GDA_USB4_A2A_POST_LOG=N
+```
+
+When enabled, the USB4 all-to-all path prints one `USB4_GDA_A2A_POST` line for
+the first `N` all-to-all payload posts. The line includes the selected local
+source address, remote destination address, remote pSync/signal address,
+source/destination memory classification, heap/sync offsets, selected lkey/rkey,
+the heap and sync keys stored in the QP, QPN, and SQ/CQ cursors. The app gate
+now exposes this as `--usb4-a2a-post-log`, forwards it through MPI/PyTorch, and
+the summarizer collapses the per-rank lines into unique post layouts.
+
+Built and installed the instrumented rocSHMEM and RCCL into the existing
+waitbudget prefixes, then ran a small coherent-scratch PyTorch host-stream
+all-to-all with the post logger enabled:
+
+```text
+log: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-a2apost-coherent-auto-writegaprnr1-qptimeout14-20260606-185742
+options: --source-heap 0 --dest-heap 0 --hoststream-addr-log 1 --usb4-a2a-post-log 8
+status: pass, 1/1
+loaded RCCL: /mnt/Home/tmp/rccl-hoststream-waitbudget-install/lib/librccl.so.1.0
+```
+
+Phase timing still reproduced the slot asymmetry in the exchange phase:
+
+```text
+msgSize=2097152 symId=0 exchange_avg=3.676ms
+msgSize=2097152 symId=1 exchange_avg=22.550ms
+msgSize=4194304 symId=0 exchange_avg=3.461ms
+msgSize=4194304 symId=1 exchange_avg=89.618ms
+```
+
+The RCCL address logger again showed coherent scratch selection with two
+128 MiB slots:
+
+```text
+source_backing=coherent
+dest_backing=coherent
+num_sym_buf=2
+buf_threshold=134217728
+symId=0 slot_offset=0
+symId=1 slot_offset=134217728
+```
+
+The rocSHMEM USB4 post logger showed the actual WQEs use heap-classified
+payload addresses on both sides, while only the pSync signal target is in the
+remote sync pool:
+
+```text
+all payload posts:
+  src_heap=1 src_sync=0
+  dst_heap=1 dst_sync=0
+  sync_remote_sync=1
+  qpn=0
+  src_lkey=dst_rkey=heap_lkey=heap_rkey=sync_lkey=sync_rkey=39871
+
+rank0 symId=0:
+  src_heap_off=1084672/2133248
+  dst_heap_off=268471680
+  sync_remote_off=16400
+
+rank0 symId=1:
+  src_heap_off=135302400/136350976
+  dst_heap_off=402689408
+  sync_remote_off=17424
+
+rank1 symId=0:
+  src_heap_off=36096
+  dst_heap_off=269520256/270568832
+  sync_remote_off=16464
+
+rank1 symId=1:
+  src_heap_off=134253824
+  dst_heap_off=403737984/404786560
+  sync_remote_off=17488
+```
+
+Counters stayed correctness-clean in this diagnostic run:
+
+```text
+wr_retx=0 rnr_retx=1 write_gap_rnr=37
+dv_hard=0 wr_timeout=0 wr_retry_exhausted=0
+reorder_timeout=0 active_timeout=0
+data_tx_errors=0 data_tx_posted/completed=4442/4442
+```
+
+Interpretation: this falsifies the most direct sync-pool/key-classification
+theory for the slow host-stream slot. Even when RCCL labels the scratch buffers
+as host-coherent, the rocSHMEM USB4 all-to-all payload posts classify the
+source and destination payloads as heap memory and select the same key for heap
+and sync in this run. The slow `symId=1` path tracks the `+128MiB` source and
+destination payload heap offsets, not a switch to sync-pool payload keys. The
+remaining likely bottleneck is below RCCL's scratch backing choice and below
+rocSHMEM's lkey/rkey selection: an address/offset effect in the USB4 DV/RDMA
+or host-coherent heap mapping path.
+
+### Exchange-Only Scratch Slot A/B
+
+Ran a follow-up discriminator with RCCL host-stream bench mode 2, which skips
+copy-in and copy-out and times only the rocSHMEM exchange phase. PyTorch payload
+validation was disabled for this run because mode 2 intentionally leaves the
+normal all-to-all result incomplete.
+
+```text
+RCCL_ROCSHMEM_GDA_BENCH_MODE=2
+RCCL_ROCSHMEM_HOST_STREAM_TIMING=1
+--torch-validate 0
+--source-heap 0 --dest-heap 0
+--hoststream-addr-log 1
+--usb4-a2a-post-log 4
+iters=4
+reps=5
+```
+
+Fixed `symId=0`:
+
+```text
+log: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-exchangeonly-coherent-fixedsym0-writegaprnr1-qptimeout14-20260606-190426
+status: pass, 5/5
+1MiB/rank avg/max: 19434.4us / 42874.1us
+2MiB/rank avg/max: 47255.5us / 109736.5us
+msgSize=2097152 exchange_avg/p90/max: 19.284ms / 40.672ms / 48.869ms
+msgSize=4194304 exchange_avg/p90/max: 47.113ms / 109.283ms / 115.431ms
+wr_retx=0 rnr_retx=126 write_gap_rnr=4186
+dv_hard=0 wr_timeout=0 wr_retry_exhausted=0 tx=95979/95979
+```
+
+Fixed `symId=1`:
+
+```text
+log: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-exchangeonly-coherent-fixedsym1-writegaprnr1-qptimeout14-20260606-190508
+status: pass, 5/5
+1MiB/rank avg/max: 69791.9us / 144131.7us
+2MiB/rank avg/max: 185788.7us / 564498.9us
+msgSize=2097152 exchange_avg/p90/max: 69.636ms / 146.422ms / 228.877ms
+msgSize=4194304 exchange_avg/p90/max: 185.715ms / 552.793ms / 599.126ms
+wr_retx=0 rnr_retx=85 write_gap_rnr=2782
+dv_hard=0 wr_timeout=0 wr_retry_exhausted=0 tx=74652/74652
+```
+
+The post-key layouts stayed consistent with the previous diagnostic. Fixed
+`symId=0` payload posts used `src_heap_off=1084672` on rank 0 and
+`src_heap_off=36096` on rank 1; fixed `symId=1` used
+`src_heap_off=135302400` on rank 0 and `134253824` on rank 1. In both legs,
+payload source/destination addresses classified as heap, the pSync target
+classified as remote sync, and lkey/rkey selection remained internally
+consistent.
+
+Interpretation: the slot-1 penalty survives after removing host-stream copy-in
+and copy-out from the timed path. Mode 2 is not an application-correctness mode,
+but as a performance discriminator it tightens the target: the slow slot is in
+the rocSHMEM USB4 exchange/address path itself, not in CPU/GPU staging copies
+around the scratch buffer.
