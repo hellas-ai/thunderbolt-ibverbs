@@ -116,6 +116,7 @@
               tools/ci/distro-package.sh \
               userspace/bench/tbv_app_gate.sh \
               userspace/bench/tbv_app_gate_summarize.sh \
+              userspace/bench/tbv_rocshmem_example.sh \
               userspace/bench/tbv_vllm_smoke.sh \
               tools/ci/vm-guest-smoke.sh \
               tools/ci/vm-smoke.sh

@@ -39,6 +39,7 @@ let
     "tbv_pytorch_smoke.py"
     "tbv_rdma_sweep.py"
     "tbv_uc_stress.py"
+    "tbv_rocshmem_example.sh"
     "tbv_vllm_smoke.sh"
   ];
 

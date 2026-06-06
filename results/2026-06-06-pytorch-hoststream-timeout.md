@@ -2081,3 +2081,63 @@ path; the tiny dense Qwen smoke mostly validates vLLM/Ray/NCCL process
 lifecycle, library selection, and interface binding. The next application-level
 GDA benchmark still needs either an MoE workload that issues all-to-all or a
 vLLM/RCCL path where the relevant collective routes through rocSHMEM/GDA.
+
+### rocSHMEM Example Runner and LL_MoE Triage
+
+Added `tbv_rocshmem_example.sh` to make upstream rocSHMEM examples repeatable
+on the Strix pair. The runner sets the same USB4 GDA/OpenMPI environment used
+by the app gate, forces `ROCSHMEM_BACKEND=gda`,
+`ROCSHMEM_GDA_PROVIDER=usb4`, captures before/after
+`/sys/kernel/debug/thunderbolt_ibverbs/summary`, and records per-host counter
+deltas.
+
+The existing rocSHMEM build was reconfigured with `BUILD_EXAMPLES=ON` and these
+examples were built from the current GDA rocSHMEM tree:
+
+```text
+/mnt/Home/tmp/rocshmem-qptimeout-build-20260606-073230/examples/rocshmem_alltoall_test
+/mnt/Home/tmp/rocshmem-qptimeout-build-20260606-073230/examples/rocshmem_put_signal_test
+/mnt/Home/tmp/rocshmem-qptimeout-build-20260606-073230/examples/rocshmem_getmem_test
+/mnt/Home/tmp/rocshmem-qptimeout-build-20260606-073230/examples/LL_MoE/ll_moe
+```
+
+Primitive USB4 GDA examples all passed cleanly:
+
+```text
+case        log root                                                    result  key deltas
+alltoall    /mnt/Home/tmp/tbv-rocshmem-example/alltoall-debug-20260606-231654  PASS    dv_poll=+4 tx=+12/+12 ack_match=+4 hard=0
+put_signal  /mnt/Home/tmp/tbv-rocshmem-example/put-signal-20260606-231712      PASS    dv_poll=+4 tx=+13/+13 ack_match=+4 hard=0
+getmem      /mnt/Home/tmp/tbv-rocshmem-example/getmem-20260606-231737          PASS    dv_poll=+2 tx=+6/+6   hard=0
+```
+
+The debug all-to-all run confirmed real USB4 GDA selection and posting:
+both PEs selected `usb4_rdma0`, the vendor string was
+`rocSHMEM_v3.4.0_GDA(USB4)`, USB4 routes were created, and
+`USB4_GDA_A2A_POST`/`USB4_GDA_A2A_TIMING` records appeared before both ranks
+reported `[PASS]`.
+
+The LL_MoE example is not a valid benchmark yet. Even the smallest two-host
+case timed out:
+
+```text
+log root: /mnt/Home/tmp/tbv-rocshmem-example/ll-moe-min-20260606-231753
+command: ll_moe -n 4 -h 64 -k 1 -e 2 -i 1 -m d
+result: timeout after rank init
+counter deltas: dv_poll=+8 tx=+24/+24 ack_match=+8 hard=0
+```
+
+That run proves the transport work it did issue completed cleanly. The stronger
+local controls then scoped the hang away from USB4 transport:
+
+```text
+case              log root                                                    result
+np=1 e=1 i=1      /mnt/Home/tmp/tbv-rocshmem-example/ll-moe-np1-20260606-231854     timeout, zero transport deltas
+np=1 e=4 i=1      /mnt/Home/tmp/tbv-rocshmem-example/ll-moe-np1-e4-20260606-232004  timeout, zero transport deltas
+np=1 e=4 i=0      /mnt/Home/tmp/tbv-rocshmem-example/ll-moe-i0-20260606-232107      PASS
+```
+
+Interpretation: rocSHMEM USB4 GDA primitives are usable as app-level probes,
+but the upstream LL_MoE example hangs in its first `ll_dispatch()` kernel even
+with one local PE and no transport traffic. Treat LL_MoE as an example-kernel
+debug target, not as a GDA transport benchmark, until its dispatch-side GPU
+synchronization/protocol issue is fixed.
