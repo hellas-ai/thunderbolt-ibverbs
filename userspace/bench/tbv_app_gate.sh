@@ -9,6 +9,7 @@ iface=${TBV_APP_IFACE:-eno1}
 log_root=${TBV_APP_LOG_ROOT:-/tmp/tbv-app-gate/$(date +%Y%m%d-%H%M%S)}
 ssh_cmd=${TBV_SSH:-ssh}
 timeout_s=${TBV_APP_TIMEOUT:-300}
+dv_check=${TBV_DV_CHECK:-auto}
 
 rccl_tests_dir=${RCCL_TESTS_DIR:-}
 rccl_install=${RCCL_INSTALL_DIR:-}
@@ -34,6 +35,7 @@ pytorch_collectives=${TBV_TORCH_COLLECTIVES:-all_to_all}
 pytorch_master_addr=${TBV_TORCH_MASTER_ADDR:-192.168.23.136}
 pytorch_master_port=${TBV_TORCH_MASTER_PORT:-29617}
 pytorch_timeout=${TBV_TORCH_TIMEOUT:-240}
+pytorch_remote_script=${TBV_TORCH_REMOTE_SCRIPT:-/tmp/tbv_pytorch_smoke_${USER:-tbv}_$$.py}
 expected_rccl_lib=${RCCL_EXPECTED_LIB:-}
 
 counter_summary=${TBV_DEBUGFS_SUMMARY:-/sys/kernel/debug/thunderbolt_ibverbs/summary}
@@ -52,6 +54,7 @@ Options:
   --iface IFACE             Default: $iface
   --log-root DIR            Default: $log_root
   --timeout SECONDS         RCCL test timeout. Default: $timeout_s
+  --dv-check MODE           auto, require, forbid, off. Default: $dv_check
   --rccl-tests-dir DIR      Directory containing alltoall_perf/alltoallv_perf
   --rccl-install DIR        RCCL install prefix
   --rocshmem-install DIR    rocSHMEM install prefix
@@ -71,6 +74,7 @@ Options:
   --pytorch-sizes CSV       Default: $pytorch_sizes
   --pytorch-iters N         Default: $pytorch_iters
   --pytorch-timeout SECONDS Default: $pytorch_timeout
+  --pytorch-remote-script P Remote script path. Default: $pytorch_remote_script
   --torch-collectives CSV   Default: $pytorch_collectives
   --master-addr ADDR        Default: $pytorch_master_addr
   --master-port PORT        Default: $pytorch_master_port
@@ -85,6 +89,7 @@ while (($#)); do
     --iface) iface=$2; shift 2 ;;
     --log-root) log_root=$2; shift 2 ;;
     --timeout) timeout_s=$2; shift 2 ;;
+    --dv-check) dv_check=$2; shift 2 ;;
     --rccl-tests-dir) rccl_tests_dir=$2; shift 2 ;;
     --rccl-install) rccl_install=$2; shift 2 ;;
     --rocshmem-install) rocshmem_install=$2; shift 2 ;;
@@ -104,6 +109,7 @@ while (($#)); do
     --pytorch-sizes) pytorch_sizes=$2; shift 2 ;;
     --pytorch-iters) pytorch_iters=$2; shift 2 ;;
     --pytorch-timeout) pytorch_timeout=$2; shift 2 ;;
+    --pytorch-remote-script) pytorch_remote_script=$2; shift 2 ;;
     --torch-collectives) pytorch_collectives=$2; shift 2 ;;
     --master-addr) pytorch_master_addr=$2; shift 2 ;;
     --master-port) pytorch_master_port=$2; shift 2 ;;
@@ -260,6 +266,9 @@ assert_dv_delta() {
   local expected=$5
   local delta
 
+  if [[ "$expected" == skip ]]; then
+    return 0
+  fi
   delta=$(counter_delta_sum "$before_label" "$after_label" "$dir" "$target_hosts" dv_poll_wqes)
   if [[ "$expected" == 1 && "$delta" -lt 1 ]]; then
     echo "ERROR: expected dv_poll_wqes delta >= 1, got $delta" >&2
@@ -269,6 +278,18 @@ assert_dv_delta() {
     echo "ERROR: expected dv_poll_wqes delta == 0, got $delta" >&2
     return 1
   fi
+}
+
+resolve_dv_expectation() {
+  local mode_default=$1
+
+  case "$dv_check" in
+    auto) printf '%s\n' "$mode_default" ;;
+    require) printf '1\n' ;;
+    forbid) printf '0\n' ;;
+    off|skip|none) printf 'skip\n' ;;
+    *) echo "ERROR: unknown --dv-check mode: $dv_check" >&2; exit 2 ;;
+  esac
 }
 
 split_csv() {
@@ -407,7 +428,7 @@ run_with_counters() {
     if ! assert_clean_counters "$before_label" "$after_label" "$dir/counters" "$counter_hosts" >>"$log" 2>&1; then
       status=1
     fi
-    if ! assert_dv_delta "$before_label" "$after_label" "$dir/counters" "$counter_hosts" "$expect_dv" >>"$log" 2>&1; then
+    if ! assert_dv_delta "$before_label" "$after_label" "$dir/counters" "$counter_hosts" "$(resolve_dv_expectation "$expect_dv")" >>"$log" 2>&1; then
       status=1
     fi
   fi
@@ -458,7 +479,7 @@ run_rccl_case() {
 stage_pytorch_smoke() {
   local host
   for host in $(host_list "$hosts"); do
-    scp -q "$script_dir/tbv_pytorch_smoke.py" "$host:/tmp/tbv_pytorch_smoke.py"
+    scp -q "$script_dir/tbv_pytorch_smoke.py" "$host:$pytorch_remote_script"
   done
 }
 
@@ -510,7 +531,7 @@ build_torch_remote_command() {
     "--node_rank=$rank"
     "--master_addr=$pytorch_master_addr"
     "--master_port=$pytorch_master_port"
-    /tmp/tbv_pytorch_smoke.py
+    "$pytorch_remote_script"
   )
   printf '%q ' "${cmd[@]}"
 }
@@ -557,7 +578,7 @@ run_pytorch_case() {
     if ! assert_clean_counters "$before_label" "$after_label" "$logdir/counters" "$counter_hosts" >>"$logdir/counters.log" 2>&1; then
       status=1
     fi
-    if ! assert_dv_delta "$before_label" "$after_label" "$logdir/counters" "$counter_hosts" "$TBV_EXPECT_DV" >>"$logdir/counters.log" 2>&1; then
+    if ! assert_dv_delta "$before_label" "$after_label" "$logdir/counters" "$counter_hosts" "$(resolve_dv_expectation "$TBV_EXPECT_DV")" >>"$logdir/counters.log" 2>&1; then
       status=1
     fi
     if [[ -n "$expected_rccl_lib" ]] && ! grep -q "$expected_rccl_lib" "$logdir"/rank*.log; then
@@ -580,6 +601,7 @@ echo "  iface=$iface"
 echo "  log_root=$log_root"
 echo "  modes=$modes"
 echo "  collectives=$collectives"
+echo "  dv_check=$dv_check"
 
 gate_status=0
 

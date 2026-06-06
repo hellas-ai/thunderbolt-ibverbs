@@ -3362,9 +3362,9 @@ Local/package checks:
 ```text
 bash -n userspace/bench/tbv_app_gate.sh
 nix build .#bench-tools --no-link --print-out-paths
-  /nix/store/6nxyw5pd3gk4d87c03k6abid7b66m5rj-thunderbolt-ibverbs-bench-tools-0.1.0
+  /nix/store/zyc7yj9pqahk5bcas4w2iza452v1wzdv-thunderbolt-ibverbs-bench-tools-0.1.0
 nix build .#checks.x86_64-linux.script-syntax --no-link --print-out-paths
-  /nix/store/xsly36cyf7hm6yl2pj0r5am8fm0gvwpg-thunderbolt-ibverbs-script-syntax-0.1.0
+  /nix/store/czly4i1kh8q66byi21n1pmyd2ym7gnba-thunderbolt-ibverbs-script-syntax-0.1.0
 nix run .#tbv-app-gate -- --help
 ```
 
@@ -3512,3 +3512,115 @@ Interpretation:
    rep hit 73 ms with a single successful retransmit. That is not a kernel
    correctness failure, but it is the next application-level bottleneck to
    instrument in RCCL/rocSHMEM.
+
+### PyTorch non-all-to-all scope check
+
+Follow-up runner hardening:
+
+- added `--dv-check auto|require|forbid|off`, so exploratory collectives can
+  still capture DV deltas without turning "no DV" into a gate failure;
+- changed PyTorch smoke staging from fixed `/tmp/tbv_pytorch_smoke.py` to a
+  unique `/tmp/tbv_pytorch_smoke_${USER}_${pid}.py` default. The fixed path had
+  become unwritable on one host after earlier runs.
+
+Validation after the runner change:
+
+```text
+bash -n userspace/bench/tbv_app_gate.sh
+nix build .#bench-tools --no-link --print-out-paths
+  /nix/store/zyc7yj9pqahk5bcas4w2iza452v1wzdv-thunderbolt-ibverbs-bench-tools-0.1.0
+nix build .#checks.x86_64-linux.script-syntax --no-link --print-out-paths
+  /nix/store/czly4i1kh8q66byi21n1pmyd2ym7gnba-thunderbolt-ibverbs-script-syntax-0.1.0
+```
+
+Source fact checked in RCCL:
+
+```text
+projects/rccl/src/collectives.cc:
+  ncclAlltoAll_impl selects ncclFuncAlltoAllGda when
+  rcclUseAlltoAllGda(comm) && msgSize <= comm->rocshmemThreshold.
+
+  ncclAlltoAllv_impl selects ncclFuncAlltoAllvGda, or routes regular
+  all-to-allv through ncclAlltoAll_impl.
+
+  ncclAllGather_impl selects AllGather/direct AllGather paths.
+  ncclAllReduce_impl selects regular AllReduce or DDA IPC paths.
+
+projects/rccl/src/enqueue.cc:
+  rocSHMEM device work is populated only for ncclFuncAlltoAllGda and
+  ncclFuncAlltoAllvGda.
+```
+
+Ran PyTorch all-reduce/all-gather with rocSHMEM env disabled and enabled:
+
+```text
+log root: /tmp/tbv-app-gate-pytorch-ar-ag-20260606-054048
+collectives: all_reduce, all_gather
+sizes: 65536, 262144
+iters/reps: 2/1
+dv_check: off
+expected RCCL:
+  /nix/store/74kx31vim3ynwpivjlxq04wbdl62nrbg-rccl-usb4-hostheap-gfx1151-2.28.9-local/lib/librccl.so.1
+status: pass
+
+fallback:
+  all_reduce 65536: 3420.6 us/iter
+  all_gather 65536: 126.0 us/iter
+  all_reduce 262144: 415.6 us/iter
+  all_gather 262144: 240.9 us/iter
+  dv_poll_wqes sum +0
+  data_tx_posted/completed sum +4515/+4515
+
+hoststream env enabled:
+  all_reduce 65536: 3603.3 us/iter
+  all_gather 65536: 127.1 us/iter
+  all_reduce 262144: 713.3 us/iter
+  all_gather 262144: 1036.1 us/iter
+  dv_poll_wqes sum +0
+  data_tx_posted/completed sum +4515/+4515
+```
+
+Hard correctness deltas were zero in both modes:
+
+```text
+data_wr_retransmit sum                 +0
+data_wr_timeout sum                    +0
+data_wr_retry_exhausted sum            +0
+data_wr_retransmit_closing_qp sum      +0
+data_wr_retransmit_no_live_path sum    +0
+data_wr_retransmit_teardown_path sum   +0
+data_tx_errors sum                     +0
+data_rx_canceled sum                   +0
+data_rx_no_qp sum                      +0
+data_qp_tombstone_evicted sum          +0
+```
+
+Final health:
+
+```text
+strix-1:
+dv_poll_wqes=2954
+data_tx_posted=216366
+data_tx_completed=216366
+data_tx_errors=0
+data_rx_canceled=4096
+
+strix-2:
+dv_poll_wqes=2954
+data_tx_posted=216066
+data_tx_completed=216066
+data_tx_errors=0
+data_rx_canceled=0
+```
+
+Interpretation:
+
+1. Current rocSHMEM GDA integration is scoped to RCCL all-to-all/all-to-allv.
+   PyTorch all-reduce/all-gather do not exercise the DV/GDA path even with the
+   rocSHMEM env enabled; `dv_poll_wqes` stayed flat.
+2. A vLLM run is now useful as an end-to-end stack/lifecycle smoke, but it is
+   unlikely to benchmark the GDA path unless the workload issues all-to-all or
+   the RCCL integration grows GDA support for vLLM-relevant collectives.
+3. The kernel/driver path remains clean under these PyTorch collectives:
+   software verbs traffic moves (`data_tx_posted/completed` grows), TX
+   completions balance, and no hard correctness counter moves.
