@@ -9650,6 +9650,151 @@ static void tbv_rx_fail_active_write_locked(struct tbv_state *state,
 	tbv_rx_finish_write_locked(state, tqp, rx_path, status);
 }
 
+static struct tbv_rx_reorder_frag *
+tbv_rx_reorder_find_frag_locked(struct tbv_rx_reorder_msg *msg, u32 offset)
+{
+	struct tbv_rx_reorder_frag *frag;
+
+	list_for_each_entry(frag, &msg->frags, node) {
+		if (frag->offset == offset)
+			return frag;
+	}
+
+	return NULL;
+}
+
+static void tbv_rx_reorder_remove_frag_locked(struct tbv_qp *tqp,
+					      struct tbv_rx_reorder_msg *msg,
+					      struct tbv_rx_reorder_frag *frag)
+{
+	u32 frag_idx;
+	u32 frag_count;
+	bool last = frag->offset + frag->len == msg->total_len;
+
+	if (tbv_rx_write_fragment_shape(msg->total_len, frag->offset,
+					frag->len, last, &frag_idx,
+					&frag_count) &&
+	    frag_count == msg->frag_count)
+		clear_bit(frag_idx, msg->frag_seen);
+
+	list_del(&frag->node);
+	if (msg->buffered_bytes >= frag->len)
+		msg->buffered_bytes -= frag->len;
+	else
+		msg->buffered_bytes = 0;
+	if (tqp->rx_reorder_bytes >= frag->len)
+		tqp->rx_reorder_bytes -= frag->len;
+	else
+		tqp->rx_reorder_bytes = 0;
+	if (msg->received >= frag->len)
+		msg->received -= frag->len;
+	else
+		msg->received = 0;
+	if (msg->frags_received)
+		msg->frags_received--;
+	msg->complete = false;
+}
+
+static bool
+tbv_rx_reorder_matches_active_write_locked(const struct tbv_rx_write *wrx,
+					   const struct tbv_rx_reorder_msg *msg)
+{
+	return msg->kind == TBV_RX_REORDER_WRITE &&
+	       msg->src_qp == wrx->src_qp &&
+	       msg->psn == wrx->psn &&
+	       msg->remote_addr == wrx->remote_addr &&
+	       msg->total_len == wrx->total_len &&
+	       msg->with_imm == wrx->with_imm &&
+	       msg->imm_data == wrx->imm_data &&
+	       msg->rkey == wrx->rkey;
+}
+
+static int tbv_rx_merge_active_write_reorder_locked(struct tbv_state *state,
+						    struct tbv_qp *tqp,
+						    struct tbv_path *rx_path)
+{
+	struct tbv_rx_write *wrx = &tqp->rx_write;
+	struct tbv_rx_reorder_msg *msg;
+	struct tbv_rx_reorder_frag *frag;
+	struct tbv_mr *mr = NULL;
+	int ret = 0;
+
+	if (!wrx->active || wrx->with_imm || !wrx->total_len)
+		return 0;
+
+	for (;;) {
+		u64 copy_addr;
+
+		msg = tbv_rx_reorder_find(tqp, wrx->psn);
+		if (!msg)
+			break;
+		if (!tbv_rx_reorder_matches_active_write_locked(wrx, msg))
+			break;
+
+		frag = tbv_rx_reorder_find_frag_locked(msg, wrx->received);
+		if (!frag)
+			break;
+
+		if (!mr) {
+			mr = tbv_mr_get(state, wrx->rkey);
+			if (!mr) {
+				atomic64_inc(&state->data_rx_copy_error);
+				ret = -EINVAL;
+				break;
+			}
+			if (!(mr->access & IB_ACCESS_REMOTE_WRITE)) {
+				atomic64_inc(&state->data_rx_copy_error);
+				ret = -EACCES;
+				break;
+			}
+		}
+
+		if (check_add_overflow(wrx->remote_addr, (u64)frag->offset,
+				       &copy_addr)) {
+			atomic64_inc(&state->data_rx_copy_error);
+			ret = -EINVAL;
+			break;
+		}
+
+		ret = tbv_umem_copy_to_iova(mr, copy_addr, frag->data,
+					    frag->len);
+		if (ret) {
+			atomic64_inc(&state->data_rx_copy_error);
+			break;
+		}
+
+		wrx->received = frag->offset + frag->len;
+		wrx->started_jiffies = jiffies;
+		wrx->last_offset = frag->offset;
+		wrx->last_len = frag->len;
+		msg->first_jiffies = jiffies;
+		atomic64_inc(&state->data_rx_active_write_reorder_merge);
+		atomic64_add(frag->len,
+			     &state->data_rx_active_write_reorder_merge_bytes);
+
+		tbv_rx_reorder_remove_frag_locked(tqp, msg, frag);
+		kfree(frag);
+
+		if (!msg->frags_received) {
+			tbv_rx_reorder_unlink_msg_locked(tqp, msg);
+			tbv_rx_reorder_free_msg(msg);
+		}
+
+		if (wrx->received == wrx->total_len) {
+			atomic64_inc(
+				&state->data_rx_active_write_reorder_merge_complete);
+			break;
+		}
+	}
+
+	if (mr)
+		tbv_mr_put(mr);
+	if (ret)
+		tbv_rx_fail_active_write_locked(state, tqp, rx_path,
+						IB_WC_LOC_PROT_ERR);
+	return ret;
+}
+
 static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 					      struct tbv_qp *tqp,
 					      const struct tbv_native_data_header *hdr,
@@ -9882,8 +10027,15 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 		wrx->started_jiffies = jiffies;
 		wrx->last_offset = copy_offset;
 		wrx->last_len = copy_len;
+
+		if (tbv_rx_merge_active_write_reorder_locked(state, tqp,
+							     rx_path)) {
+			mutex_unlock(&tqp->rx_lock);
+			return;
+		}
 	}
-	if (last) {
+	if (last || (!wrx->with_imm && wrx->total_len &&
+		     wrx->received == wrx->total_len)) {
 		tbv_rx_finish_write_locked(state, tqp, rx_path,
 					       IB_WC_SUCCESS);
 	}

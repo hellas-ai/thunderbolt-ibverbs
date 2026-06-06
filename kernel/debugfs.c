@@ -509,6 +509,12 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_active_retry));
 	seq_printf(s, "data_rx_active_duplicate_refresh: %lld\n",
 		   atomic64_read(&state->data_rx_active_duplicate_refresh));
+	seq_printf(s, "data_rx_active_write_reorder_merge: %lld\n",
+		   atomic64_read(&state->data_rx_active_write_reorder_merge));
+	seq_printf(s, "data_rx_active_write_reorder_merge_bytes: %lld\n",
+		   atomic64_read(&state->data_rx_active_write_reorder_merge_bytes));
+	seq_printf(s, "data_rx_active_write_reorder_merge_complete: %lld\n",
+		   atomic64_read(&state->data_rx_active_write_reorder_merge_complete));
 	seq_printf(s, "data_rx_active_write_flush: %lld\n",
 		   atomic64_read(&state->data_rx_active_write_flush));
 	seq_printf(s, "data_rx_active_write_imm_flush: %lld\n",

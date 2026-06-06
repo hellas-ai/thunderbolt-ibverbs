@@ -632,6 +632,9 @@ struct tbv_state {
 	atomic64_t data_rx_active_timeout;
 	atomic64_t data_rx_active_retry;
 	atomic64_t data_rx_active_duplicate_refresh;
+	atomic64_t data_rx_active_write_reorder_merge;
+	atomic64_t data_rx_active_write_reorder_merge_bytes;
+	atomic64_t data_rx_active_write_reorder_merge_complete;
 	atomic64_t data_rx_active_write_flush;
 	atomic64_t data_rx_active_write_imm_flush;
 	atomic64_t data_rx_reorder_buffered;
