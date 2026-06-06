@@ -2209,3 +2209,58 @@ dispatch/combine protocol still returns zeros for the peer-routed tokens. The
 next fix should target LL_MoE's remote combine return path or the GDA device
 fence/ordering path with a minimal repro, not the already-passing primitive
 rocSHMEM examples.
+
+### Minimal rocSHMEM Fence-Ordering Repro
+
+The LL_MoE fence hard error is reproducible outside LL_MoE with the rocSHMEM
+functional fence-ordering test. The smallest clean shape is one workgroup, one
+hardware wave on Strix (`-z 32 -ta 32`), one timed iteration, and a 128-byte
+max message sweep:
+
+```text
+log root: /mnt/Home/tmp/tbv-rocshmem-example/fence-order-allpe-z32-rebuilt-20260606-235723
+command: rocshmem_functional_tests -a fenceorderputwavesignal -w 1 -z 32 -ta 32 -s 128 -n 1 -nskip 0 -x 4
+result: USB4 GDA CQE error on PE0 at msg size 4
+error:  status=5 opcode=3 byte_len=4 wr_id=0x2 qp_state=0
+deltas: dv_hard_error=+1 data_wr_retransmit=+7 retry_exhausted=+1 timeout=+1
+        closing_qp=0 no_live_path=0 teardown_path=0 rx_canceled=0 no_qp=0
+```
+
+`status=5` is the USB4 DV retry-exceeded status for the RDMA WRITE WQE
+(`opcode=3`). The successful 1- and 2-byte writes each received the expected
+two path-diverse ACKs (`data_rx_ack=+4`, `data_rx_ack_matched=+2`,
+`data_rx_late_ack=+2`); the 4-byte write then retransmitted to exhaustion
+without entering the QP teardown guard paths.
+
+A new functional-test discriminator,
+`fenceorderputwavesignalpefence`, runs the same pattern but calls
+`rocshmem_ctx_fence(ctx, 1)` instead of the all-PE `rocshmem_ctx_fence(ctx)`.
+It fails identically:
+
+```text
+log root: /mnt/Home/tmp/tbv-rocshmem-example/fence-order-pe-z32-20260606-235740
+command: rocshmem_functional_tests -a fenceorderputwavesignalpefence -w 1 -z 32 -ta 32 -s 128 -n 1 -nskip 0 -x 4
+result: USB4 GDA CQE error on PE0 at msg size 4
+error:  status=5 opcode=3 byte_len=4 wr_id=0x2 qp_state=0
+deltas: dv_hard_error=+1 data_wr_retransmit=+7 retry_exhausted=+1 timeout=+1
+        closing_qp=0 no_live_path=0 teardown_path=0 rx_canceled=0 no_qp=0
+```
+
+Interpretation: this is not the earlier QP teardown race, and it is not caused
+by the all-PE fence implementation polling every QP. The minimal failure is a
+device-side USB4 GDA fence after a nonblocking wave PUT, before the signal. The
+post-failure primitive health check still passes cleanly, so the fault does
+not leave the transport wedged:
+
+```text
+log root: /mnt/Home/tmp/tbv-rocshmem-example/alltoall-post-fence-pe-20260606-235756
+command: rocshmem_alltoall_test 4
+result: PASS
+deltas: dv_poll=+4 tx=+12/+12 ack_match=+4 hard=0 retry=0 timeout=0
+```
+
+One harness caveat is now explicit: `rocshmem_functional_tests` can exit
+successfully or via MPI broken-pipe handling while the USB4 GDA counters record
+hard errors. For fence-ordering investigations, the TBV counter deltas are the
+authoritative pass/fail signal until the harness learns to fail on device CQE
+errors.
