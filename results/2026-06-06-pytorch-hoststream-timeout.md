@@ -793,3 +793,118 @@ timeout at 492/519 fragments and one active timeout at about 1.89 MiB/2 MiB.
 Next target: classify why the large WRITE retry path still exhausts after
 partial receive progress. The existing counters prove it is not the RNR-wait
 bug, not teardown/no-QP, and not a local TX completion imbalance.
+
+## Duplicate RX Refresh and Active/Reorder Merge
+
+The next fix refreshed RX active/reorder timers when duplicate replay traffic
+arrived for the same PSN. This prevents a retry stream from looking idle just
+because the receiver is suppressing already-consumed duplicate fragments.
+
+Deployed as:
+
+```text
+thunderbolt-ibverbs: 65932ff kernel: refresh RX timers on duplicate replay
+nixos-config:        dc21b7b strix: deploy RX duplicate replay refresh
+```
+
+The 30-rep PyTorch hoststream run:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-dupreplayrefresh30-qptimeout14-20260606-163535
+status: fail, 27/30 app reps passed
+failed reps: 17,19,21
+data_tx_posted/completed: balanced in every failed rep
+```
+
+All three failures retained the ordinary `status=5` class:
+
+```text
+data_wr_timeout/data_wr_retry_exhausted: 1/1
+data_wr_rnr_retry_exhausted: 0
+data_rx_active_timeout/active_retry: 1/1
+data_rx_reorder_timeout/reorder_retry/reorder_dropped: 1/1/1
+data_wr_retransmit_closing_qp/no_live_path/teardown_path: 0/0/0
+data_rx_canceled: 0
+data_tx_errors: 0
+```
+
+The duplicate-refresh counters fired heavily in the failed reps:
+
+```text
+rep 17: data_rx_reorder_duplicate_refresh=1165 data_rx_active_duplicate_refresh=1259
+rep 19: data_rx_reorder_duplicate_refresh=1297 data_rx_active_duplicate_refresh=1736
+rep 21: data_rx_reorder_duplicate_refresh=3742 data_rx_active_duplicate_refresh=6418
+```
+
+That is a useful falsifier. Duplicate replay traffic is real, and the refresh
+logic is live, but refreshing duplicate activity does not guarantee completion
+of the partially received WRITE. The receiver can continue seeing duplicate
+fragments while still missing at least one required data fragment.
+
+The failed kernel logs also showed same-PSN active and reorder state at timeout,
+with the active WRITE missing an earlier offset and the reorder object holding
+later fragments. Example:
+
+```text
+native RDMA_WRITE active timeout ... received=918896 total=1048576 last_offset=914848
+native RX reorder timeout ... psn=0 received=906896 total=1048576 frags=225/260 last_offset=1048432
+```
+
+That suggested a possible stranded-fragment bug: buffered reorder fragments
+might be contiguous with the active WRITE but never merged. A helper was added
+to merge same-PSN buffered WRITE fragments into the active non-imm WRITE when
+the next buffered fragment exactly matches `rx_write.received`.
+
+Deployed as:
+
+```text
+thunderbolt-ibverbs: 73b3e58 kernel: merge buffered write fragments into active RX
+nixos-config:        518d088 strix: deploy active write reorder merge
+```
+
+The 30-rep PyTorch hoststream run:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-activewritemerge30-qptimeout14-20260606-165020
+status: fail, 29/30 app reps passed
+failed rep: 22
+data_tx_posted/completed: balanced in every rep
+```
+
+Rep 22 again had the ordinary WRITE timeout/exhaustion class:
+
+```text
+rank1 strix-2: USB4 GDA CQE error status=5 opcode=3 byte_len=2097152
+rank0 strix-1: USB4 alltoall DATA wait timed out ctx=6 expected=6 observed=4
+
+data_wr_retransmit: 17
+data_wr_timeout/data_wr_retry_exhausted: 1/1
+data_rx_active_timeout/active_retry: 1/1
+data_rx_reorder_timeout/reorder_retry/reorder_dropped: 1/1/1
+data_tx_ack_rnr/data_rx_ack_rnr: 2/0
+data_tx_errors: 0
+data_tx_posted/data_tx_completed: 10623/10623
+```
+
+The new merge counters stayed zero in every rep, including the failure:
+
+```text
+data_rx_active_write_reorder_merge: 0
+data_rx_active_write_reorder_merge_bytes: 0
+data_rx_active_write_reorder_merge_complete: 0
+```
+
+So the active/reorder merge hypothesis is falsified for this workload. The
+receiver is not failing because it forgot to drain a contiguous buffered
+fragment into the active WRITE. The missing data is the first gap at
+`rx_write.received`; later fragments can be buffered and duplicate replay can
+refresh timers, but the fragment needed to advance the active WRITE still does
+not arrive before the sender exhausts the WR.
+
+Current narrowed statement: the remaining PyTorch correctness failure is a
+large non-imm `RDMA_WRITE` gap-repair problem. TX completion accounting is
+balanced, teardown/no-QP guards are not firing, RNR-wait terminal buckets are
+clear, and duplicate replay/merge does not close the gap. The next falsifier
+should capture or change the first-gap repair policy: log the missing offset
+and active/reorder rail/path IDs at timeout, or send an early targeted RNR when
+the receiver first observes future fragments beyond an active WRITE gap.
