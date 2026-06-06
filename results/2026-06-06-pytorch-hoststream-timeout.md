@@ -254,3 +254,30 @@ The useful next experiments are:
    frame loss, delayed delivery beyond the reorder window, or receiver-side
    processing starvation under PyTorch hoststream pressure.
 ```
+
+## ACK Recovery Source Check
+
+The current ACK-loss recovery path is full data retransmission:
+
+```text
+tbv_qp_timeout_reap_tx() moves an expired pending send to retry_sends
+tbv_qp_timeout_work() reposts it through tbv_native_send_ctx_post_frames()
+the receiver's duplicate-data path re-ACKs from ACK history
+the sender then counts data_rx_ack_match_retried when the ACK matches
+```
+
+This matches the qptimeout14 run after adding `data_rx_duplicate_ack` to the
+summary: most ACKs matched after retry are paired with duplicate-data re-ACKs,
+not delayed original ACKs. That means the common tail is expensive because the
+sender resends the whole operation to recover a missing control ACK.
+
+There is a `data_rx_ack_cumulative` counter in debugfs, but no implementation
+uses it today. It would also be a poor fit for the dominant PyTorch tail: the
+failure logs commonly show new QPs at `psn=0`, so there is no earlier PSN range
+for a cumulative ACK to cover.
+
+A lower-latency fix should avoid blind extra fanout. The next plausible design
+is an explicit ACK-query/re-ACK request before full data retransmission, with a
+fallback to the existing data retransmit path if the query is lost or the peer
+cannot answer from ACK history. That would need a new native control opcode and
+new counters; it should be gated behind a module parameter until validated.
