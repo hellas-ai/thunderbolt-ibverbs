@@ -26,6 +26,9 @@ warmup=${TBV_RCCL_WARMUP:-2}
 reps=${TBV_REPS:-3}
 collectives=${TBV_RCCL_COLLECTIVES:-alltoall,alltoallv}
 modes=${TBV_MODES:-fallback,hoststream,device}
+rccl_source_heap=${TBV_RCCL_SOURCE_HEAP:-${RCCL_ROCSHMEM_SOURCE_HEAP:-}}
+rccl_dest_heap=${TBV_RCCL_DEST_HEAP:-${RCCL_ROCSHMEM_DEST_HEAP:-}}
+hoststream_fixed_symid=${TBV_RCCL_HOSTSTREAM_FIXED_SYMID:-${RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID:-}}
 
 run_rccl=${TBV_RUN_RCCL:-1}
 run_pytorch=${TBV_RUN_PYTORCH:-0}
@@ -78,6 +81,10 @@ Options:
   --reps N                  Repetitions per mode/collective. Default: $reps
   --collectives CSV         alltoall,alltoallv. Default: $collectives
   --modes CSV               fallback,hoststream,device. Default: $modes
+  --source-heap 0|1         Override RCCL_ROCSHMEM_SOURCE_HEAP for GDA modes
+  --dest-heap 0|1           Override RCCL_ROCSHMEM_DEST_HEAP for GDA modes
+  --hoststream-fixed-symid N
+                            Set RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID
   --skip-rccl               Do not run rccl-tests gates
   --pytorch                 Run PyTorch distributed smoke
   --pytorch-wrapper DIR     vLLM/PyTorch wrapper prefix
@@ -119,6 +126,9 @@ while (($#)); do
     --reps) reps=$2; shift 2 ;;
     --collectives) collectives=$2; shift 2 ;;
     --modes) modes=$2; shift 2 ;;
+    --source-heap) rccl_source_heap=$2; shift 2 ;;
+    --dest-heap) rccl_dest_heap=$2; shift 2 ;;
+    --hoststream-fixed-symid) hoststream_fixed_symid=$2; shift 2 ;;
     --skip-rccl) run_rccl=0; shift ;;
     --pytorch) run_pytorch=1; shift ;;
     --pytorch-wrapper) pytorch_wrapper=$2; shift 2 ;;
@@ -410,16 +420,16 @@ configure_mode() {
       export RCCL_ROCSHMEM_ENABLE=1
       export RCCL_ROCSHMEM_FORCE_ENABLE=1
       export RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=1
-      export RCCL_ROCSHMEM_SOURCE_HEAP=1
-      export RCCL_ROCSHMEM_DEST_HEAP=1
+      export RCCL_ROCSHMEM_SOURCE_HEAP=${rccl_source_heap:-1}
+      export RCCL_ROCSHMEM_DEST_HEAP=${rccl_dest_heap:-1}
       TBV_EXPECT_DV=1
       ;;
     device)
       export RCCL_ROCSHMEM_ENABLE=1
       export RCCL_ROCSHMEM_FORCE_ENABLE=1
       export RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=0
-      export RCCL_ROCSHMEM_SOURCE_HEAP=1
-      export RCCL_ROCSHMEM_DEST_HEAP=1
+      export RCCL_ROCSHMEM_SOURCE_HEAP=${rccl_source_heap:-1}
+      export RCCL_ROCSHMEM_DEST_HEAP=${rccl_dest_heap:-1}
       TBV_EXPECT_DV=1
       ;;
     *) echo "ERROR: unknown mode: $mode" >&2; exit 2 ;;
@@ -578,6 +588,7 @@ run_rccl_case() {
       -x RCCL_ROCSHMEM_ENABLE -x RCCL_ROCSHMEM_FORCE_ENABLE -x RCCL_ROCSHMEM_THRESHOLD \
       -x RCCL_ROCSHMEM_SOURCE_HEAP -x RCCL_ROCSHMEM_DEST_HEAP -x RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL \
       -x RCCL_ROCSHMEM_GDA_BENCH_MODE -x RCCL_ROCSHMEM_HOST_STREAM_TIMING \
+      -x RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID \
       -x RCCL_FORCE_ENABLE_DMABUF -x RCCL_INIT_CHANNELS -x NCCL_DEBUG \
       "$rccl_tests_dir/$bin" -b "$min_size" -e "$max_size" -f "$factor" \
       -n "$iters" -w "$warmup" -g 1 -c 1 -a 1
@@ -785,6 +796,10 @@ run_pytorch_case() {
 mkdir -p "$log_root"
 setup_app_env
 
+if [[ -n "$hoststream_fixed_symid" ]]; then
+  export RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID=$hoststream_fixed_symid
+fi
+
 echo "TBV app gate"
 echo "  hosts=$hosts"
 echo "  counter_hosts=$counter_hosts"
@@ -793,6 +808,9 @@ echo "  log_root=$log_root"
 echo "  modes=$modes"
 echo "  collectives=$collectives"
 echo "  dv_check=$dv_check"
+echo "  source_heap=${rccl_source_heap:-gda-default}"
+echo "  dest_heap=${rccl_dest_heap:-gda-default}"
+echo "  hoststream_fixed_symid=${hoststream_fixed_symid:-auto}"
 
 gate_status=0
 
