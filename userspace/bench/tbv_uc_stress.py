@@ -168,10 +168,17 @@ def run_with_timeout(cmd: list[str], timeout: float) -> tuple[int, str]:
         proc.kill()
         stdout, _ = proc.communicate()
         return 124, stdout
+    except BaseException:
+        proc.kill()
+        proc.communicate()
+        raise
 
 
 def cleanup_port(host: str, tool_basename: str, port: int) -> None:
-    pattern = f"{tool_basename} .*--port {port}"
+    pattern = (
+        rf"(^|/){re.escape(tool_basename)}([[:space:]]|$)"
+        rf".*--port[[:space:]]+{port}([[:space:]]|$)"
+    )
     subprocess.run(
         ssh_command(host, f"pkill -f {shlex.quote(pattern)} 2>/dev/null || true"),
         stdout=subprocess.DEVNULL,
@@ -277,23 +284,33 @@ def run_case(
         stderr=subprocess.STDOUT,
         text=True,
     )
-    time.sleep(args.start_delay)
-
-    sender_rc, sender_stdout = run_with_timeout(
-        ssh_command(sender, send_cmd),
-        args.timeout,
-    )
     try:
-        receiver_stdout, _ = recv_proc.communicate(timeout=args.receiver_drain_timeout)
-        receiver_rc = recv_proc.returncode
-    except subprocess.TimeoutExpired:
-        recv_proc.kill()
-        receiver_stdout, _ = recv_proc.communicate()
-        receiver_rc = 124
+        time.sleep(args.start_delay)
 
-    if sender_rc == 124 or receiver_rc == 124:
+        sender_rc, sender_stdout = run_with_timeout(
+            ssh_command(sender, send_cmd),
+            args.timeout,
+        )
+        try:
+            receiver_stdout, _ = recv_proc.communicate(
+                timeout=args.receiver_drain_timeout
+            )
+            receiver_rc = recv_proc.returncode
+        except subprocess.TimeoutExpired:
+            recv_proc.kill()
+            receiver_stdout, _ = recv_proc.communicate()
+            receiver_rc = 124
+
+        if sender_rc == 124 or receiver_rc == 124:
+            cleanup_port(sender, os.path.basename(sender_tool), port)
+            cleanup_port(receiver, os.path.basename(receiver_tool), port)
+    except BaseException:
+        if recv_proc.poll() is None:
+            recv_proc.kill()
+            recv_proc.communicate()
         cleanup_port(sender, os.path.basename(sender_tool), port)
         cleanup_port(receiver, os.path.basename(receiver_tool), port)
+        raise
 
     sender_log.write_text(sender_stdout)
     receiver_log.write_text(receiver_stdout)

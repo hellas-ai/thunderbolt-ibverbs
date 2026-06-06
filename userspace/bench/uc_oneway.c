@@ -312,6 +312,8 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	if (o->mtu != 256 && o->mtu != 512 && o->mtu != 1024 &&
 	    o->mtu != 2048 && o->mtu != 4096)
 		return -1;
+	if (o->check_any_order && o->size < sizeof(uint64_t))
+		return -1;
 	if (strcmp(o->role, "send") && strcmp(o->role, "recv") &&
 	    strcmp(o->role, "bidi"))
 		return -1;
@@ -731,6 +733,14 @@ int main(int argc, char **argv)
 		     (o.send_slots ? o.send_slots : o.depth) : 0;
 	if (send_slots < 0 || send_slots > o.count)
 		send_slots = o.count;
+	if ((is_sender || is_bidi) && o.check && send_slots < o.depth) {
+		fprintf(stderr,
+			"uc_oneway: --check requires --send-slots >= --depth; "
+			"otherwise in-flight SEND buffers may be overwritten "
+			"(send_slots=%d depth=%d)\n",
+			send_slots, o.depth);
+		return 2;
+	}
 
 	debug_step("open device");
 	ctx = open_dev(o.dev);

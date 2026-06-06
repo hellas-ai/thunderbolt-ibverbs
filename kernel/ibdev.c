@@ -8852,9 +8852,16 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
 	dev->base.dev.parent = dma_device;
 	ret = tbv_ibdev_attach_netdev(dev);
 	if (ret) {
-		pr_warn("failed to attach %s RoCE netdev %s for %s: %d\n",
-			tbv_backend_name(backend),
-			tbv_ibdev_netdev_name(dev) ?: "(none)", name, ret);
+		if (ret == -EPROBE_DEFER)
+			pr_debug("deferred %s RoCE netdev %s attach for %s\n",
+				 tbv_backend_name(backend),
+				 tbv_ibdev_netdev_name(dev) ?: "(none)",
+				 name);
+		else
+			pr_warn("failed to attach %s RoCE netdev %s for %s: %d\n",
+				tbv_backend_name(backend),
+				tbv_ibdev_netdev_name(dev) ?: "(none)",
+				name, ret);
 		put_device(dma_device);
 		ib_dealloc_device(&dev->base);
 		return ret;
@@ -9099,10 +9106,16 @@ static void tbv_ibdev_netdev_retry_work(struct work_struct *work)
 
 		mutex_lock(&state->rail_register_lock);
 		if (target->ibdev_register_deferred && !target->ibdev &&
-		    !target->ibdev_register_failed)
+		    !target->ibdev_register_failed) {
+			/*
+			 * Clear the latch before replaying the up-edge. The
+			 * event path re-checks all publication gates under the
+			 * same lock and would otherwise return early.
+			 */
 			target->ibdev_register_deferred = false;
-		else
+		} else {
 			skip = true;
+		}
 		mutex_unlock(&state->rail_register_lock);
 
 		if (!skip)
@@ -9111,13 +9124,50 @@ static void tbv_ibdev_netdev_retry_work(struct work_struct *work)
 	}
 }
 
+static void tbv_ibdev_detach_matching_netdev(struct tbv_state *state,
+					     struct net_device *ndev,
+					     bool detach_renamed)
+{
+	struct tbv_peer *peer;
+
+	mutex_lock(&state->rail_register_lock);
+	mutex_lock(&state->lock);
+	list_for_each_entry(peer, &state->peers, node) {
+		struct tbv_rail *rail;
+
+		list_for_each_entry(rail, &peer->rails, node) {
+			struct tbv_ibdev *dev = rail->ibdev;
+			const char *expected_name;
+
+			if (!dev || dev->netdev != ndev)
+				continue;
+
+			expected_name = tbv_ibdev_netdev_name(dev);
+			if (detach_renamed && expected_name &&
+			    !strcmp(expected_name, ndev->name))
+				continue;
+
+			pr_info("detaching ib_device %s from %s netdev %s%s%s\n",
+				dev_name(&dev->base.dev),
+				detach_renamed ? "renamed" : "unregistering",
+				ndev->name,
+				detach_renamed && expected_name ?
+					", expected " : "",
+				detach_renamed && expected_name ?
+					expected_name : "");
+			tbv_ibdev_detach_netdev(dev);
+		}
+	}
+	mutex_unlock(&state->lock);
+	mutex_unlock(&state->rail_register_lock);
+}
+
 static int tbv_ibdev_netdev_event(struct notifier_block *nb,
 				  unsigned long event, void *ptr)
 {
 	struct tbv_state *state =
 		container_of(nb, struct tbv_state, ibdev_netdev_nb);
 	struct net_device *ndev = netdev_notifier_info_to_dev(ptr);
-	struct tbv_peer *peer;
 
 	switch (event) {
 	case NETDEV_REGISTER:
@@ -9128,25 +9178,14 @@ static int tbv_ibdev_netdev_event(struct notifier_block *nb,
 			queue_work(state->workqueue,
 				   &state->ibdev_netdev_retry_work);
 		return NOTIFY_DONE;
+	case NETDEV_CHANGENAME:
+		tbv_ibdev_detach_matching_netdev(state, ndev, true);
+		if (state->workqueue)
+			queue_work(state->workqueue,
+				   &state->ibdev_netdev_retry_work);
+		return NOTIFY_DONE;
 	case NETDEV_UNREGISTER:
-		mutex_lock(&state->rail_register_lock);
-		mutex_lock(&state->lock);
-		list_for_each_entry(peer, &state->peers, node) {
-			struct tbv_rail *rail;
-
-			list_for_each_entry(rail, &peer->rails, node) {
-				struct tbv_ibdev *dev = rail->ibdev;
-
-				if (!dev || dev->netdev != ndev)
-					continue;
-
-				pr_info("detaching ib_device %s from unregistering netdev %s\n",
-					dev_name(&dev->base.dev), ndev->name);
-				tbv_ibdev_detach_netdev(dev);
-			}
-		}
-		mutex_unlock(&state->lock);
-		mutex_unlock(&state->rail_register_lock);
+		tbv_ibdev_detach_matching_netdev(state, ndev, false);
 		return NOTIFY_DONE;
 	default:
 		return NOTIFY_DONE;

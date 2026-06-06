@@ -20,6 +20,8 @@ Options:
   --copy-to STORE             Nix copy destination, default ssh-ng://SSH_HOST.
   --copy                      Copy the verified module closure to TARGET.
   --reload                    Copy and reload thunderbolt_ibverbs on TARGET.
+                              Reload is non-atomic: a later insmod failure
+                              leaves the target without thunderbolt_ibverbs.
   --options STRING            Module options for --reload. Required unless
                               --allow-empty-options is set.
   --allow-empty-options       Permit --reload with no module options.
@@ -233,6 +235,7 @@ if [[ "$reload" == 1 ]]; then
 		die "--reload requires --options or TBV_OPTIONS; pass --allow-empty-options to load defaults intentionally"
 	fi
 	printf '==> Reloading thunderbolt_ibverbs on %s\n' "$ssh_host"
+	printf 'warning: --reload is non-atomic; a remote insmod failure leaves thunderbolt_ibverbs unloaded\n' >&2
 	ssh "$ssh_host" \
 		"sudo -n env TBV_MODULE=$(sh_quote "$module") TBV_EXPECTED_UNAME=$(sh_quote "$remote_uname") TBV_OPTIONS=$(sh_quote "$module_options") TBV_WAIT_SECS=$(sh_quote "$wait_secs") bash -s" <<'REMOTE'
 set -euo pipefail
