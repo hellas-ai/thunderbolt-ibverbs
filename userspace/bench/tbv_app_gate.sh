@@ -29,6 +29,7 @@ modes=${TBV_MODES:-fallback,hoststream,device}
 rccl_source_heap=${TBV_RCCL_SOURCE_HEAP:-${RCCL_ROCSHMEM_SOURCE_HEAP:-}}
 rccl_dest_heap=${TBV_RCCL_DEST_HEAP:-${RCCL_ROCSHMEM_DEST_HEAP:-}}
 hoststream_fixed_symid=${TBV_RCCL_HOSTSTREAM_FIXED_SYMID:-${RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID:-}}
+hoststream_addr_log=${TBV_RCCL_HOSTSTREAM_ADDR_LOG:-${RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG:-}}
 
 run_rccl=${TBV_RUN_RCCL:-1}
 run_pytorch=${TBV_RUN_PYTORCH:-0}
@@ -85,6 +86,8 @@ Options:
   --dest-heap 0|1           Override RCCL_ROCSHMEM_DEST_HEAP for GDA modes
   --hoststream-fixed-symid N
                             Set RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID
+  --hoststream-addr-log 0|1
+                            Set RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG
   --skip-rccl               Do not run rccl-tests gates
   --pytorch                 Run PyTorch distributed smoke
   --pytorch-wrapper DIR     vLLM/PyTorch wrapper prefix
@@ -129,6 +132,7 @@ while (($#)); do
     --source-heap) rccl_source_heap=$2; shift 2 ;;
     --dest-heap) rccl_dest_heap=$2; shift 2 ;;
     --hoststream-fixed-symid) hoststream_fixed_symid=$2; shift 2 ;;
+    --hoststream-addr-log) hoststream_addr_log=$2; shift 2 ;;
     --skip-rccl) run_rccl=0; shift ;;
     --pytorch) run_pytorch=1; shift ;;
     --pytorch-wrapper) pytorch_wrapper=$2; shift 2 ;;
@@ -588,7 +592,7 @@ run_rccl_case() {
       -x RCCL_ROCSHMEM_ENABLE -x RCCL_ROCSHMEM_FORCE_ENABLE -x RCCL_ROCSHMEM_THRESHOLD \
       -x RCCL_ROCSHMEM_SOURCE_HEAP -x RCCL_ROCSHMEM_DEST_HEAP -x RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL \
       -x RCCL_ROCSHMEM_GDA_BENCH_MODE -x RCCL_ROCSHMEM_HOST_STREAM_TIMING \
-      -x RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID \
+      -x RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID -x RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG \
       -x RCCL_FORCE_ENABLE_DMABUF -x RCCL_INIT_CHANNELS -x NCCL_DEBUG \
       "$rccl_tests_dir/$bin" -b "$min_size" -e "$max_size" -f "$factor" \
       -n "$iters" -w "$warmup" -g 1 -c 1 -a 1
@@ -713,6 +717,9 @@ build_torch_remote_command() {
   if [[ -n "${RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID:-}" ]]; then
     cmd+=("RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID=$RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID")
   fi
+  if [[ -n "${RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG:-}" ]]; then
+    cmd+=("RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG=$RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG")
+  fi
   if [[ -n "$torch_ld_preload" ]]; then
     cmd+=("LD_PRELOAD=$torch_ld_preload")
   fi
@@ -799,6 +806,9 @@ setup_app_env
 if [[ -n "$hoststream_fixed_symid" ]]; then
   export RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID=$hoststream_fixed_symid
 fi
+if [[ -n "$hoststream_addr_log" ]]; then
+  export RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG=$hoststream_addr_log
+fi
 
 echo "TBV app gate"
 echo "  hosts=$hosts"
@@ -811,6 +821,7 @@ echo "  dv_check=$dv_check"
 echo "  source_heap=${rccl_source_heap:-gda-default}"
 echo "  dest_heap=${rccl_dest_heap:-gda-default}"
 echo "  hoststream_fixed_symid=${hoststream_fixed_symid:-auto}"
+echo "  hoststream_addr_log=${hoststream_addr_log:-0}"
 
 gate_status=0
 

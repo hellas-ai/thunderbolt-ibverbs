@@ -230,6 +230,65 @@ print_hoststream_phase_aggregates() {
   ' "${logs[@]}" | sort -V
 }
 
+print_hoststream_addr_layouts() {
+  local -a logs=("$@")
+
+  ((${#logs[@]} > 0)) || return 0
+  if ! grep -h 'NCCL WARN RCCL_ROCSHMEM_HOST_STREAM_ADDR' "${logs[@]}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  printf '\nhoststream_addr layouts:\n'
+  printf 'app_mode rank bench_mode msg_size rank_offset sym_id fixed_sym_id count source_backing dest_backing num_sym_buf buf_threshold slot_offset source_base source_slot dest_base dest_slot\n'
+  awk '
+    function file_mode(path, parts, n, i) {
+      n = split(path, parts, "/")
+      for (i = 1; i <= n; i++) {
+        if (parts[i] == "pytorch" && i + 1 <= n)
+          return parts[i + 1]
+      }
+      return "unknown"
+    }
+    function field(name, m) {
+      if (match($0, name "=([^[:space:]]+)", m))
+        return m[1]
+      return "NA"
+    }
+    FNR == 1 {
+      app_mode = file_mode(FILENAME)
+    }
+    /NCCL WARN RCCL_ROCSHMEM_HOST_STREAM_ADDR/ {
+      rank = field("rank")
+      bench_mode = field("mode")
+      msg_size = field("msgSize")
+      rank_offset = field("rankOffset")
+      sym_id = field("symId")
+      fixed_sym_id = field("fixedSymId")
+      num_sym_buf = field("numSymBuf")
+      buf_threshold = field("bufThreshold")
+      slot_offset = field("slotOffset")
+      source_backing = field("sourceBacking")
+      source_base = field("sourceBase")
+      source_slot = field("sourceSlot")
+      dest_backing = field("destBacking")
+      dest_base = field("destBase")
+      dest_slot = field("destSlot")
+      key = app_mode SUBSEP rank SUBSEP bench_mode SUBSEP msg_size SUBSEP rank_offset SUBSEP sym_id SUBSEP fixed_sym_id \
+        SUBSEP source_backing SUBSEP dest_backing SUBSEP num_sym_buf SUBSEP buf_threshold SUBSEP slot_offset \
+        SUBSEP source_base SUBSEP source_slot SUBSEP dest_base SUBSEP dest_slot
+      count[key]++
+    }
+    END {
+      for (key in count) {
+        split(key, p, SUBSEP)
+        printf "%s %s %s %s %s %s %s %d %s %s %s %s %s %s %s %s %s\n",
+          p[1], p[2], p[3], p[4], p[5], p[6], p[7], count[key],
+          p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15], p[16]
+      }
+    }
+  ' "${logs[@]}" | sort -V
+}
+
 print_rccl_timing_aggregates() {
   local -a logs=("$@")
 
@@ -434,6 +493,7 @@ mapfile -d '' -t counter_logs < <(
 
 print_pytorch_timing_aggregates "${pytorch_rank0_logs[@]}"
 print_hoststream_phase_aggregates "${pytorch_rank_logs[@]}"
+print_hoststream_addr_layouts "${pytorch_rank_logs[@]}"
 print_loaded_collective_lib_counts "${pytorch_rank_logs[@]}"
 print_rccl_timing_aggregates "${rccl_logs[@]}"
 print_counter_aggregates "${counter_logs[@]}"

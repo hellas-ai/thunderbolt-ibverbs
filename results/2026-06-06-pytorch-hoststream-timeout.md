@@ -1420,3 +1420,55 @@ instrumentation is address-level: log the base pointer, per-slot pointer,
 slot offset, backing mode, and any available registration/remote-key metadata
 for source and destination scratch so the `+128MiB` slot can be tied to actual
 local and remote translations.
+
+### Host-Stream Address-Log Tooling Validation
+
+Added an opt-in RCCL diagnostic:
+
+```text
+RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG=1
+```
+
+When enabled, RCCL emits one `RCCL_ROCSHMEM_HOST_STREAM_ADDR` line per
+host-stream all-to-all call with rank, mode, message size, selected `symId`,
+`fixedSymId`, source/destination backing mode, base pointer, slot pointer,
+`numSymBuf`, `bufThreshold`, and `slotOffset`. The app gate now exposes this as
+`--hoststream-addr-log`, forwards it through MPI/PyTorch, and the summarizer
+collapses the per-call lines into unique address layouts.
+
+Built and installed the instrumented RCCL into the existing waitbudget prefix:
+
+```text
+/mnt/Home/tmp/rccl-hoststream-waitbudget-install/lib/librccl.so.1.0
+marker: RCCL_ROCSHMEM_HOST_STREAM_ADDR present
+```
+
+Validation run:
+
+```text
+log: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-addrlog-coherent-auto-writegaprnr1-qptimeout14-20260606-183306
+options: --source-heap 0 --dest-heap 0 --hoststream-addr-log 1
+status: pass, 1/1
+```
+
+Address-layout summary:
+
+```text
+rank=0 msgSize=2097152 symId=0 fixed=-1 count=2 sourceBase=0x7e5173e08d00 sourceSlot=0x7e5173e08d00 destBase=0x7e5183e08d80 destSlot=0x7e5183e08d80 slotOffset=0
+rank=0 msgSize=2097152 symId=1 fixed=-1 count=1 sourceBase=0x7e5173e08d00 sourceSlot=0x7e517be08d00 destBase=0x7e5183e08d80 destSlot=0x7e518be08d80 slotOffset=134217728
+rank=1 msgSize=2097152 symId=0 fixed=-1 count=2 sourceBase=0x7bd1d1c08d00 sourceSlot=0x7bd1d1c08d00 destBase=0x7bd1e1c08d80 destSlot=0x7bd1e1c08d80 slotOffset=0
+rank=1 msgSize=2097152 symId=1 fixed=-1 count=1 sourceBase=0x7bd1d1c08d00 sourceSlot=0x7bd1d9c08d00 destBase=0x7bd1e1c08d80 destSlot=0x7bd1e9c08d80 slotOffset=134217728
+```
+
+Phase timing in this small validation still showed the same direction:
+`symId=1` exchange was slower than `symId=0` even with coherent scratch on both
+sides (`4194304` msgSize: `symId=0 exchange_avg=7.919ms`,
+`symId=1 exchange_avg=58.615ms`). Counters stayed correctness-clean:
+`wr_retx=0`, `wr_timeout=0`, `wr_retry_exhausted=0`, `dv_hard=0`, no
+active/reorder timeouts, no no-QP frames, no RX cancels, and `tx=6902/6902`.
+
+Interpretation: the new diagnostic proves the selected slow slot is exactly the
+second half of the symmetric scratch allocation on both ranks. The next
+performance discriminator should move below RCCL's local pointer view and log
+the rocSHMEM USB4 backend's chosen remote address/rkey/lkey or memory-region
+classification for those same source/destination slots.
