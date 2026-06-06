@@ -135,21 +135,21 @@ static bool tbv_service_backend_data_enabled(const struct tbv_state *state,
 	return state->native_data;
 }
 
-static bool tbv_service_tbnet_path_ready(struct tbv_state *state,
-					 const struct tb_xdomain *xd)
+static bool tbv_service_tbnet_neighbor_ready(struct tbv_state *state,
+					     const struct tb_xdomain *xd)
 {
 	if (state->cfg.tbnet_identity != TBV_TBNET_ID_MINIMAL_PACKET)
 		return true;
 
-	return tbv_tbnet_minimal_packet_path_ready(&state->tbnet_identity,
-						   xd ? xd->remote_uuid : NULL);
+	return tbv_tbnet_minimal_neighbor_ready(&state->tbnet_identity,
+						xd ? xd->remote_uuid : NULL);
 }
 
 static bool tbv_service_should_defer_apple_tunnel(struct tbv_state *state,
 						  const struct tb_xdomain *xd)
 {
 	return state->apple_tunnels_wait_tbnet &&
-	       !tbv_service_tbnet_path_ready(state, xd);
+	       !tbv_service_tbnet_neighbor_ready(state, xd);
 }
 
 static bool tbv_service_has_pending_apple_rail_locked(struct tbv_state *state)
@@ -220,7 +220,7 @@ tbv_service_next_pending_apple_rail(struct tbv_state *state)
 			    rail->path.state != TBV_PATH_RING_STARTED)
 				continue;
 			pending = true;
-			if (!tbv_service_tbnet_path_ready(state, peer->xd))
+			if (!tbv_service_tbnet_neighbor_ready(state, peer->xd))
 				continue;
 			refcount_inc(&rail->refcnt);
 			mutex_unlock(&state->lock);
@@ -239,7 +239,7 @@ static void tbv_service_apple_tunnel_work(struct work_struct *work)
 
 	if (!state->services_registered || !state->enable_tunnels)
 		return;
-	if (!tbv_service_tbnet_path_ready(state, NULL))
+	if (!tbv_service_tbnet_neighbor_ready(state, NULL))
 		return;
 
 	for (;;) {
@@ -274,7 +274,7 @@ void tbv_services_tbnet_identity_ready(struct tbv_tbnet_identity *identity)
 		return;
 	if (!state->services_registered || !state->apple_tunnels_wait_tbnet)
 		return;
-	if (!tbv_service_tbnet_path_ready(state, NULL))
+	if (!tbv_service_tbnet_neighbor_ready(state, NULL))
 		return;
 
 	queue_work(system_long_wq, &state->apple_tunnel_work);
@@ -602,13 +602,11 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 	state->negotiate_native = service_cfg->negotiate_native;
 	state->enable_tunnels = service_cfg->enable_tunnels;
 	/*
-	 * When this module owns the ThunderboltIP identity, the packet login path
-	 * is the carrier/path proof macOS normally gets from thunderbolt_net.
-	 * Do not program the AD/FA57 tunnel until that identity path is active:
-	 * older macOS interop work showed that enabling a second XDomain DMA
-	 * tunnel before TBnet is established can tear down or poison the peer
-	 * state.  Stock/proxy identity modes already depend on an external TBnet
-	 * carrier, so they keep the immediate FA57 path.
+	 * When this module owns the ThunderboltIP identity, macOS still expects a
+	 * live ThunderboltIP neighbor before the AD/FA57 path is usable.  Do not
+	 * program the AD/FA57 tunnel until the minimal packet path has answered the
+	 * peer's ARP for our RDMA GID address.  Stock/proxy identity modes already
+	 * depend on an external TBnet carrier, so they keep the immediate FA57 path.
 	 */
 	state->apple_tunnels_wait_tbnet =
 		state->cfg.tbnet_identity == TBV_TBNET_ID_MINIMAL_PACKET;

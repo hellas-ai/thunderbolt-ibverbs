@@ -37,7 +37,6 @@
 #define TBV_TBNET_MIN_LOGIN_DELAY_MS	4500
 #define TBV_TBNET_MIN_LOGIN_TIMEOUT_MS	500
 #define TBV_TBNET_MIN_LOGIN_RETRIES	60
-#define TBV_TBNET_MIN_LOGOUT_TIMEOUT_MS	1000
 #define TBV_TBNET_MIN_RING_SIZE		256
 #define TBV_TBNET_MIN_FRAME_SIZE	SZ_4K
 #define TBV_TBNET_E2E			BIT(0)
@@ -97,7 +96,6 @@ struct tbv_tbnet_minimal_session {
 	bool path_enabled;
 	bool login_sent;
 	bool login_received;
-	bool logout_reset_sent;
 	bool neighbor_seen;
 	bool handler_registered;
 	bool removing;
@@ -145,9 +143,6 @@ static void tbv_tbnet_minimal_rx_work(struct work_struct *work);
 static void tbv_tbnet_minimal_tx_poll_work(struct work_struct *work);
 static void
 tbv_tbnet_minimal_free_rings(struct tbv_tbnet_minimal_session *session);
-static int
-tbv_tbnet_minimal_send_logout_request(struct tbv_tbnet_minimal_session *session,
-				      u8 sequence);
 static __be32
 tbv_tbnet_minimal_lookup_proxy_ipv4(struct tbv_tbnet_identity *identity);
 
@@ -368,8 +363,7 @@ tbv_tbnet_minimal_alloc_rings(struct tbv_tbnet_minimal_session *session)
 	int hopid;
 	int ret;
 
-	if (session->identity->minimal_e2e &&
-	    session->svc->prtcstns & TBV_TBNET_E2E)
+	if (session->svc->prtcstns & TBV_TBNET_E2E)
 		flags |= RING_FLAG_E2E;
 
 	session->tx_ring = tb_ring_alloc_tx(session->xd->tb->nhi, -1,
@@ -921,7 +915,6 @@ static void tbv_tbnet_minimal_teardown_path(struct tbv_tbnet_minimal_session *s)
 	}
 	s->login_sent = false;
 	s->login_received = false;
-	s->logout_reset_sent = false;
 	s->login_retries = 0;
 	mutex_unlock(&s->lock);
 
@@ -1013,7 +1006,6 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 	struct tbv_tbip_login_params params;
 	u8 request[128];
 	u8 reply[128];
-	bool need_reset;
 	bool retry_later = false;
 	u8 sequence;
 	int ret;
@@ -1025,17 +1017,7 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 		return;
 	}
 	sequence = session->login_retries % 4;
-	need_reset = !session->login_received && !session->logout_reset_sent;
-	if (need_reset)
-		session->logout_reset_sent = true;
 	mutex_unlock(&session->lock);
-
-	if (need_reset) {
-		ret = tbv_tbnet_minimal_send_logout_request(session, sequence);
-		if (ret && ret != -ETIMEDOUT && ret != -ENODEV)
-			pr_debug("minimal TBnet logout reset route=0x%llx ret=%d\n",
-				 session->xd->route, ret);
-	}
 
 	mutex_lock(&session->lock);
 	if (session->path_enabled || session->removing) {
@@ -1139,50 +1121,6 @@ static int tbv_tbnet_minimal_send_status(
 
 	return tb_xdomain_response(session->xd, reply, len,
 				   TB_CFG_PKG_XDOMAIN_RESP);
-}
-
-static int
-tbv_tbnet_minimal_send_logout_request(struct tbv_tbnet_minimal_session *session,
-				      u8 sequence)
-{
-	struct tbv_tbip_status_result status;
-	struct tbv_tbip_control ctrl;
-	u8 request[128];
-	u8 reply[128];
-	int ret;
-	int len;
-
-	memset(&ctrl, 0, sizeof(ctrl));
-	ctrl.route = session->xd->route;
-	ctrl.sequence = sequence;
-	uuid_copy(&ctrl.initiator_uuid, session->xd->local_uuid);
-	uuid_copy(&ctrl.target_uuid, session->xd->remote_uuid);
-	ctrl.command_id = atomic_inc_return(&session->command_id);
-
-	len = tbv_tbip_build_logout(request, sizeof(request), &ctrl);
-	if (len < 0)
-		return len;
-
-	memset(reply, 0, sizeof(reply));
-	atomic64_inc(&session->identity->minimal_logout_tx);
-	atomic64_inc(&session->logout_tx);
-	ret = tb_xdomain_request(session->xd, request, len,
-				 TB_CFG_PKG_XDOMAIN_RESP, reply, sizeof(reply),
-				 TB_CFG_PKG_XDOMAIN_RESP,
-				 TBV_TBNET_MIN_LOGOUT_TIMEOUT_MS);
-	if (!ret)
-		ret = tbv_tbip_parse_status(reply, sizeof(reply), &status);
-	if (!ret &&
-	    (!tbv_tbnet_minimal_ctrl_matches(session, &status.ctrl) ||
-	     status.status)) {
-		ret = -EPROTO;
-	}
-	if (!ret) {
-		atomic64_inc(&session->identity->minimal_status_rx);
-		atomic64_inc(&session->status_rx);
-	}
-
-	return ret;
 }
 
 static int tbv_tbnet_minimal_handle_packet_common(
@@ -1385,8 +1323,7 @@ static int tbv_tbnet_minimal_probe(struct tb_service *svc,
 	mutex_unlock(&identity->lock);
 
 	tb_service_set_drvdata(svc, session);
-	queue_delayed_work(system_long_wq, &session->login_work,
-			   msecs_to_jiffies(1000));
+	queue_delayed_work(system_long_wq, &session->login_work, 0);
 	pr_info("bound minimal TBnet service id=%d route=0x%llx tx_path=%d mac=%pM prtcstns=0x%x\n",
 		svc->id, xd->route, session->local_transmit_path,
 		session->mac, svc->prtcstns);
@@ -1496,8 +1433,6 @@ int tbv_tbnet_minimal_start(struct tbv_tbnet_identity *identity)
 					       "prtcvers", 1);
 	ret = ret ?: tb_property_add_immediate(identity->minimal_dir,
 					       "prtcrevs", 1);
-	if (identity->minimal_e2e)
-		prtcstns |= TBV_TBNET_E2E;
 	ret = ret ?: tb_property_add_immediate(identity->minimal_dir,
 					       "prtcstns",
 					       prtcstns);

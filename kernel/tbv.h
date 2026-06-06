@@ -334,7 +334,6 @@ struct tbv_tbnet_identity {
 	struct notifier_block netdev_nb;
 	struct notifier_block inetaddr_nb;
 	__be32 proxy_ipv4;
-	bool minimal_e2e;
 	bool minimal_apple_only;
 	bool minimal_neighbor_seen;
 	bool minimal_dir_registered;
@@ -391,11 +390,6 @@ struct tbv_tbip_status_params {
 	u32 status;
 };
 
-struct tbv_tbip_status_result {
-	struct tbv_tbip_control ctrl;
-	u32 status;
-};
-
 struct tbv_tbip_login_response_result {
 	struct tbv_tbip_control ctrl;
 	u32 status;
@@ -411,7 +405,6 @@ struct tbv_tbnet_arp_proxy {
 struct tbv_tbnet_identity_config {
 	const char *tbnet_netdev;
 	const char *gid_netdev;
-	bool minimal_e2e;
 	bool minimal_apple_only;
 };
 
@@ -672,8 +665,6 @@ int tbv_tbip_build_login(void *buf, size_t size,
 			 const struct tbv_tbip_login_params *params);
 int tbv_tbip_build_login_response(void *buf, size_t size,
 				  const struct tbv_tbip_login_response_params *params);
-int tbv_tbip_build_logout(void *buf, size_t size,
-			  const struct tbv_tbip_control *ctrl);
 int tbv_tbip_build_status(void *buf, size_t size,
 			  const struct tbv_tbip_status_params *params);
 int tbv_tbip_parse_type(const void *buf, size_t size,
@@ -683,8 +674,6 @@ int tbv_tbip_parse_login(const void *buf, size_t size,
 			 struct tbv_tbip_login_params *params);
 int tbv_tbip_parse_login_response(const void *buf, size_t size,
 				  struct tbv_tbip_login_response_result *result);
-int tbv_tbip_parse_status(const void *buf, size_t size,
-			  struct tbv_tbip_status_result *result);
 int tbv_tbnet_arp_reply_for_request(void *reply, size_t reply_size,
 				    const void *request, size_t request_size,
 				    const struct tbv_tbnet_arp_proxy *proxy);

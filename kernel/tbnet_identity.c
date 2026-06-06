@@ -65,10 +65,6 @@ struct tbv_tbip_login_response {
 	u32 reserved[4];
 };
 
-struct tbv_tbip_logout {
-	struct tbv_tbip_header hdr;
-};
-
 struct tbv_tbip_status {
 	struct tbv_tbip_header hdr;
 	u32 status;
@@ -154,21 +150,6 @@ int tbv_tbip_build_login_response(void *buf, size_t size,
 	msg->status = params->status;
 	memcpy(msg->receiver_mac, params->receiver_mac, TBV_ETH_ALEN);
 	msg->receiver_mac_len = TBV_ETH_ALEN;
-	return sizeof(*msg);
-}
-
-int tbv_tbip_build_logout(void *buf, size_t size,
-			  const struct tbv_tbip_control *ctrl)
-{
-	struct tbv_tbip_logout *msg = buf;
-
-	if (!buf || !ctrl)
-		return -EINVAL;
-	if (size < sizeof(*msg))
-		return -ENOSPC;
-
-	memset(msg, 0, sizeof(*msg));
-	tbv_tbip_fill_header(&msg->hdr, ctrl, TBV_TBIP_LOGOUT, sizeof(*msg));
 	return sizeof(*msg);
 }
 
@@ -287,29 +268,6 @@ int tbv_tbip_parse_login_response(const void *buf, size_t size,
 	result->receiver_mac_len = msg->receiver_mac_len;
 	memcpy(result->receiver_mac, msg->receiver_mac,
 	       min_t(u32, msg->receiver_mac_len, TBV_ETH_ALEN));
-	return 0;
-}
-
-int tbv_tbip_parse_status(const void *buf, size_t size,
-			  struct tbv_tbip_status_result *result)
-{
-	const struct tbv_tbip_status *msg = buf;
-	enum tbv_tbip_type type;
-	int ret;
-
-	if (!result)
-		return -EINVAL;
-	if (size < sizeof(*msg))
-		return -EINVAL;
-
-	memset(result, 0, sizeof(*result));
-	ret = tbv_tbip_parse_header(buf, size, &type, &result->ctrl);
-	if (ret)
-		return ret;
-	if (type != TBV_TBIP_STATUS)
-		return -EPROTO;
-
-	result->status = msg->status;
 	return 0;
 }
 
@@ -847,7 +805,6 @@ int tbv_tbnet_identity_prepare(struct tbv_tbnet_identity *identity,
 
 	memset(identity, 0, sizeof(*identity));
 	identity->mode = cfg->tbnet_identity;
-	identity->minimal_e2e = identity_cfg->minimal_e2e;
 	identity->minimal_apple_only = identity_cfg->minimal_apple_only;
 	mutex_init(&identity->lock);
 	INIT_LIST_HEAD(&identity->minimal_sessions);
