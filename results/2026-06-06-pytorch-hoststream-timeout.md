@@ -1872,3 +1872,46 @@ payload completion path for RDMA WRITEs whose local source address is high in
 the coherent rocSHMEM scratch allocation. The next kernel-side split should
 measure DV WQE admission, native WRITE send completion, and DV CQE publication
 by WQE local address bucket; remote destination offset is secondary.
+
+### Full Host-Stream Source-Pinning Workaround Check
+
+Re-ran full host-stream mode (`RCCL_ROCSHMEM_GDA_BENCH_MODE=0`) with PyTorch
+validation enabled. The first split fixed both source and destination slots.
+The second split compared normal rotating slots against only pinning the source
+slot to 0 while leaving the destination slot on the normal rotating `symId`.
+
+Fixed source/destination slots, `iters=3`, `reps=3`, validation enabled:
+
+```text
+src_sym dst_sym torch_avg_us exchange_avg exchange_p50 exchange_p90 exchange_max copyin_avg copyout_avg post_avg_combined quiet_avg_combined quiet_p90_max tx_post tx_comp wr_retx rnr_retx ack_retry write_gap_rnr dv_hard wr_to wr_exh tx_err
+0       0       22442.0      22.916ms     19.672ms     41.709ms     45.639ms     0.033ms    0.035ms     866.7             1502731.4          4117984       20533   20533   0       43       752       1494          0       0     0      0
+3       0       87100.7      88.705ms     93.180ms     102.142ms    132.018ms    0.033ms    0.035ms     790.7             7704908.7          9508628       14803   14803   0       24       149       865           0       0     0      0
+0       3       20950.4      20.943ms     20.050ms     28.639ms     38.324ms     0.034ms    0.035ms     912.7             2016382.0          2455220       18619   18619   0       30       353       1117          0       0     0      0
+3       3       103833.6     106.425ms    102.076ms    135.643ms    164.639ms    0.034ms    0.035ms     791.3             10253089.4         13495832      20109   20109   0       40       314       1863          0       0     0      0
+```
+
+Rotating destination, `iters=8`, `reps=3`, validation enabled:
+
+```text
+mode          torch_avg_us exchange_by_sym_ms                         total_tx wr_retx rnr_retx ack_retry write_gap_rnr dv_hard wr_to wr_exh tx_err
+rotate-both   62826.3      sym0=16.287 sym1=59.021 sym2=84.627 sym3=91.667 39844    0       76       605       3186          0       0     0      0
+fixed-src0    22955.3      sym0=14.928 sym1=29.477 sym2=16.367 sym3=31.078 38968    0       77       798       2565          0       0     0      0
+```
+
+Log roots:
+
+```text
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-full-srcdst-src0-dst0-20260606-210412
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-full-srcdst-src3-dst0-20260606-210437
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-full-srcdst-src0-dst3-20260606-210507
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-full-srcdst-src3-dst3-20260606-210542
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-full-rotate-iters8-20260606-210718
+/mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-full-src0-dstauto-iters8-20260606-210756
+```
+
+Interpretation: the source-slot result survives the real host-stream path with
+copy-in, payload exchange, signal/wait, copy-out, and PyTorch validation. Simply
+pinning the source scratch slot to 0 while letting the destination slot rotate
+reduced the validated 1MiB all-to-all average from about 62.8ms to 23.0ms. This
+is not the root-cause fix, but it is a credible short-term app-benchmark
+workaround while the kernel/DV path is instrumented by local source address.
