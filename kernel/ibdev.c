@@ -147,6 +147,11 @@ MODULE_PARM_DESC(qp_timeout_ms,
 		 "Fallback milliseconds for pending native/Apple WRs and partial native receives "
 		 "when a QP has no verbs ACK timeout; 0 disables fallback timeout work");
 
+static uint qp_rx_timeout_multiplier = 1;
+module_param(qp_rx_timeout_multiplier, uint, 0644);
+MODULE_PARM_DESC(qp_rx_timeout_multiplier,
+		 "Scale native RX active/reorder timeout without changing TX retry cadence; 0 maps to 1, capped at 32");
+
 static uint dv_poll_interval_us = 10;
 module_param(dv_poll_interval_us, uint, 0644);
 MODULE_PARM_DESC(dv_poll_interval_us,
@@ -1036,6 +1041,8 @@ tbv_qp_rx_timeout_jiffies_locked(const struct tbv_qp *tqp,
 				 unsigned long tx_timeout)
 {
 	unsigned long rx_timeout;
+	unsigned long scaled;
+	uint multiplier;
 	u8 retry_cnt;
 
 	if (!tx_timeout)
@@ -1046,8 +1053,14 @@ tbv_qp_rx_timeout_jiffies_locked(const struct tbv_qp *tqp,
 	if (check_mul_overflow(tx_timeout, (unsigned long)retry_cnt + 1,
 			       &rx_timeout))
 		return MAX_JIFFY_OFFSET;
+	multiplier = READ_ONCE(qp_rx_timeout_multiplier);
+	if (!multiplier)
+		multiplier = 1;
+	multiplier = min_t(uint, multiplier, 32);
+	if (check_mul_overflow(rx_timeout, (unsigned long)multiplier, &scaled))
+		return MAX_JIFFY_OFFSET;
 
-	return rx_timeout;
+	return scaled;
 }
 
 static unsigned long
