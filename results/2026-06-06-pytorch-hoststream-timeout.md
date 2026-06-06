@@ -1066,3 +1066,59 @@ data_tx_posted/data_tx_completed: 111025/111025
 This makes the current Strix application-test baseline: native E2E disabled on
 AMD, duplicate replay refresh present, RNR tx-pending defer present, and
 targeted WRITE gap RNR enabled in the host profile.
+
+## Broader Application Gate
+
+With the persisted Strix profile still active (`native_write_gap_rnr=Y` on both
+hosts), a broader app gate was run:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/app-broad-writegaprnr-reps3-20260606-173906
+status: pass
+RCCL collectives: alltoall, alltoallv
+RCCL modes: fallback, hoststream, device
+RCCL sizes: 262144, 1048576, 2097152
+PyTorch collectives: all_reduce, all_gather, all_to_all
+PyTorch modes: fallback, hoststream, device
+PyTorch sizes: 1048576, 2097152
+reps: 3
+```
+
+RCCL coverage:
+
+```text
+18/18 RCCL test cases passed
+all rccl-tests validation wrong counts: 0
+alltoall 2MiB max algbw:
+  fallback=1.78 GB/s, hoststream=1.52 GB/s, device=1.58 GB/s
+alltoallv 2MiB max algbw:
+  fallback=1.73 GB/s, hoststream=1.65 GB/s, device=1.56 GB/s
+only WARNs were the expected RCCL_FORCE_ENABLE_DMABUF notices
+```
+
+PyTorch summary:
+
+```text
+fallback:   reps=3 t2_max=6779.5 us  wr_retx=0 rnr_retx=0  write_gap_rnr=0   dv_hard=0 wr_to=0 tx=102089/102089
+hoststream: reps=3 t2_max=31145.3 us wr_retx=0 rnr_retx=1  write_gap_rnr=2   dv_hard=0 wr_to=0 tx=89476/89476
+device:     reps=3 t2_max=79329.5 us wr_retx=0 rnr_retx=19 write_gap_rnr=508 dv_hard=0 wr_to=0 tx=96953/96953
+```
+
+Post-run host counters remained healthy:
+
+```text
+strix-1: verbs_qps=4 data_tx=465375/465375 data_tx_errors=0
+         data_wr_timeout=0 data_wr_retry_exhausted=0
+         data_rx_active_timeout=0 data_rx_reorder_timeout=0
+         data_rx_canceled=0
+
+strix-2: verbs_qps=4 data_tx=462035/462035 data_tx_errors=0
+         data_wr_timeout=0 data_wr_retry_exhausted=0
+         data_rx_active_timeout=0 data_rx_reorder_timeout=0
+         data_rx_canceled=0
+```
+
+This is the first broad application-level pass after the correctness fixes. It
+does not replace longer workload benchmarking, but it moves the branch from
+"focused PyTorch all_to_all still fails" to "RCCL alltoall/alltoallv and
+PyTorch all_reduce/all_gather/all_to_all all pass a small multi-mode gate."
