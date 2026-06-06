@@ -1915,3 +1915,87 @@ pinning the source scratch slot to 0 while letting the destination slot rotate
 reduced the validated 1MiB all-to-all average from about 62.8ms to 23.0ms. This
 is not the root-cause fix, but it is a credible short-term app-benchmark
 workaround while the kernel/DV path is instrumented by local source address.
+
+### USB4 Payload Chunking
+
+Added a rocSHMEM runtime knob for the USB4 optimized all-to-all payload path:
+
+```text
+ROCSHMEM_GDA_USB4_A2A_CHUNK_BYTES
+```
+
+The default is `0`, which preserves the previous single-`put_nbi_single()`
+payload WRITE. When the knob is non-zero and smaller than the payload, the
+device path splits the payload into multiple `put_nbi_single(..., signal=true)`
+WRITEs and keeps the existing single `quiet_single()` after the chunk loop.
+The app gate now exposes the knob as:
+
+```text
+--usb4-a2a-chunk-bytes N
+```
+
+Because RCCL statically links rocSHMEM into `librccl.so.1.0`, rebuilding only
+rocSHMEM is not enough for PyTorch/RCCL runs. The active rebuilt installs were:
+
+```text
+rocSHMEM: /mnt/Home/tmp/rocshmem-waitbudget-install
+RCCL:     /mnt/Home/tmp/rccl-hoststream-waitbudget-install
+```
+
+`strings` on the rebuilt RCCL confirmed that `librccl.so.1.0` contains
+`ROCSHMEM_GDA_USB4_A2A_CHUNK_BYTES`.
+
+Payload-only 4 MiB discriminator, `ROCSHMEM_GDA_USB4_ALLTOALL_MODE=1`,
+validation disabled, `iters=4`, `reps=2`:
+
+```text
+chunk   log root                                                          avg_us   min_us   max_us   wr_retx rnr_retx ack_retry late_ack dup_ack write_gap_rnr hard
+1MiB    /mnt/Home/tmp/tbv-app-gate-logs/pytorch-chunk1m-payload-4m-20260606-2232   46655.9  5856.4  87455.4  0       5        24        152      4       123           0
+512KiB  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-chunk512k-payload-4m-20260606-2235  7001.0   5564.1  8437.9   0       5        5         218      5       79            0
+256KiB  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-chunk256k-payload-4m-20260606-2237  25989.5  6511.0  45468.1  1       4        5         474      69      19            0
+```
+
+The 512 KiB chunk is the best tested point so far: it keeps the fast run near
+5.6ms and collapses the two-rep average from the old unchunked payload-only
+4 MiB baseline of about 52.0ms to about 7.0ms. The 1 MiB chunk can be fast, but
+still has an 87ms tail when write-gap/RNR recovery appears. The 256 KiB chunk
+increases ACK/retry noise and produced one recovered WR retransmit, so smaller
+chunks are not automatically better.
+
+Validated full PyTorch hoststream runs with 512 KiB chunks:
+
+```text
+case             log root                                                             avg_us   min_us   max_us   wr_retx rnr_retx ack_retry late_ack dup_ack write_gap_rnr tx_post/tx_comp hard
+4MiB single-size  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-chunk512k-full-4m-validate-20260606-2240   11943.0  8834.9  15051.1  0       7        38        352      6       108           23504/23504   0
+16MiB single-rep  /mnt/Home/tmp/tbv-app-gate-logs/pytorch-chunk512k-full-16m-validate-20260606-2242  65556.7  65556.7 65556.7  0       5        39        284      3       94            27217/27217   0
+```
+
+The previous SG-cursor-fixed full baseline was about 82.1ms at 4 MiB and
+about 1.02s at 16 MiB. With 512 KiB chunks, the single-size validated runs
+improved those to about 11.9ms and 65.6ms respectively.
+
+The final validated sweep used 512 KiB chunks, sizes 1/4/16 MiB, `iters=4`,
+`reps=2`, and validation enabled:
+
+```text
+log root: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-chunk512k-full-sweep-20260606-2244
+
+bytes     avg_us   min_us   max_us   gbps_max
+1MiB      2822.4   2585.7   3059.2   3.24
+4MiB      6693.6   5966.7   7420.5   5.62
+16MiB     29032.8  27306.1  30759.6  4.92
+
+aggregate counters:
+wr_retx=0 rnr_retx=22 ack_retry=26 late_ack=1420 dup_ack=20
+write_gap_rnr=359 dv_hard=0 wr_timeout=0 wr_retry_exhausted=0
+data_tx_errors=0 data_tx_posted=119662 data_tx_completed=119662
+```
+
+Interpretation: the large-message bottleneck after the SG cursor fix was
+strongly tied to posting one very large USB4 all-to-all payload WRITE. Splitting
+the payload into 512 KiB WRITEs bounds the completion tail enough to make
+validated PyTorch hoststream 4 MiB and 16 MiB all-to-all usable for the next
+application-level gates. It does not eliminate the underlying native
+write-gap/RNR recovery path; those counters still move, but they now recover
+without hard errors, timeouts, TX errors, or TX completion leaks in the tested
+matrix.

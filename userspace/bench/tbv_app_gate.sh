@@ -35,6 +35,7 @@ hoststream_fixed_dst_symid=${TBV_RCCL_HOSTSTREAM_FIXED_DST_SYMID:-${RCCL_ROCSHME
 hoststream_addr_log=${TBV_RCCL_HOSTSTREAM_ADDR_LOG:-${RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG:-}}
 usb4_a2a_post_log=${TBV_ROCSHMEM_USB4_A2A_POST_LOG:-${ROCSHMEM_GDA_USB4_A2A_POST_LOG:-}}
 usb4_a2a_timing_log=${TBV_ROCSHMEM_USB4_A2A_TIMING_LOG:-${ROCSHMEM_GDA_USB4_A2A_TIMING_LOG:-}}
+usb4_a2a_chunk_bytes=${TBV_ROCSHMEM_USB4_A2A_CHUNK_BYTES:-${ROCSHMEM_GDA_USB4_A2A_CHUNK_BYTES:-}}
 usb4_alltoall_mode=${TBV_ROCSHMEM_USB4_ALLTOALL_MODE:-${ROCSHMEM_GDA_USB4_ALLTOALL_MODE:-}}
 usb4_alltoall_ack=${TBV_ROCSHMEM_USB4_ALLTOALL_ACK:-${ROCSHMEM_GDA_USB4_ALLTOALL_ACK:-}}
 
@@ -102,6 +103,7 @@ Options:
                             Set RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG
   --usb4-a2a-post-log N     Set ROCSHMEM_GDA_USB4_A2A_POST_LOG
   --usb4-a2a-timing-log N   Set ROCSHMEM_GDA_USB4_A2A_TIMING_LOG
+  --usb4-a2a-chunk-bytes N  Set ROCSHMEM_GDA_USB4_A2A_CHUNK_BYTES
   --usb4-alltoall-mode N    Set ROCSHMEM_GDA_USB4_ALLTOALL_MODE
   --usb4-alltoall-ack 0|1   Set ROCSHMEM_GDA_USB4_ALLTOALL_ACK
   --skip-rccl               Do not run rccl-tests gates
@@ -154,6 +156,7 @@ while (($#)); do
     --hoststream-addr-log) hoststream_addr_log=$2; shift 2 ;;
     --usb4-a2a-post-log) usb4_a2a_post_log=$2; shift 2 ;;
     --usb4-a2a-timing-log) usb4_a2a_timing_log=$2; shift 2 ;;
+    --usb4-a2a-chunk-bytes) usb4_a2a_chunk_bytes=$2; shift 2 ;;
     --usb4-alltoall-mode) usb4_alltoall_mode=$2; shift 2 ;;
     --usb4-alltoall-ack) usb4_alltoall_ack=$2; shift 2 ;;
     --skip-rccl) run_rccl=0; shift ;;
@@ -532,6 +535,7 @@ setup_app_env() {
   export ROCSHMEM_GDA_USB4_ROUTE_TRACE=${ROCSHMEM_GDA_USB4_ROUTE_TRACE:-0}
   export ROCSHMEM_GDA_USB4_A2A_POST_LOG=${ROCSHMEM_GDA_USB4_A2A_POST_LOG:-0}
   export ROCSHMEM_GDA_USB4_A2A_TIMING_LOG=${ROCSHMEM_GDA_USB4_A2A_TIMING_LOG:-0}
+  export ROCSHMEM_GDA_USB4_A2A_CHUNK_BYTES=${ROCSHMEM_GDA_USB4_A2A_CHUNK_BYTES:-0}
   export ROCSHMEM_GDA_USB4_ALLTOALL_MODE=${ROCSHMEM_GDA_USB4_ALLTOALL_MODE:-0}
   export ROCSHMEM_GDA_USB4_ALLTOALL_ACK=${ROCSHMEM_GDA_USB4_ALLTOALL_ACK:-0}
   export IB_GID_INDEX=${IB_GID_INDEX:-1}
@@ -617,6 +621,7 @@ run_rccl_case() {
       -x ROCSHMEM_GDA_PROVIDER -x ROCSHMEM_GDA_ENABLE_DMABUF -x ROCSHMEM_HCA_LIST -x ROCSHMEM_HEAP_SIZE \
       -x ROCSHMEM_MAX_NUM_TEAMS -x ROCSHMEM_DEBUG_LEVEL -x ROCSHMEM_GDA_USB4_ROUTE_TRACE -x IB_GID_INDEX \
       -x ROCSHMEM_GDA_USB4_A2A_POST_LOG -x ROCSHMEM_GDA_USB4_A2A_TIMING_LOG \
+      -x ROCSHMEM_GDA_USB4_A2A_CHUNK_BYTES \
       -x ROCSHMEM_GDA_USB4_ALLTOALL_MODE -x ROCSHMEM_GDA_USB4_ALLTOALL_ACK \
       -x ROCSHMEM_GDA_QP_TIMEOUT -x ROCSHMEM_GDA_QP_RETRY_CNT -x ROCSHMEM_GDA_QP_RNR_RETRY \
       -x RCCL_ROCSHMEM_ENABLE -x RCCL_ROCSHMEM_FORCE_ENABLE -x RCCL_ROCSHMEM_THRESHOLD \
@@ -726,6 +731,7 @@ build_torch_remote_command() {
     "ROCSHMEM_GDA_USB4_ROUTE_TRACE=${ROCSHMEM_GDA_USB4_ROUTE_TRACE:-0}"
     "ROCSHMEM_GDA_USB4_A2A_POST_LOG=${ROCSHMEM_GDA_USB4_A2A_POST_LOG:-0}"
     "ROCSHMEM_GDA_USB4_A2A_TIMING_LOG=${ROCSHMEM_GDA_USB4_A2A_TIMING_LOG:-0}"
+    "ROCSHMEM_GDA_USB4_A2A_CHUNK_BYTES=${ROCSHMEM_GDA_USB4_A2A_CHUNK_BYTES:-0}"
     "ROCSHMEM_GDA_USB4_ALLTOALL_MODE=${ROCSHMEM_GDA_USB4_ALLTOALL_MODE:-0}"
     "ROCSHMEM_GDA_USB4_ALLTOALL_ACK=${ROCSHMEM_GDA_USB4_ALLTOALL_ACK:-0}"
     "ROCSHMEM_GDA_QP_TIMEOUT=${ROCSHMEM_GDA_QP_TIMEOUT:-14}"
@@ -862,6 +868,9 @@ fi
 if [[ -n "$usb4_a2a_timing_log" ]]; then
   export ROCSHMEM_GDA_USB4_A2A_TIMING_LOG=$usb4_a2a_timing_log
 fi
+if [[ -n "$usb4_a2a_chunk_bytes" ]]; then
+  export ROCSHMEM_GDA_USB4_A2A_CHUNK_BYTES=$usb4_a2a_chunk_bytes
+fi
 if [[ -n "$usb4_alltoall_mode" ]]; then
   export ROCSHMEM_GDA_USB4_ALLTOALL_MODE=$usb4_alltoall_mode
 fi
@@ -889,6 +898,7 @@ echo "  hoststream_fixed_dst_symid=${hoststream_fixed_dst_symid:-auto}"
 echo "  hoststream_addr_log=${hoststream_addr_log:-0}"
 echo "  usb4_a2a_post_log=${usb4_a2a_post_log:-0}"
 echo "  usb4_a2a_timing_log=${usb4_a2a_timing_log:-0}"
+echo "  usb4_a2a_chunk_bytes=${usb4_a2a_chunk_bytes:-0}"
 echo "  usb4_alltoall_mode=${usb4_alltoall_mode:-0}"
 echo "  usb4_alltoall_ack=${usb4_alltoall_ack:-0}"
 
