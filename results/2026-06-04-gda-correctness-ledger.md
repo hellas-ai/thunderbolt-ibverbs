@@ -3085,3 +3085,118 @@ Interpretation:
    it happened with DV inactive, the kernel counters were clean, and a
    fallback-only 5x rerun passed. Treat it as an app/RCCL benchmark-harness
    flake to watch, not a GDA correctness failure.
+
+### Repeated RCCL All-To-Allv Gate
+
+Ran a smaller repeated all-to-allv gate because `alltoallv_perf` has shown much
+larger latency swings than `alltoall_perf`:
+
+```text
+log root: /tmp/usb4-rccl-gda-20260606-89bcec0/repeated-alltoallv-051614
+sizes: 65536, 131072, 262144, 524288
+iters/warmup: 5/2
+validation: enabled (-c 1)
+MPI TCP iface: eno1
+counter hosts: strix-1,strix-2
+```
+
+The benchmark wrapper itself completed all nine runs successfully. The enclosing
+login shell returned non-zero only after the run because `/etc/bash_logout`
+references an unset variable under `set -u`; no RCCL row failed.
+
+Fallback RCCL:
+
+```text
+fallback RCCL, RCCL_ROCSHMEM_ENABLE=0:
+  65536 B out-of-place median: 1980.56 us (min 1830.12, max 1995.29)
+  131072 B out-of-place median: 2197.82 us (min 1999.63, max 2298.53)
+  262144 B out-of-place median: 2093.38 us (min 1998.46, max 2199.13)
+  524288 B out-of-place median: 2396.52 us (min 1996.82, max 2595.33)
+  dv_poll_wqes sum +0 for every rep
+```
+
+Host-stream GDA:
+
+```text
+host-stream GDA, RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=1:
+  65536 B out-of-place median: 2769.82 us (min 2549.08, max 2782.54)
+  131072 B out-of-place median: 2893.60 us (min 2718.38, max 2913.57)
+  262144 B out-of-place median: 3316.22 us (min 3091.31, max 4092.92)
+  524288 B out-of-place median: 4729.65 us (min 4465.75, max 5730.65)
+  dv_poll_wqes sum +256 for every rep
+```
+
+Device/default GDA:
+
+```text
+device/default GDA, RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL=0:
+  65536 B out-of-place median: 5176.12 us (min 4577.30, max 5578.00)
+  131072 B out-of-place median: 4791.44 us (min 3987.76, max 5192.52)
+  262144 B out-of-place median: 5591.29 us (min 5393.34, max 5993.62)
+  524288 B out-of-place median: 6587.20 us (min 6389.95, max 7200.99)
+  dv_poll_wqes sum +256 for every rep
+```
+
+All all-to-allv runs were correctness-clean:
+
+```text
+wrong=0 for every out-of-place validated row
+dv_hard_error sum              +0
+data_wr_copy_error sum         +0
+data_wr_timeout sum            +0
+data_wr_retry_exhausted sum    +0
+data_tx_errors sum             +0
+data_rx_canceled sum           +0
+data_rx_no_qp sum              +0
+data_rx_no_qp_reack sum        +0
+data_rx_no_qp_error_ack sum    +0
+data_qp_tombstone_evicted sum  +0
+```
+
+Final post-all-to-allv health:
+
+```text
+strix-1:
+dv_poll_wqes=2820
+dv_hard_error=0
+data_wr_copy_error=0
+data_wr_retransmit=21
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=205647
+data_tx_completed=205647
+data_tx_errors=0
+data_rx_canceled=4096
+data_rx_no_qp=0
+data_qp_tombstone_evicted=0
+
+strix-2:
+dv_poll_wqes=2820
+dv_hard_error=0
+data_wr_copy_error=0
+data_wr_retransmit=25
+data_wr_retry_exhausted=0
+data_wr_timeout=0
+data_tx_posted=205254
+data_tx_completed=205254
+data_tx_errors=0
+data_rx_canceled=0
+data_rx_no_qp=0
+data_qp_tombstone_evicted=0
+```
+
+No matching `BUG`, `Oops`, `panic`, watchdog, lockup, hard-error, timeout,
+GPU-fault, or tombstone-cap warning appeared in the last 400 dmesg lines on
+either host.
+
+Interpretation:
+
+1. `alltoallv_perf` now clears the same cautious app-level correctness bar as
+   `alltoall_perf`: fallback stays off DV, both GDA modes exercise DV, and the
+   kernel remains clean after repeated validated rows.
+2. The performance ranking matches all-to-all: fallback fastest, host-stream GDA
+   slower, device/default GDA slower again.
+3. The GDA path is now ready for broader RCCL/rocSHMEM characterization. vLLM is
+   still a separate end-to-end sanity target, not the best next diagnostic,
+   because the validated GDA collectives are all-to-all/all-to-allv rather than
+   vLLM's dominant all-reduce/all-gather traffic.
