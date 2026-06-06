@@ -1358,3 +1358,65 @@ constant. That rules out "rocSHMEM heap allocation only" as the whole cause and
 keeps the next discriminator focused on the per-slot address/translation path:
 log the actual scratch addresses and registration keys for each slot, then
 split source-vs-destination backing if needed.
+
+### Host-Coherent Source/Destination Split
+
+Split the fixed `symId=1` host-stream probe by scratch backing:
+
+```text
+source coherent, destination heap:
+  log: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-srccoh-destheap-fixedsym1-writegaprnr5-qptimeout14-20260606-181355
+source heap, destination coherent:
+  log: /mnt/Home/tmp/tbv-app-gate-logs/pytorch-hoststream-srcheap-destcoh-fixedsym1-writegaprnr5-qptimeout14-20260606-181502
+status: both pass, 5/5
+```
+
+Application timing:
+
+```text
+source coherent, destination heap:
+  1MiB/rank n=5 min=20996.7us avg=57137.3us  max=147567.6us
+  2MiB/rank n=5 min=45793.8us avg=144160.3us max=414666.3us
+
+source heap, destination coherent:
+  1MiB/rank n=5 min=21156.5us avg=49574.8us  max=143106.6us
+  2MiB/rank n=5 min=61456.5us avg=137322.9us max=367258.1us
+```
+
+Host-stream exchange timing:
+
+```text
+source coherent, destination heap:
+  msgSize=2097152  n=90 exchange_avg=54.951ms  p50=21.290ms p90=119.791ms p99=244.185ms max=244.185ms
+  msgSize=4194304  n=90 exchange_avg=137.898ms p50=83.486ms p90=233.906ms p99=895.682ms max=895.682ms
+
+source heap, destination coherent:
+  msgSize=2097152  n=90 exchange_avg=48.026ms  p50=24.553ms p90=82.395ms  p99=302.088ms max=302.088ms
+  msgSize=4194304  n=90 exchange_avg=137.345ms p50=90.149ms p90=237.898ms p99=1030.954ms max=1030.954ms
+```
+
+Counters stayed correctness-clean:
+
+```text
+source coherent, destination heap:
+  wr_retx=0 rnr_retx=135 write_gap_rnr=3049
+  dv_hard=0 wr_timeout=0 wr_retry_exhausted=0
+  reorder_timeout=0 active_timeout=0 tx=139653/139653
+
+source heap, destination coherent:
+  wr_retx=0 rnr_retx=120 write_gap_rnr=4007
+  dv_hard=0 wr_timeout=0 wr_retry_exhausted=0
+  reorder_timeout=0 active_timeout=0 tx=135518/135518
+```
+
+Post-run host counters remained healthy on both Strix hosts: no no-QP frames,
+no RX cancels, no active/reorder timeouts, no DV hard errors, and balanced TX.
+
+Interpretation: the slow fixed `symId=1` path is not caused solely by source
+heap backing or solely by destination heap backing. Host-coherent backing on
+both sides is the best `symId=1` result so far, but every fixed `symId=1`
+variant remains much slower than fixed `symId=0`. The next useful
+instrumentation is address-level: log the base pointer, per-slot pointer,
+slot offset, backing mode, and any available registration/remote-key metadata
+for source and destination scratch so the `+128MiB` slot can be tied to actual
+local and remote translations.
