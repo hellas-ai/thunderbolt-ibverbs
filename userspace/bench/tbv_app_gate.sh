@@ -136,6 +136,19 @@ host_list() {
   done
 }
 
+torch_collectives_include_all_to_all() {
+  local raw=$1
+  local item
+
+  raw=${raw//,/ }
+  for item in $raw; do
+    case "$item" in
+      all_to_all|alltoall|all_to_all_single) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 safe_name() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
 }
@@ -357,6 +370,26 @@ configure_mode() {
   export RCCL_ROCSHMEM_THRESHOLD=${RCCL_ROCSHMEM_THRESHOLD:-1048576}
   export RCCL_ROCSHMEM_GDA_BENCH_MODE=${RCCL_ROCSHMEM_GDA_BENCH_MODE:-0}
   export RCCL_ROCSHMEM_HOST_STREAM_TIMING=${RCCL_ROCSHMEM_HOST_STREAM_TIMING:-0}
+  export ROCSHMEM_GDA_QP_TIMEOUT=${ROCSHMEM_GDA_QP_TIMEOUT:-14}
+  export ROCSHMEM_GDA_QP_RETRY_CNT=${ROCSHMEM_GDA_QP_RETRY_CNT:-7}
+  export ROCSHMEM_GDA_QP_RNR_RETRY=${ROCSHMEM_GDA_QP_RNR_RETRY:-7}
+}
+
+assert_pytorch_validation_mode() {
+  local mode=$1
+
+  [[ "$pytorch_validate" == 1 ]] || return 0
+  [[ "$mode" == hoststream ]] || return 0
+  torch_collectives_include_all_to_all "$pytorch_collectives" || return 0
+  [[ "${RCCL_ROCSHMEM_GDA_BENCH_MODE:-0}" == 0 ]] && return 0
+
+  cat >&2 <<EOF
+ERROR: PyTorch all_to_all validation requires RCCL_ROCSHMEM_GDA_BENCH_MODE=0.
+Modes 1-5 are phase probes; they intentionally skip parts of the all_to_all
+pipeline and can return zero or partial payloads. Re-run with
+--torch-validate 0 for phase timing, or use bench mode 0 for correctness.
+EOF
+  exit 2
 }
 
 setup_app_env() {
@@ -481,6 +514,7 @@ run_rccl_case() {
       -x HIP_VISIBLE_DEVICES -x ROCR_VISIBLE_DEVICES -x HSA_NO_SCRATCH_RECLAIM -x HSA_OVERRIDE_GFX_VERSION \
       -x ROCSHMEM_GDA_PROVIDER -x ROCSHMEM_GDA_ENABLE_DMABUF -x ROCSHMEM_HCA_LIST -x ROCSHMEM_HEAP_SIZE \
       -x ROCSHMEM_MAX_NUM_TEAMS -x ROCSHMEM_DEBUG_LEVEL -x ROCSHMEM_GDA_USB4_ROUTE_TRACE -x IB_GID_INDEX \
+      -x ROCSHMEM_GDA_QP_TIMEOUT -x ROCSHMEM_GDA_QP_RETRY_CNT -x ROCSHMEM_GDA_QP_RNR_RETRY \
       -x RCCL_ROCSHMEM_ENABLE -x RCCL_ROCSHMEM_FORCE_ENABLE -x RCCL_ROCSHMEM_THRESHOLD \
       -x RCCL_ROCSHMEM_SOURCE_HEAP -x RCCL_ROCSHMEM_DEST_HEAP -x RCCL_ROCSHMEM_HOST_STREAM_ALLTOALL \
       -x RCCL_ROCSHMEM_GDA_BENCH_MODE -x RCCL_ROCSHMEM_HOST_STREAM_TIMING \
@@ -582,6 +616,9 @@ build_torch_remote_command() {
     "ROCSHMEM_MAX_NUM_TEAMS=${ROCSHMEM_MAX_NUM_TEAMS:-1}"
     "ROCSHMEM_DEBUG_LEVEL=${ROCSHMEM_DEBUG_LEVEL:-ERROR}"
     "ROCSHMEM_GDA_USB4_ROUTE_TRACE=${ROCSHMEM_GDA_USB4_ROUTE_TRACE:-0}"
+    "ROCSHMEM_GDA_QP_TIMEOUT=${ROCSHMEM_GDA_QP_TIMEOUT:-14}"
+    "ROCSHMEM_GDA_QP_RETRY_CNT=${ROCSHMEM_GDA_QP_RETRY_CNT:-7}"
+    "ROCSHMEM_GDA_QP_RNR_RETRY=${ROCSHMEM_GDA_QP_RNR_RETRY:-7}"
     "IB_GID_INDEX=${IB_GID_INDEX:-1}"
     "RCCL_ROCSHMEM_ENABLE=$RCCL_ROCSHMEM_ENABLE"
     "RCCL_ROCSHMEM_FORCE_ENABLE=$RCCL_ROCSHMEM_FORCE_ENABLE"
@@ -633,6 +670,7 @@ run_pytorch_case() {
 
   require_dir "TBV_PYTORCH_WRAPPER/VLLM_USB4_ENV" "$pytorch_wrapper"
   configure_mode "$mode"
+  assert_pytorch_validation_mode "$mode"
   mkdir -p "$logdir"
 
   capture_counters "$before_label" "$logdir/counters" "$counter_hosts"

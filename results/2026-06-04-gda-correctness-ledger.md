@@ -4149,3 +4149,130 @@ Interpretation:
    correctness of PyTorch/RCCL all-to-all, but performance variability in the
    rocSHMEM exchange phase and the fact that vLLM's dominant collectives still
    do not exercise this GDA path.
+
+### 2026-06-06 PyTorch validation-mode correction and QP timeout sweep
+
+Follow-up retesting found a methodology error in the previous mode-5 PyTorch
+validation interpretation. `RCCL_ROCSHMEM_GDA_BENCH_MODE=5` is a phase probe,
+not a full all-to-all implementation: the host-stream path runs exchange plus
+copy-out, but intentionally skips copy-in. Payload validation of PyTorch
+`all_to_all`/`all_to_all_single` is therefore meaningful only in bench mode 0.
+The app gate now rejects validated PyTorch all-to-all runs in host-stream phase
+modes 1-5 and tells the caller to use `--torch-validate 0` for phase timing or
+bench mode 0 for correctness.
+
+The same gate now forwards the rocSHMEM GDA RC QP attributes when present:
+
+```text
+ROCSHMEM_GDA_QP_TIMEOUT
+ROCSHMEM_GDA_QP_RETRY_CNT
+ROCSHMEM_GDA_QP_RNR_RETRY
+```
+
+Valid mode-0 controls:
+
+```text
+known-good RCCL/rocSHMEM, 4 reps:
+  /tmp/tbv-app-gate-pytorch-hoststream-mode0-known-good-validate-20260606-080405
+  status: pass 4/4
+  data_wr_retransmit: +1
+  data_wr_timeout/retry_exhausted/no_qp/canceled: +0
+  data_tx_posted == data_tx_completed
+
+local QP-env rocSHMEM/RCCL build, timeout exponent 14, 4 reps:
+  /tmp/tbv-app-gate-pytorch-hoststream-mode0-qptimeout14-goodbc-validate-20260606-080445
+  status: pass 4/4
+  data_wr_retransmit: +6
+  data_wr_timeout/retry_exhausted/no_qp/canceled: +0
+  data_tx_posted == data_tx_completed == +7443
+```
+
+QP timeout exponent sweep, all with PyTorch payload validation enabled, bench
+mode 0, sizes `131072,524288`, iters `2`:
+
+```text
+timeout 10:
+  /tmp/tbv-app-gate-pytorch-hoststream-mode0-qptimeout10-goodbc-validate-20260606-080809
+  status: fail 7/8
+  failure: HSA hardware exception in rocshmem_alltoallmem_kernel
+  dv_hard_error: +1
+  data_wr_retransmit: +12
+  data_wr_timeout/retry_exhausted/no_qp/canceled: +0
+
+timeout 11:
+  /tmp/tbv-app-gate-pytorch-hoststream-mode0-qptimeout11-goodbc-validate-20260606-080940
+  status: fail 7/8
+  failure: HSA hardware exception in rocshmem_alltoallmem_kernel
+  dv_hard_error: +1
+  data_wr_retransmit: +30
+  data_wr_timeout/retry_exhausted/no_qp/canceled: +0
+
+timeout 12:
+  /tmp/tbv-app-gate-pytorch-hoststream-mode0-qptimeout12-goodbc-validate-long-20260606-081213
+  status: fail 31/32
+  failure: HSA hardware exception in rocshmem_alltoallmem_kernel
+  dv_hard_error: +1
+  data_wr_retransmit: +104
+  data_wr_timeout/retry_exhausted/no_qp/canceled: +0
+
+timeout 13:
+  /tmp/tbv-app-gate-pytorch-hoststream-mode0-qptimeout13-goodbc-validate-long-20260606-081901
+  status: fail 30/32
+  failure: strict counter gate only
+  data_rx_no_qp: +6
+  data_rx_no_qp_native_non_ack: +6
+  data_rx_no_qp_opcode_2: +6
+  dv_hard_error: +0
+  data_wr_timeout/retry_exhausted/canceled: +0
+
+timeout 14:
+  /tmp/tbv-app-gate-pytorch-hoststream-mode0-qptimeout14-goodbc-validate-long-20260606-082224
+  status: fail 31/32
+  failure: strict counter gate only
+  data_rx_no_qp: +2
+  data_rx_no_qp_native_non_ack: +2
+  data_rx_no_qp_opcode_2: +2
+  dv_hard_error: +0
+  data_wr_retransmit: +53
+  data_wr_timeout/retry_exhausted/canceled: +0
+  data_tx_posted == data_tx_completed == +60006
+```
+
+Opcode 2 is `TBV_NATIVE_DATA_OP_SEND_ACK`. The `native_non_ack` bucket is
+therefore a poor human label for this case; it means the opcode is not one of
+the data opcodes that requires a SEND_ACK response, not that the frame is not an
+ACK. The timeout-13/14 failures are late SEND_ACK frames arriving after the
+target QP has been destroyed. They did not produce payload mismatches, WR
+timeouts, retry exhaustion, RX cancels, DV hard errors, or TX imbalance. They
+remain a lifecycle/accounting wart, but they are distinct from the earlier
+retransmit-to-dead-QP tombstone correctness bug.
+
+A dependency-complete packaged known-good long control stayed clean over the
+same validated mode-0 shape:
+
+```text
+log root:
+  /tmp/tbv-app-gate-pytorch-hoststream-mode0-known-good-validate-long-clean-20260606-082834
+status: pass 32/32
+data_wr_retransmit: +67
+data_rx_no_qp/opcode_2: +0
+dv_hard_error: +0
+data_wr_timeout/retry_exhausted/canceled: +0
+data_tx_posted == data_tx_completed == +61469
+exchangeMs n=384 avg=32.622 p50=4.445 p90=95.936 p95=169.700 p99=351.379 max=417.483
+```
+
+Conclusions:
+
+1. The payload-correct application benchmark baseline is mode 0. Phase modes are
+   timing probes only.
+2. QP timeout exponents 10, 11, and 12 are too aggressive for the current
+   GPU-origin/DV application path: software retransmit may recover the WR, but
+   the GPU can still observe a hard DV/HSA error.
+3. Exponents 13 and 14 avoid the observed DV hard-error class in these 32-rep
+   runs, but the local QP-env build still exposes intermittent late SEND_ACK
+   no-QP teardown noise under the strict gate.
+4. The packaged known-good stack does not show that no-QP teardown noise in the
+   matching long control, so do not attribute it to the kernel baseline alone.
+   It needs a sharper local ROCm/RCCL/rocSHMEM comparison before changing
+   kernel behavior or relaxing the hard gate.
