@@ -4631,3 +4631,103 @@ Current app-level benchmark readiness:
    skipped.
 4. The next performance task is still the rocSHMEM exchange-phase tail, not a
    currently observed kernel correctness counter.
+
+### 2026-06-06 Post-Boot Autoload And App Gate
+
+The operational boot gap above is fixed and deployed.
+
+Code/config commits:
+
+```text
+thunderbolt-ibverbs GDA:
+  5f3ddb2 nix: wait for full ibverbs readiness in boot check
+deploy input used by nixos-config:
+  693ae75 nix: wait for full ibverbs readiness in boot check
+nixos-config:
+  06dc1ce strix: load thunderbolt ibverbs at boot
+```
+
+The check helper now polls the complete requested runtime state until timeout
+instead of failing as soon as `debugfs/summary` exists. This matters because
+`thunderbolt_ibverbs` loads several seconds before XDomain discovery registers
+the verbs devices and marks rails data-ready.
+
+Colmena deployment:
+
+```text
+nix run .#colmena -- --impure apply boot --reboot --on strix-1,strix-2
+
+strix-1 system:
+  /nix/store/32gn8141ninvllihvr28k2lxjmx8dcgf-nixos-system-strix-1-26.11pre-git
+strix-2 system:
+  /nix/store/c0z10al6fpp8gp7chr34ipc0g6xizsg9-nixos-system-strix-2-26.11pre-git
+```
+
+Both hosts rebooted and the boot-time check succeeded without manual reload:
+
+```text
+strix-1:
+  thunderbolt-ibverbs-check.service: success
+  wall clock: 7.112s
+  ibv_devices: usb4_rdma5 usb4_rdma6 usb4_rdma0 usb4_rdma1
+
+strix-2:
+  thunderbolt-ibverbs-check.service: success
+  wall clock: 7.100s
+  ibv_devices: usb4_rdma5 usb4_rdma6 usb4_rdma0 usb4_rdma1
+
+both:
+  profile=linux_perf
+  native_control=source_aware
+  native_qp_tombstone_reack=1
+  native_qp_tombstone_max=4096
+  native_retransmit_teardown_guard=1
+  native_ack_repeat=1
+  verbs_registered=1
+  dv_poll_running=1
+  all four native rails active/data_ready
+  native E2E disabled on every rail
+```
+
+Post-reboot PyTorch host-stream GDA gate, using the boot-loaded module state:
+
+```text
+/tmp/tbv-app-gate-pytorch-hoststream-postboot-waitbudget-threshold4m-qptimeout14-20260606-104300
+status: pass 3/3
+sizes: 1048576,2097152
+iters: 4
+RCCL_ROCSHMEM_THRESHOLD=4194304
+RCCL_ROCSHMEM_GDA_BENCH_MODE=0
+ROCSHMEM_GDA_QP_TIMEOUT=14
+local RCCL:
+  /mnt/Home/tmp/rccl-hoststream-waitbudget-install/lib/librccl.so.1
+local rocSHMEM:
+  /mnt/Home/tmp/rocshmem-waitbudget-install
+```
+
+Final counters were symmetric on both hosts:
+
+```text
+dv_poll_wqes: 60
+dv_poll_errors/dv_hard_error: 0/0
+data_wr_send: 300
+data_wr_retransmit: 14
+data_wr_retry_exhausted/data_wr_timeout: 0/0
+data_wr_retransmit_closing_qp/no_live_path/teardown_path: 0/0/0
+data_rx_ack: 810
+data_rx_ack_matched: 300
+data_rx_ack_match_retried: 9
+data_rx_ack_match_max_ms: 287ms on strix-1, 323ms on strix-2
+data_rx_late_ack: 318
+data_rx_duplicate_ack: 9
+data_rx_no_qp_reack/data_rx_no_qp_error_ack/data_rx_no_qp: 0/0/0
+data_rx_active_timeout/data_rx_reorder_timeout/data_rx_canceled: 0/0/0
+```
+
+Interpretation: boot autoload is now suitable for unattended GDA testing, and
+validated PyTorch all-to-all still exercises the host-stream DV/GDA path after a
+fresh reboot. The recovered-loss path is active under application pressure
+(`data_wr_retransmit` and `data_rx_ack_match_retried` move), but it recovers
+without retry exhaustion, WR timeout, RX reorder timeout, canceled RX frames, or
+DV hard errors in this gate. Keep those recovery counters in every app benchmark
+summary; they are evidence of real transport loss being handled, not noise.
