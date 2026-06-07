@@ -75,24 +75,37 @@ counter_logs_for_root() {
   find "$1" -path '*/pytorch/*/rep-*/counters.log' -type f -print0 | sort -z
 }
 
-counter_sum() {
+counter_sums() {
   local root=$1
-  local key=$2
+  shift
+  local -a keys=("$@")
   local -a logs=()
+  local key_string
 
   mapfile -d '' -t logs < <(counter_logs_for_root "$root")
   if ((${#logs[@]} == 0)); then
-    printf '0\n'
+    for _ in "${keys[@]}"; do
+      printf '0\n'
+    done
     return 0
   fi
 
-  awk -v key="$key" '
-    $1 == key && $2 == "sum" {
+  key_string=${keys[*]}
+  awk -v keys="$key_string" '
+    BEGIN {
+      n = split(keys, ordered, " ")
+      for (i = 1; i <= n; i++) {
+        wanted[ordered[i]] = 1
+        total[ordered[i]] = 0
+      }
+    }
+    ($1 in wanted) && $2 == "sum" {
       gsub(/^\+/, "", $3)
-      total += $3
+      total[$1] += $3
     }
     END {
-      print total + 0
+      for (i = 1; i <= n; i++)
+        print total[ordered[i]] + 0
     }
   ' "${logs[@]}"
 }
@@ -223,7 +236,57 @@ dv_metrics() {
     '
 }
 
-printf 'chunk_bytes size_bytes root reps app_avg_us app_min_us app_max_us gpu_avg_us gbps_max dv_writes dv_bytes dv_avg_bytes dv_avg_ms copy_ms postcopy_ms submit_ms enqueue_ms drain_ms total_gbps copy_gbps postcopy_gbps enqueue_gbps drain_gbps wr_retx rnr_retx ack_retry late_ack dup_ack write_gap_rnr tx_rnr rx_rnr dv_hard wr_to wr_exh tx_err tx_skew root_name\n'
+classify_route() {
+  local dv_poll=$1
+  local dv_writes=$2
+  local tx_post=$3
+  local tx_comp=$4
+
+  if ((dv_poll > 0 || dv_writes > 0)); then
+    printf 'dv\n'
+  elif ((tx_post > 0 || tx_comp > 0)); then
+    printf 'copied-native\n'
+  else
+    printf 'no-tbv\n'
+  fi
+}
+
+print_fields() {
+  local -a fields=("$@")
+
+  (IFS=' '; printf '%s\n' "${fields[*]}")
+}
+
+COUNTER_KEYS=(
+  data_wr_retransmit
+  data_wr_rnr_retransmit
+  data_rx_ack_match_retried
+  data_rx_late_ack
+  data_rx_duplicate_ack
+  data_rx_write_gap_rnr
+  data_tx_ack_rnr
+  data_rx_ack_rnr
+  dv_hard_error
+  dv_poll_wqes
+  data_wr_timeout
+  data_wr_retry_exhausted
+  data_tx_errors
+  data_tx_posted
+  data_tx_completed
+)
+
+HEADER_FIELDS=(
+  chunk_bytes size_bytes root reps
+  app_avg_us app_min_us app_max_us gpu_avg_us gbps_max
+  route dv_poll_wqes
+  dv_writes dv_bytes dv_avg_bytes dv_avg_ms
+  copy_ms postcopy_ms submit_ms enqueue_ms drain_ms
+  total_gbps copy_gbps postcopy_gbps enqueue_gbps drain_gbps
+  wr_retx rnr_retx ack_retry late_ack dup_ack write_gap_rnr tx_rnr rx_rnr
+  dv_hard wr_to wr_exh tx_err tx_posted tx_completed tx_skew root_name
+)
+
+print_fields "${HEADER_FIELDS[@]}"
 
 mapfile -t roots < <(discover_roots "$@")
 for root in "${roots[@]}"; do
@@ -231,32 +294,40 @@ for root in "${roots[@]}"; do
   chunk=$(chunk_to_bytes "$root")
   name=$(safe_name "${root#/mnt/Home/tmp/tbv-app-gate-logs/}")
   dv=$(dv_metrics "$root")
-  wr_retx=$(counter_sum "$root" data_wr_retransmit)
-  rnr_retx=$(counter_sum "$root" data_wr_rnr_retransmit)
-  ack_retry=$(counter_sum "$root" data_rx_ack_match_retried)
-  late_ack=$(counter_sum "$root" data_rx_late_ack)
-  dup_ack=$(counter_sum "$root" data_rx_duplicate_ack)
-  write_gap_rnr=$(counter_sum "$root" data_rx_write_gap_rnr)
-  tx_rnr=$(counter_sum "$root" data_tx_ack_rnr)
-  rx_rnr=$(counter_sum "$root" data_rx_ack_rnr)
-  dv_hard=$(counter_sum "$root" dv_hard_error)
-  wr_to=$(counter_sum "$root" data_wr_timeout)
-  wr_exh=$(counter_sum "$root" data_wr_retry_exhausted)
-  tx_err=$(counter_sum "$root" data_tx_errors)
-  tx_post=$(counter_sum "$root" data_tx_posted)
-  tx_comp=$(counter_sum "$root" data_tx_completed)
+  mapfile -t counters < <(counter_sums "$root" "${COUNTER_KEYS[@]}")
+  if ((${#counters[@]} != ${#COUNTER_KEYS[@]})); then
+    echo "counter read failed for $root" >&2
+    exit 1
+  fi
+  wr_retx=${counters[0]}
+  rnr_retx=${counters[1]}
+  ack_retry=${counters[2]}
+  late_ack=${counters[3]}
+  dup_ack=${counters[4]}
+  write_gap_rnr=${counters[5]}
+  tx_rnr=${counters[6]}
+  rx_rnr=${counters[7]}
+  dv_hard=${counters[8]}
+  dv_poll=${counters[9]}
+  wr_to=${counters[10]}
+  wr_exh=${counters[11]}
+  tx_err=${counters[12]}
+  tx_post=${counters[13]}
+  tx_comp=${counters[14]}
   tx_skew=$((tx_post - tx_comp))
   read -r -a dv_fields <<<"$dv"
+  route=$(classify_route "$dv_poll" "${dv_fields[0]:-0}" "$tx_post" "$tx_comp")
 
   while read -r collective size reps min_us avg_us max_us gpu_avg gbps_max; do
     row=(
       "$chunk" "$size" "$root" "$reps" "$avg_us" "$min_us" "$max_us"
-      "$gpu_avg" "$gbps_max" "${dv_fields[@]}"
+      "$gpu_avg" "$gbps_max" "$route" "$dv_poll" "${dv_fields[@]}"
       "$wr_retx" "$rnr_retx" "$ack_retry" "$late_ack" "$dup_ack"
       "$write_gap_rnr" "$tx_rnr" "$rx_rnr"
-      "$dv_hard" "$wr_to" "$wr_exh" "$tx_err" "$tx_skew" "$name"
+      "$dv_hard" "$wr_to" "$wr_exh" "$tx_err"
+      "$tx_post" "$tx_comp" "$tx_skew" "$name"
     )
     [[ -n "${collective:-}" ]] || continue
-    (IFS=' '; printf '%s\n' "${row[*]}")
+    print_fields "${row[@]}"
   done < <(timing_rows "$root")
 done
