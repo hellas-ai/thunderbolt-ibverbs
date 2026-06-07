@@ -205,6 +205,24 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_bad_frame));
 	seq_printf(s, "data_rx_bad_header: %lld\n",
 		   atomic64_read(&state->data_rx_bad_header));
+	seq_printf(s, "data_rx_bad_header_parse: %lld\n",
+		   atomic64_read(&state->data_rx_bad_header_parse));
+	seq_printf(s, "data_rx_bad_header_len: %lld\n",
+		   atomic64_read(&state->data_rx_bad_header_len));
+	seq_printf(s, "data_rx_bad_header_path_credit: %lld\n",
+		   atomic64_read(&state->data_rx_bad_header_path_credit));
+	seq_printf(s, "data_rx_bad_header_opcode: %lld\n",
+		   atomic64_read(&state->data_rx_bad_header_opcode));
+	seq_printf(s, "data_rx_bad_header_recv_credit: %lld\n",
+		   atomic64_read(&state->data_rx_bad_header_recv_credit));
+	seq_printf(s, "data_rx_bad_header_ack: %lld\n",
+		   atomic64_read(&state->data_rx_bad_header_ack));
+	seq_printf(s, "data_rx_bad_header_write: %lld\n",
+		   atomic64_read(&state->data_rx_bad_header_write));
+	seq_printf(s, "data_rx_bad_header_read_req: %lld\n",
+		   atomic64_read(&state->data_rx_bad_header_read_req));
+	seq_printf(s, "data_rx_bad_header_mad: %lld\n",
+		   atomic64_read(&state->data_rx_bad_header_mad));
 	seq_printf(s, "data_rx_send: %lld\n",
 		   atomic64_read(&state->data_rx_send));
 	seq_printf(s, "data_rx_op_send: %lld\n",

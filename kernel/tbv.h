@@ -503,6 +503,15 @@ struct tbv_state {
 	atomic64_t data_rx_repost_failed;
 	atomic64_t data_rx_bad_frame;
 	atomic64_t data_rx_bad_header;
+	atomic64_t data_rx_bad_header_parse;
+	atomic64_t data_rx_bad_header_len;
+	atomic64_t data_rx_bad_header_path_credit;
+	atomic64_t data_rx_bad_header_opcode;
+	atomic64_t data_rx_bad_header_recv_credit;
+	atomic64_t data_rx_bad_header_ack;
+	atomic64_t data_rx_bad_header_write;
+	atomic64_t data_rx_bad_header_read_req;
+	atomic64_t data_rx_bad_header_mad;
 	atomic64_t data_rx_send;
 	atomic64_t data_rx_op_send;
 	atomic64_t data_rx_op_send_imm;

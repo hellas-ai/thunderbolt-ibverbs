@@ -877,14 +877,32 @@ static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 			return_rx_credits = 1;
 			tbv_path_rx_raw_payload(path, state, f->buf, len);
 		} else {
-			ret = tbv_native_data_parse_header(f->buf, len, &hdr);
-			if (!ret && hdr.opcode == TBV_NATIVE_DATA_OP_PATH_CREDIT) {
-				if (tbv_native_data_valid_path_credit(&hdr))
-					add_remote_credits = hdr.imm_data;
-				else
-					atomic64_inc(&state->data_rx_bad_header);
-			} else if (!ret &&
-				   (hdr.flags & TBV_NATIVE_DATA_F_RAW_STREAM)) {
+				ret = tbv_native_data_parse_header(f->buf, len, &hdr);
+				if (!ret && hdr.opcode == TBV_NATIVE_DATA_OP_PATH_CREDIT) {
+					if (tbv_native_data_valid_path_credit(&hdr)) {
+						add_remote_credits = hdr.imm_data;
+					} else {
+						atomic64_inc(&state->data_rx_bad_header);
+						atomic64_inc(&state->data_rx_bad_header_path_credit);
+						pr_warn_ratelimited("native RX bad header reason=path_credit frame_len=%u flags=0x%x len=%u imm=%u psn=%u peer=%u rail=%u path_id=%u route=0x%llx\n",
+								    len, hdr.flags,
+								    hdr.length, hdr.imm_data,
+								    hdr.psn,
+								    path->rail && path->rail->peer ?
+								    path->rail->peer->peer_id :
+								    U32_MAX,
+								    path->rail ?
+								    path->rail->rail_id :
+								    U32_MAX,
+								    path->rail ?
+								    path->rail->key.path_id :
+								    0,
+								    path->rail ?
+								    (unsigned long long)path->rail->key.route :
+								    0);
+					}
+				} else if (!ret &&
+					   (hdr.flags & TBV_NATIVE_DATA_F_RAW_STREAM)) {
 				if (len != TBV_NATIVE_DATA_HDR_SIZE ||
 				    !hdr.length ||
 				    (hdr.flags & ~(TBV_NATIVE_DATA_F_LAST |

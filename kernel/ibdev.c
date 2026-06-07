@@ -150,6 +150,92 @@ static bool tbv_apple_rx_trace_take(void)
 	return true;
 }
 
+static void tbv_rx_bad_header_context(const struct tbv_path *rx_path,
+				      u32 *peer_id, u32 *rail_id,
+				      u32 *path_id, u64 *route)
+{
+	*peer_id = U32_MAX;
+	*rail_id = U32_MAX;
+	*path_id = 0;
+	*route = 0;
+	if (!rx_path || !rx_path->rail)
+		return;
+
+	*rail_id = rx_path->rail->rail_id;
+	*path_id = rx_path->rail->key.path_id;
+	*route = rx_path->rail->key.route;
+	if (rx_path->rail->peer)
+		*peer_id = rx_path->rail->peer->peer_id;
+}
+
+static void tbv_rx_bad_header_note(struct tbv_state *state,
+				   struct tbv_path *rx_path,
+				   atomic64_t *reason_counter,
+				   const char *reason,
+				   const struct tbv_native_data_header *hdr,
+				   u32 frame_len, int ret)
+{
+	u32 peer_id;
+	u32 rail_id;
+	u32 path_id;
+	u64 route;
+
+	atomic64_inc(&state->data_rx_bad_header);
+	if (reason_counter)
+		atomic64_inc(reason_counter);
+
+	tbv_rx_bad_header_context(rx_path, &peer_id, &rail_id, &path_id, &route);
+	if (hdr) {
+		pr_warn_ratelimited("native RX bad header reason=%s ret=%d frame_len=%u op=%u flags=0x%x len=%u imm=%u psn=%u dst=%u src=%u off=%u peer=%u rail=%u path_id=%u route=0x%llx\n",
+				    reason, ret, frame_len, hdr->opcode,
+				    hdr->flags, hdr->length, hdr->imm_data,
+				    hdr->psn, hdr->dest_qp, hdr->src_qp,
+				    hdr->frag_offset, peer_id, rail_id, path_id,
+				    (unsigned long long)route);
+	} else {
+		pr_warn_ratelimited("native RX bad header reason=%s ret=%d frame_len=%u peer=%u rail=%u path_id=%u route=0x%llx\n",
+				    reason, ret, frame_len, peer_id, rail_id,
+				    path_id, (unsigned long long)route);
+	}
+}
+
+static void tbv_rx_bad_header_parse_note(struct tbv_state *state,
+					 struct tbv_path *rx_path,
+					 const void *data, u32 len, int ret)
+{
+	const tbv_wire_u8 *p = data;
+	u32 peer_id;
+	u32 rail_id;
+	u32 path_id;
+	u64 route;
+	u32 magic = 0;
+	u16 version = 0;
+	u16 header_size = 0;
+	u8 opcode = 0;
+	u8 flags = 0;
+
+	atomic64_inc(&state->data_rx_bad_header);
+	atomic64_inc(&state->data_rx_bad_header_parse);
+
+	if (p) {
+		if (len >= 4)
+			magic = tbv_wire_get_le32(p);
+		if (len >= 6)
+			version = tbv_wire_get_le16(p + 4);
+		if (len >= 8)
+			header_size = tbv_wire_get_le16(p + 6);
+		if (len >= 9)
+			opcode = p[8];
+		if (len >= 10)
+			flags = p[9];
+	}
+
+	tbv_rx_bad_header_context(rx_path, &peer_id, &rail_id, &path_id, &route);
+	pr_warn_ratelimited("native RX bad header reason=parse ret=%d frame_len=%u magic=0x%x version=%u hdr_size=%u op=%u flags=0x%x peer=%u rail=%u path_id=%u route=0x%llx\n",
+			    ret, len, magic, version, header_size, opcode, flags,
+			    peer_id, rail_id, path_id, (unsigned long long)route);
+}
+
 struct tbv_ucontext {
 	struct ib_ucontext base;
 	struct tbv_state *owner;
@@ -7735,7 +7821,10 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 			   last != (frag_end == total_len))) ||
 	    (!last && !hdr->length) ||
 	    !(tqp->attr.qp_access_flags & IB_ACCESS_REMOTE_WRITE)) {
-		atomic64_inc(&state->data_rx_bad_header);
+		tbv_rx_bad_header_note(state, rx_path,
+				       &state->data_rx_bad_header_write,
+				       "write", hdr,
+				       TBV_NATIVE_DATA_HDR_SIZE + hdr->length, 0);
 		tbv_send_ack_on_path(tqp, rx_path, hdr->src_qp,
 				     hdr->dest_qp, hdr->psn,
 				     TBV_NATIVE_SEND_ACK_ERROR);
@@ -8210,7 +8299,10 @@ static void tbv_rx_handle_rdma_read_req(struct tbv_state *state,
 
 	if (hdr->length || !(hdr->flags & TBV_NATIVE_DATA_F_LAST) ||
 	    (hdr->flags & ~TBV_NATIVE_DATA_F_LAST)) {
-		atomic64_inc(&state->data_rx_bad_header);
+		tbv_rx_bad_header_note(state, rx_path,
+				       &state->data_rx_bad_header_read_req,
+				       "read_req", hdr,
+				       TBV_NATIVE_DATA_HDR_SIZE + hdr->length, 0);
 		tbv_send_read_status_on_path(tqp, rx_path, hdr->src_qp,
 					     hdr->dest_qp, hdr->psn,
 					     hdr->imm_data, -EINVAL);
@@ -8387,14 +8479,20 @@ static void tbv_rx_handle_mad(struct tbv_state *state, struct tbv_path *rx_path,
 	if (!rx_path || hdr->flags != TBV_NATIVE_DATA_F_LAST ||
 	    hdr->dest_qp != TBV_GSI_QPN || hdr->src_qp != TBV_GSI_QPN ||
 	    hdr->imm_data != sizeof(struct ib_mad)) {
-		atomic64_inc(&state->data_rx_bad_header);
+		tbv_rx_bad_header_note(state, rx_path,
+				       &state->data_rx_bad_header_mad,
+				       "mad_header", hdr,
+				       TBV_NATIVE_DATA_HDR_SIZE + hdr->length, 0);
 		return;
 	}
 
 	ret = tbv_gsi_meta_parse(payload, hdr->length, &sgid, &dgid,
 				 &pkey_index, &mad, &mad_len);
 	if (ret || mad_len != sizeof(struct ib_mad)) {
-		atomic64_inc(&state->data_rx_bad_header);
+		tbv_rx_bad_header_note(state, rx_path,
+				       &state->data_rx_bad_header_mad,
+				       "mad_meta", hdr,
+				       TBV_NATIVE_DATA_HDR_SIZE + hdr->length, ret);
 		return;
 	}
 
@@ -8469,7 +8567,10 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 	case TBV_NATIVE_DATA_OP_MAD:
 		break;
 	default:
-		atomic64_inc(&state->data_rx_bad_header);
+		tbv_rx_bad_header_note(state, rx_path,
+				       &state->data_rx_bad_header_opcode,
+				       "opcode", hdr,
+				       TBV_NATIVE_DATA_HDR_SIZE + hdr->length, 0);
 		return;
 	}
 
@@ -8487,7 +8588,11 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 	if (hdr->opcode == TBV_NATIVE_DATA_OP_RECV_CREDIT) {
 		atomic64_inc(&state->data_rx_ack);
 		if (!hdr->imm_data) {
-			atomic64_inc(&state->data_rx_bad_header);
+			tbv_rx_bad_header_note(state, rx_path,
+					       &state->data_rx_bad_header_recv_credit,
+					       "recv_credit", hdr,
+					       TBV_NATIVE_DATA_HDR_SIZE +
+					       hdr->length, 0);
 			tbv_qp_put(tqp);
 			return;
 		}
@@ -8547,7 +8652,11 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 				tqp, hdr->psn, status, &acked, &matched_send);
 			break;
 		default:
-			atomic64_inc(&state->data_rx_bad_header);
+			tbv_rx_bad_header_note(state, rx_path,
+					       &state->data_rx_bad_header_ack,
+					       "send_ack", hdr,
+					       TBV_NATIVE_DATA_HDR_SIZE +
+					       hdr->length, 0);
 			tbv_qp_put(tqp);
 			return;
 		}
@@ -8641,11 +8750,13 @@ void tbv_ibdev_rx_frame(struct tbv_state *state, struct tbv_path *rx_path,
 
 	ret = tbv_native_data_parse_header(data, len, &hdr);
 	if (ret) {
-		atomic64_inc(&state->data_rx_bad_header);
+		tbv_rx_bad_header_parse_note(state, rx_path, data, len, ret);
 		return;
 	}
 	if (hdr.length > len - TBV_NATIVE_DATA_HDR_SIZE) {
-		atomic64_inc(&state->data_rx_bad_header);
+		tbv_rx_bad_header_note(state, rx_path,
+				       &state->data_rx_bad_header_len,
+				       "frame_len", &hdr, len, 0);
 		return;
 	}
 
