@@ -117,41 +117,72 @@
         awk -F': *' -v key="$1" '$1 == key { print $2; found=1; exit } END { if (!found) exit 1 }' "$summary"
       }
 
-      if ! grep -q '^thunderbolt_ibverbs ' /proc/modules; then
-        fail "module thunderbolt_ibverbs is not loaded"
-      fi
-
       deadline=$((SECONDS + timeout))
+      timed_out() {
+        [ "$SECONDS" -ge "$deadline" ]
+      }
+
+      while ! grep -q '^thunderbolt_ibverbs ' /proc/modules; do
+        if timed_out; then
+          fail "module thunderbolt_ibverbs is not loaded within ''${timeout}s"
+        fi
+        sleep 1
+      done
+
       while [ ! -r "$summary" ]; do
-        if [ "$SECONDS" -ge "$deadline" ]; then
+        if timed_out; then
           fail "debugfs summary did not appear at $summary within ''${timeout}s"
         fi
         sleep 1
       done
 
+      wait_summary_value() {
+        key="$1"
+        expected="$2"
+        label="$3"
+        actual=""
+
+        while true; do
+          actual="$(get_summary "$key" || true)"
+          if [ "$actual" = "$expected" ]; then
+            return 0
+          fi
+          if timed_out; then
+            fail "$label: expected $expected, got ''${actual:-<missing>}"
+          fi
+          sleep 1
+        done
+      }
+
       if [ -n "$expected_profile" ]; then
-        actual_profile="$(get_summary profile || true)"
-        [ "$actual_profile" = "$expected_profile" ] ||
-          fail "profile mismatch: expected $expected_profile, got ''${actual_profile:-<missing>}"
+        wait_summary_value profile "$expected_profile" "profile mismatch"
       fi
 
       if [ -n "$expected_native_control" ]; then
-        actual_native_control="$(get_summary native_control || true)"
-        [ "$actual_native_control" = "$expected_native_control" ] ||
-          fail "native_control mismatch: expected $expected_native_control, got ''${actual_native_control:-<missing>}"
+        wait_summary_value native_control "$expected_native_control" "native_control mismatch"
       fi
 
       if [ "$require_verbs" = "1" ]; then
-        verbs_registered="$(get_summary verbs_registered || true)"
-        [ "$verbs_registered" = "1" ] ||
-          fail "verbs device is not registered"
+        wait_summary_value verbs_registered 1 "verbs device is not registered"
       fi
 
       if [ -n "$min_ready_rails" ]; then
-        [ -r "$peers" ] || fail "debugfs peers file is missing at $peers"
-        ready_rails="$(grep -o 'data_ready=1' "$peers" | wc -l | tr -d ' ')"
-        [ "$ready_rails" -ge "$min_ready_rails" ] ||
-          fail "ready rail count too low: expected >= $min_ready_rails, got $ready_rails"
+        ready_rails=0
+        while true; do
+          if [ -r "$peers" ]; then
+            ready_rails="$( { grep -o 'data_ready=1' "$peers" || true; } | wc -l | tr -d ' ')"
+            if [ "$ready_rails" -ge "$min_ready_rails" ]; then
+              break
+            fi
+          fi
+          if timed_out; then
+            if [ ! -r "$peers" ]; then
+              fail "debugfs peers file is missing at $peers within ''${timeout}s"
+            fi
+            fail "ready rail count too low: expected >= $min_ready_rails, got $ready_rails"
+          fi
+          sleep 1
+        done
       fi
 
       if [ -n "$expected_speed" ]; then
