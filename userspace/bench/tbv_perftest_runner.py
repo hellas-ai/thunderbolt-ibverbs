@@ -231,6 +231,10 @@ CSV_FIELDS = [
     "iommu",
     "direction",
     "dev",
+    "server_dev",
+    "client_dev",
+    "server_data_addr",
+    "client_data_addr",
     "gid_index",
     "port",
     "status",
@@ -293,6 +297,8 @@ PERFTEST_DARWIN = os.environ.get("TBV_PERFTEST_DARWIN", "")
 
 # Set once per run by detect_systems(); maps hostname -> "Linux" / "Darwin".
 HOST_SYSTEM: dict[str, str] = {}
+SSH_CONFIG = ""
+SSH_OPTIONS: list[str] = []
 
 
 def perftest_for(host: str) -> str:
@@ -305,15 +311,24 @@ def rdma_core_for(host: str) -> str:
 
 
 def ssh_args(target: str, command: str) -> list[str]:
-    return [
+    args = [
         "ssh",
+    ]
+    if SSH_CONFIG:
+        args.extend(["-F", SSH_CONFIG])
+    args.extend([
         "-o",
         "ConnectTimeout=8",
         "-o",
         "BatchMode=yes",
+    ])
+    for option in SSH_OPTIONS:
+        args.extend(["-o", option])
+    args.extend([
         target,
         "sudo -n bash -lc " + shlex.quote(command),
-    ]
+    ])
+    return args
 
 
 def run_local(args: list[str], *, check: bool = True, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
@@ -723,6 +738,7 @@ def run_pair(
     client_rdma_lib: str,
     server_dev: str,
     client_dev: str,
+    peer_addr: str,
     gid_index: int,
     port: int,
     timeout: int,
@@ -754,7 +770,7 @@ def run_pair(
         port=port,
         timeout=timeout,
         remote_json=client_json,
-        peer=server,
+        peer=peer_addr,
     )
 
     server_proc = subprocess.Popen(
@@ -871,12 +887,31 @@ def parse_hosts(value: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
+def parse_host_map(value: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not value:
+        return out
+    for part in re.split(r"[, ]+", value):
+        if not part:
+            continue
+        host, sep, addr = part.partition("=")
+        if not sep or not host or not addr:
+            die("--data-addrs entries must look like host=addr")
+        out[host] = addr
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a Nix-generated perftest benchmark plan.")
     parser.add_argument("--plan", required=True)
     parser.add_argument("--server")
     parser.add_argument("--client")
     parser.add_argument("--hosts", help="Shortcut for --server A --client B")
+    parser.add_argument("--server-data-addr", help="address clients should use to connect to the server host")
+    parser.add_argument("--client-data-addr", help="address clients should use to connect to the client host when directions reverse")
+    parser.add_argument("--data-addrs", help="comma-separated host=addr map for perftest's data connection target")
+    parser.add_argument("--ssh-config", help="ssh_config file passed to ssh with -F")
+    parser.add_argument("--ssh-option", action="append", default=[], help="extra ssh -o option; may be repeated")
     parser.add_argument("--dev")
     parser.add_argument("--server-dev", help="override --dev on the server side (asymmetric pairs)")
     parser.add_argument("--client-dev", help="override --dev on the client side (asymmetric pairs)")
@@ -906,6 +941,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.repeat < 1:
         die("--repeat must be >= 1")
+    global SSH_CONFIG, SSH_OPTIONS
+    SSH_CONFIG = args.ssh_config or os.environ.get("TBV_SSH_CONFIG", "")
+    SSH_OPTIONS = list(args.ssh_option or [])
 
     plan = json.loads(Path(args.plan).read_text())
     defaults = dict(plan.get("defaults", {}))
@@ -921,6 +959,11 @@ def main() -> int:
         server: args.server_dev or dev,
         client: args.client_dev or dev,
     }
+    host_data_addr = {
+        server: args.server_data_addr or server,
+        client: args.client_data_addr or client,
+    }
+    host_data_addr.update(parse_host_map(args.data_addrs or ""))
     gid_index = args.gid_index if args.gid_index is not None else int(defaults["gidIndex"])
     backend = args.backend if args.backend is not None else defaults.get("backend")
     netdev = args.netdev or defaults.get("netdev")
@@ -1042,7 +1085,15 @@ def main() -> int:
                             "module_ko_path": identity_server.get("ko_path", ""),
                             "iommu": identity_server.get("iommu", ""),
                             "direction": direction_name,
-                            "dev": dev,
+                            "dev": (
+                                host_dev[run_server]
+                                if host_dev[run_server] == host_dev[run_client]
+                                else f"{host_dev[run_server]}->{host_dev[run_client]}"
+                            ),
+                            "server_dev": host_dev[run_server],
+                            "client_dev": host_dev[run_client],
+                            "server_data_addr": host_data_addr.get(run_server, run_server),
+                            "client_data_addr": host_data_addr.get(run_client, run_client),
                             "gid_index": str(gid_index),
                             "port": str(port),
                             "status": "",
@@ -1064,6 +1115,7 @@ def main() -> int:
                             client_rdma_lib=rdma_core_for(run_client),
                             server_dev=host_dev[run_server],
                             client_dev=host_dev[run_client],
+                            peer_addr=host_data_addr.get(run_server, run_server),
                             gid_index=gid_index,
                             port=port,
                             timeout=timeout,
