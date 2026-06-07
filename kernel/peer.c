@@ -3,10 +3,44 @@
 #define pr_fmt(fmt) "thunderbolt_ibverbs: " fmt
 
 #include <linux/errno.h>
+#include <linux/moduleparam.h>
+#include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/thunderbolt.h>
 
 #include "tbv.h"
+
+#define TBV_NATIVE_E2E_AUTO	(-1)
+
+static int native_e2e = TBV_NATIVE_E2E_AUTO;
+module_param(native_e2e, int, 0444);
+MODULE_PARM_DESC(native_e2e,
+		 "Native Linux data ring E2E mode: -1 auto, 0 off, 1 on");
+
+static bool tbv_native_e2e_auto_enabled(const struct tbv_peer *peer)
+{
+	const struct tb_xdomain *xd = peer ? peer->xd : NULL;
+	struct device *dev;
+	struct pci_dev *pdev;
+
+	if (!xd || !xd->tb)
+		return true;
+
+	dev = xd->tb->dev.parent;
+	if (!dev || !dev_is_pci(dev))
+		return true;
+
+	pdev = to_pci_dev(dev);
+	return pdev->vendor != PCI_VENDOR_ID_AMD;
+}
+
+static bool tbv_native_e2e_enabled(const struct tbv_peer *peer)
+{
+	if (native_e2e >= 0)
+		return native_e2e > 0;
+
+	return tbv_native_e2e_auto_enabled(peer);
+}
 
 static bool tbv_peer_matches(const struct tbv_peer *peer,
 			     enum tbv_backend_type backend,
@@ -205,12 +239,13 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 	rail->native_remote_ready = false;
 	tbv_native_control_init_rail(rail, peer);
 	tbv_path_default_config(peer->backend, &path_cfg);
-	if (peer->backend == TBV_BACKEND_NATIVE) {
+	if (peer->backend == TBV_BACKEND_NATIVE &&
+	    tbv_native_e2e_enabled(peer)) {
 		/*
-		 * Native rails only bind to Linux peers.  Even in mixed mode the
-		 * Mac-facing wire format is handled by the separate Apple
-		 * backend, so native can keep the hardware E2E delivery contract
-		 * needed for RC semantics.
+		 * E2E is hardware flow control only; it does not retransmit
+		 * lost frames. In auto mode AMD NHI uses the software data
+		 * credit scheme alone because Strix Halo has reproduced TX
+		 * completion wedges with multiple native E2E rings active.
 		 */
 		path_cfg.tx_flags |= RING_FLAG_E2E;
 		path_cfg.rx_flags |= RING_FLAG_E2E;

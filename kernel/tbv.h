@@ -201,6 +201,7 @@ struct tbv_path {
 	atomic64_t data_tx_credit_stalls;
 	atomic64_t data_tx_credit_received;
 	atomic64_t data_rx_completed;
+	atomic64_t data_rx_canceled;
 	atomic64_t data_rx_credit_sent;
 	atomic64_t data_rx_credit_send_error;
 	atomic64_t data_rx_repost_failed;
@@ -496,6 +497,7 @@ struct tbv_state {
 	atomic64_t data_tx_credit_stalls;
 	atomic64_t data_tx_credit_received;
 	atomic64_t data_rx_completed;
+	atomic64_t data_rx_canceled;
 	atomic64_t data_rx_credit_sent;
 	atomic64_t data_rx_credit_send_error;
 	atomic64_t data_rx_repost_failed;

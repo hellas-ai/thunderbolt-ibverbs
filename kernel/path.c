@@ -80,6 +80,11 @@ module_param(apple_rx_raw_mode, bool, 0644);
 MODULE_PARM_DESC(apple_rx_raw_mode,
 		 "Use RAW descriptors for Apple-compatible RX rings; default keeps FRAME reassembly");
 
+static uint native_tx_max_inflight = TBV_DATA_TX_MAX_INFLIGHT;
+module_param(native_tx_max_inflight, uint, 0644);
+MODULE_PARM_DESC(native_tx_max_inflight,
+		 "Maximum native data TX descriptors posted per path before waiting for completions; 0 disables native throttling");
+
 struct tbv_data_frame {
 	struct ring_frame frame;
 	struct tbv_path *path;
@@ -133,6 +138,19 @@ static u32 tbv_path_control_packet_count(const struct tbv_path *path)
 	u32 count = path->cfg.tx_ring_size * TBV_CONTROL_QUEUE_MULTIPLIER;
 
 	return clamp_t(u32, count, 64, 4096);
+}
+
+static u32 tbv_path_tx_inflight_limit(const struct tbv_path *path)
+{
+	u32 limit = TBV_DATA_TX_MAX_INFLIGHT;
+
+	if (path->rail && path->rail->peer &&
+	    path->rail->peer->backend == TBV_BACKEND_NATIVE)
+		limit = READ_ONCE(native_tx_max_inflight);
+	if (!limit)
+		return 0;
+
+	return clamp_t(u32, limit, 1, path->cfg.tx_ring_size);
 }
 
 static u32 tbv_path_data_packet_count(const struct tbv_path *path)
@@ -834,8 +852,12 @@ static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	u32 add_remote_credits = 0;
 	bool was_raw_payload;
 
-	if (canceled)
+	if (canceled) {
+		if (state)
+			atomic64_inc(&state->data_rx_canceled);
+		atomic64_inc(&path->data_rx_canceled);
 		return;
+	}
 	if (state)
 		atomic64_inc(&state->data_rx_completed);
 	atomic64_inc(&path->data_rx_completed);
@@ -1678,12 +1700,17 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 			needs_staging = !packet->zcopy;
 		}
 
-		if (!from_control_queue &&
-		    atomic_read(&path->tx_inflight) >=
-			    TBV_DATA_TX_MAX_INFLIGHT) {
-			path->tx_scheduling = false;
-			spin_unlock_irqrestore(&path->tx_lock, flags);
-			return;
+		if (!from_control_queue) {
+			u32 tx_inflight_limit =
+				tbv_path_tx_inflight_limit(path);
+
+			if (tx_inflight_limit &&
+			    atomic_read(&path->tx_inflight) >=
+				    tx_inflight_limit) {
+				path->tx_scheduling = false;
+				spin_unlock_irqrestore(&path->tx_lock, flags);
+				return;
+			}
 		}
 
 		if (needs_staging && list_empty(&path->tx_free)) {

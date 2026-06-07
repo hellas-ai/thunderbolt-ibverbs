@@ -193,6 +193,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_tx_credit_received));
 	seq_printf(s, "data_rx_completed: %lld\n",
 		   atomic64_read(&state->data_rx_completed));
+	seq_printf(s, "data_rx_canceled: %lld\n",
+		   atomic64_read(&state->data_rx_canceled));
 	seq_printf(s, "data_rx_credit_sent: %lld\n",
 		   atomic64_read(&state->data_rx_credit_sent));
 	seq_printf(s, "data_rx_credit_send_error: %lld\n",
@@ -422,25 +424,26 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 				   rail->path.cfg.rx_ring_size,
 				   rail->path.cfg.sof_mask,
 				   rail->path.cfg.eof_mask);
-				seq_printf(s,
-					   "    data_rx_completed=%lld data_rx_credit_sent=%lld data_rx_credit_send_error=%lld data_rx_repost_failed=%lld rx_credit_pending=%u\n",
-					   atomic64_read(&rail->path.data_rx_completed),
-					   atomic64_read(&rail->path.data_rx_credit_sent),
-					   atomic64_read(&rail->path.data_rx_credit_send_error),
-					   atomic64_read(&rail->path.data_rx_repost_failed),
-					   rail->path.rx_data_credit_pending);
-				seq_printf(s,
-					   "    tx_poll enabled=%u calls=%lld completed=%lld\n",
-					   rail->path.tx_poll_enabled,
-					   atomic64_read(&rail->path.tx_poll_calls),
-					   atomic64_read(&rail->path.tx_poll_completed));
-				seq_printf(s,
-					   "    rx_supp_poll enabled=%u calls=%lld completed=%lld\n",
-					   rail->path.rx_supp_poll_enabled,
-					   atomic64_read(&rail->path.rx_supp_poll_calls),
-					   atomic64_read(&rail->path.rx_supp_poll_completed));
-			}
+			seq_printf(s,
+				   "    data_rx_completed=%lld data_rx_canceled=%lld data_rx_credit_sent=%lld data_rx_credit_send_error=%lld data_rx_repost_failed=%lld rx_credit_pending=%u\n",
+				   atomic64_read(&rail->path.data_rx_completed),
+				   atomic64_read(&rail->path.data_rx_canceled),
+				   atomic64_read(&rail->path.data_rx_credit_sent),
+				   atomic64_read(&rail->path.data_rx_credit_send_error),
+				   atomic64_read(&rail->path.data_rx_repost_failed),
+				   rail->path.rx_data_credit_pending);
+			seq_printf(s,
+				   "    tx_poll enabled=%u calls=%lld completed=%lld\n",
+				   rail->path.tx_poll_enabled,
+				   atomic64_read(&rail->path.tx_poll_calls),
+				   atomic64_read(&rail->path.tx_poll_completed));
+			seq_printf(s,
+				   "    rx_supp_poll enabled=%u calls=%lld completed=%lld\n",
+				   rail->path.rx_supp_poll_enabled,
+				   atomic64_read(&rail->path.rx_supp_poll_calls),
+				   atomic64_read(&rail->path.rx_supp_poll_completed));
 		}
+	}
 	mutex_unlock(&state->lock);
 
 	return 0;
