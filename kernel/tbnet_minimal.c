@@ -970,7 +970,13 @@ static void tbv_tbnet_minimal_connected_work(struct work_struct *work)
 	session->rings_started = true;
 	session->path_enabled = true;
 	mutex_unlock(&session->lock);
-	tbv_tbnet_minimal_recompute_state(session->identity);
+	/*
+	 * A bidirectional ThunderboltIP login plus active packet path is the
+	 * positive peer proof for minimal identity mode. Waiting for a later ARP
+	 * request deadlocks reloads when macOS keeps a warm ARP cache and emits
+	 * no packet before the RDMA data path is enabled.
+	 */
+	tbv_tbnet_minimal_mark_neighbor_seen(session);
 	pr_info("minimal TBnet packet path active route=0x%llx tx_path=%d rx_path=%d tx_hop=%d rx_hop=%d\n",
 		session->xd->route, session->local_transmit_path,
 		remote_transmit_path, session->tx_ring->hop,
