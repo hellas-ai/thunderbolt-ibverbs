@@ -11,18 +11,18 @@ diff --git a/drivers/net/thunderbolt/main.c b/drivers/net/thunderbolt/main.c
 index f8f97e8e2226..a200964091f2 100644
 --- a/drivers/net/thunderbolt/main.c
 +++ b/drivers/net/thunderbolt/main.c
-@@ -219,6 +219,11 @@ static bool tbnet_e2e = true;
- module_param_named(e2e, tbnet_e2e, bool, 0444);
- MODULE_PARM_DESC(e2e, "USB4NET full end-to-end flow control (default: true)");
+@@ -216,6 +216,11 @@ static const uuid_t tbnet_svc_uuid =
+ 
+ static struct tb_property_dir *tbnet_dir;
  
 +static bool tbnet_tx_e2e = true;
 +module_param_named(tx_e2e, tbnet_tx_e2e, bool, 0444);
 +MODULE_PARM_DESC(tx_e2e,
 +		 "USB4NET TX ring end-to-end flow control when E2E is negotiated (default: true)");
 +
- static void tbnet_fill_header(struct thunderbolt_ip_header *hdr, u64 route,
- 	u8 sequence, const uuid_t *initiator_uuid, const uuid_t *target_uuid,
- 	enum thunderbolt_ip_type type, size_t size, u32 command_id)
+ static bool tbnet_e2e = true;
+ module_param_named(e2e, tbnet_e2e, bool, 0444);
+ MODULE_PARM_DESC(e2e, "USB4NET full end-to-end flow control (default: true)");
 @@ -916,17 +921,22 @@ static int tbnet_open(struct net_device *dev)
  	struct tb_xdomain *xd = net->xd;
  	u16 sof_mask, eof_mask;
@@ -62,4 +62,3 @@ index f8f97e8e2226..a200964091f2 100644
  	if (!ring) {
 -- 
 2.54.0
-

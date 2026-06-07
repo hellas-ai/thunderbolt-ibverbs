@@ -1,21 +1,21 @@
-From b4e4fc3b334d6207f81e5fccae3572dee066e99c Mon Sep 17 00:00:00 2001
+From d58daef89223840b1ee4e86c2328fb2a12774b5c Mon Sep 17 00:00:00 2001
 From: georgewhewell <georgerw@gmail.com>
 Date: Sat, 6 Jun 2026 17:57:01 +0200
 Subject: [PATCH] thunderbolt: add XDomain bridge padding mode
 
 ---
- drivers/thunderbolt/xdomain.c | 945 +++++++++++++++++++++++++++-------
- 1 file changed, 746 insertions(+), 199 deletions(-)
+ drivers/thunderbolt/xdomain.c | 1043 ++++++++++++++++++++++++++-------
+ 1 file changed, 845 insertions(+), 198 deletions(-)
 
 diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
-index cc2bb5ffd9ee..c0be863daefa 100644
+index cc2bb5ffd9ee..a2883a016a97 100644
 --- a/drivers/thunderbolt/xdomain.c
 +++ b/drivers/thunderbolt/xdomain.c
 @@ -22,6 +22,7 @@
  
  #define XDOMAIN_SHORT_TIMEOUT			100	/* ms */
  #define XDOMAIN_DEFAULT_TIMEOUT			1000	/* ms */
-+#define XDOMAIN_BRIDGE_PROPERTIES_TIMEOUT	5000	/* ms */
++#define XDOMAIN_BRIDGE_PROPERTIES_TIMEOUT	1000	/* ms */
  #define XDOMAIN_BONDING_TIMEOUT			10000	/* ms */
  #define XDOMAIN_RETRIES				10
  #define XDOMAIN_DEFAULT_MAX_HOPID		15
@@ -28,17 +28,17 @@ index cc2bb5ffd9ee..c0be863daefa 100644
 +MODULE_PARM_DESC(xdomain_bridge_pad,
 +		 "pad XDomain packets at routed-hub clobber windows (default: false)");
 +
-+static unsigned int xdomain_bridge_properties_chunk = 4;
++static unsigned int xdomain_bridge_properties_chunk;
 +module_param_named(xdomain_bridge_properties_chunk,
 +		   xdomain_bridge_properties_chunk, uint, 0644);
 +MODULE_PARM_DESC(xdomain_bridge_properties_chunk,
-+		 "maximum properties data dwords per response with bridge padding, or 0 for frame maximum (default: 4)");
++		 "maximum properties data dwords per response with bridge padding, or 0 for frame maximum (default: 0)");
 +
-+static unsigned int xdomain_bridge_properties_retries = 8;
++static unsigned int xdomain_bridge_properties_retries = 12;
 +module_param_named(xdomain_bridge_properties_retries,
 +		   xdomain_bridge_properties_retries, uint, 0644);
 +MODULE_PARM_DESC(xdomain_bridge_properties_retries,
-+		 "properties chunk attempts with bridge padding (default: 8)");
++		 "properties chunk attempts with bridge padding (default: 12)");
 +
  /*
   * Serializes access to the properties and protocol handlers below. If
@@ -94,7 +94,7 @@ index cc2bb5ffd9ee..c0be863daefa 100644
  }
  
  static const char *tb_xdp_type_name(enum tb_xdp_type type)
-@@ -136,6 +178,336 @@ static const char *tb_xdp_type_name(enum tb_xdp_type type)
+@@ -136,6 +178,412 @@ static const char *tb_xdp_type_name(enum tb_xdp_type type)
  	}
  }
  
@@ -150,8 +150,22 @@ index cc2bb5ffd9ee..c0be863daefa 100644
 +	 * route/length-like marker. Locally padded packets use the same
 +	 * shape, so clean and clobbered directions can share the receive path.
 +	 */
-+	return !(w[offset] & BIT(31)) && w[offset + 2] == w[2] &&
-+		w[offset + 3] == ~0U;
++	if (!(w[offset] & BIT(31)) && w[offset + 2] == w[2] &&
++	    w[offset + 3] == ~0U)
++		return true;
++
++	/*
++	 * Some bridges appear to fill the same vulnerable window with a copy
++	 * of the preceding data window instead of preserving our marker. Treat
++	 * that as padding as well; otherwise the duplicate is copied into the
++	 * XDP body and shifts all following fields by four dwords.
++	 */
++	if (offset >= XDOMAIN_BRIDGE_DATA_DWORDS &&
++	    !memcmp(w + offset, w + offset - XDOMAIN_BRIDGE_DATA_DWORDS,
++		    XDOMAIN_BRIDGE_PAD_BYTES))
++		return true;
++
++	return false;
 +}
 +
 +static bool tb_xdomain_bridge_pad_present(const void *buf, size_t size)
@@ -222,10 +236,105 @@ index cc2bb5ffd9ee..c0be863daefa 100644
 +	return min_t(size_t, dst_size, unpadded_dwords * 4);
 +}
 +
++static bool tb_xdomain_properties_response_valid(
++	const struct tb_xdp_properties *req,
++	const struct tb_xdp_properties_response *res,
++	size_t res_size, unsigned int frame_size)
++{
++	u16 min_len, packet_len, chunk_len;
++	size_t packet_size;
++
++	if (res_size < sizeof(*res)) {
++		if (xdomain_debug)
++			pr_info_ratelimited("thunderbolt xdomain: match drop short bridged properties route=%llx req_seq=%u res_size=%zu frame_size=%u\n",
++					    tb_xdp_route(&req->hdr),
++					    tb_xdp_sequence(&req->hdr),
++					    res_size, frame_size);
++		return false;
++	}
++
++	if (res->hdr.type != PROPERTIES_RESPONSE) {
++		if (xdomain_debug)
++			pr_info_ratelimited("thunderbolt xdomain: match drop properties type req_route=%llx res_route=%llx req_seq=%u res_seq=%u res_type=%s(%#x) frame_size=%u\n",
++					    tb_xdp_route(&req->hdr),
++					    tb_xdp_route(&res->hdr),
++					    tb_xdp_sequence(&req->hdr),
++					    tb_xdp_sequence(&res->hdr),
++					    tb_xdp_type_name(res->hdr.type),
++					    res->hdr.type, frame_size);
++		return false;
++	}
++
++	if (tb_xdp_route(&res->hdr) != tb_xdp_route(&req->hdr) ||
++	    tb_xdp_sequence(&res->hdr) != tb_xdp_sequence(&req->hdr)) {
++		if (xdomain_debug)
++			pr_info_ratelimited("thunderbolt xdomain: match drop properties header req_route=%llx res_route=%llx req_seq=%u res_seq=%u frame_size=%u\n",
++					    tb_xdp_route(&req->hdr),
++					    tb_xdp_route(&res->hdr),
++					    tb_xdp_sequence(&req->hdr),
++					    tb_xdp_sequence(&res->hdr),
++					    frame_size);
++		return false;
++	}
++
++	min_len = sizeof(*res) / 4 - sizeof(res->hdr.xd_hdr) / 4;
++	packet_len = tb_xdp_length(&res->hdr);
++	if (packet_len < min_len) {
++		if (xdomain_debug)
++			pr_info_ratelimited("thunderbolt xdomain: match drop properties length short route=%llx req_seq=%u len=%u min=%u frame_size=%u\n",
++					    tb_xdp_route(&req->hdr),
++					    tb_xdp_sequence(&req->hdr),
++					    packet_len, min_len, frame_size);
++		return false;
++	}
++
++	packet_size = (packet_len + sizeof(res->hdr.xd_hdr) / 4) * 4;
++	if (packet_size > res_size) {
++		if (xdomain_debug)
++			pr_info_ratelimited("thunderbolt xdomain: match drop properties length overrun route=%llx req_seq=%u packet_size=%zu res_size=%zu frame_size=%u\n",
++					    tb_xdp_route(&req->hdr),
++					    tb_xdp_sequence(&req->hdr),
++					    packet_size, res_size, frame_size);
++		return false;
++	}
++
++	if (!uuid_equal(&res->src_uuid, &req->dst_uuid) ||
++	    !uuid_equal(&res->dst_uuid, &req->src_uuid)) {
++		if (xdomain_debug)
++			pr_info_ratelimited("thunderbolt xdomain: match drop properties uuid route=%llx req_seq=%u res_seq=%u req_src=%pUb req_dst=%pUb res_src=%pUb res_dst=%pUb offset=%u data_len=%u frame_size=%u\n",
++					    tb_xdp_route(&req->hdr),
++					    tb_xdp_sequence(&req->hdr),
++					    tb_xdp_sequence(&res->hdr),
++					    &req->src_uuid,
++					    &req->dst_uuid, &res->src_uuid,
++					    &res->dst_uuid, res->offset,
++					    res->data_length, frame_size);
++		return false;
++	}
++
++	chunk_len = packet_len - min_len;
++	if (res->offset != req->offset || !res->data_length ||
++	    res->data_length > TB_XDP_PROPERTIES_MAX_LENGTH ||
++	    res->offset + chunk_len > res->data_length) {
++		if (xdomain_debug)
++			pr_info_ratelimited("thunderbolt xdomain: match drop properties offset route=%llx req_seq=%u res_seq=%u req_offset=%u res_offset=%u chunk_len=%u data_len=%u frame_size=%u\n",
++					    tb_xdp_route(&req->hdr),
++					    tb_xdp_sequence(&req->hdr),
++					    tb_xdp_sequence(&res->hdr),
++					    req->offset, res->offset,
++					    chunk_len, res->data_length,
++					    frame_size);
++		return false;
++	}
++
++	return true;
++}
++
 +static bool tb_xdomain_match_properties(const struct tb_cfg_request *req,
 +					const struct ctl_pkg *pkg)
 +{
-+	struct tb_xdp_properties_response res = {};
++	u8 res_buf[TB_FRAME_SIZE];
++	const struct tb_xdp_properties_response *res;
 +	struct tb_xdp_properties prop_req = {};
 +	size_t req_size, res_size;
 +
@@ -244,48 +353,15 @@ index cc2bb5ffd9ee..c0be863daefa 100644
 +	req_size = tb_xdomain_bridge_unpad_copy(&prop_req, sizeof(prop_req),
 +					       req->request,
 +					       req->request_size);
-+	res_size = tb_xdomain_bridge_unpad_copy(&res, sizeof(res),
++	res_size = tb_xdomain_bridge_unpad_copy(res_buf, sizeof(res_buf),
 +					       pkg->buffer,
 +					       pkg->frame.size);
 +	if (req_size < sizeof(prop_req))
 +		return false;
 +
-+	if (res_size < sizeof(res)) {
-+		if (xdomain_debug)
-+			pr_info_ratelimited("thunderbolt xdomain: match drop short bridged properties route=%llx req_seq=%u res_size=%zu frame_size=%u\n",
-+					    tb_xdp_route(&prop_req.hdr),
-+					    tb_xdp_sequence(&prop_req.hdr),
-+					    res_size, pkg->frame.size);
-+		return false;
-+	}
-+
-+	if (!uuid_equal(&res.src_uuid, &prop_req.dst_uuid) ||
-+	    !uuid_equal(&res.dst_uuid, &prop_req.src_uuid)) {
-+		if (xdomain_debug)
-+			pr_info_ratelimited("thunderbolt xdomain: match drop properties uuid route=%llx req_seq=%u res_seq=%u req_src=%pUb req_dst=%pUb res_src=%pUb res_dst=%pUb offset=%u data_len=%u frame_size=%u\n",
-+					    tb_xdp_route(&prop_req.hdr),
-+					    tb_xdp_sequence(&prop_req.hdr),
-+					    tb_xdp_sequence(&res.hdr),
-+					    &prop_req.src_uuid,
-+					    &prop_req.dst_uuid, &res.src_uuid,
-+					    &res.dst_uuid, res.offset,
-+					    res.data_length, pkg->frame.size);
-+		return false;
-+	}
-+
-+	if (res.offset != prop_req.offset || !res.data_length ||
-+	    res.data_length > TB_XDP_PROPERTIES_MAX_LENGTH) {
-+		if (xdomain_debug)
-+			pr_info_ratelimited("thunderbolt xdomain: match drop properties offset route=%llx req_seq=%u res_seq=%u req_offset=%u res_offset=%u data_len=%u frame_size=%u\n",
-+					    tb_xdp_route(&prop_req.hdr),
-+					    tb_xdp_sequence(&prop_req.hdr),
-+					    tb_xdp_sequence(&res.hdr),
-+					    prop_req.offset, res.offset,
-+					    res.data_length, pkg->frame.size);
-+		return false;
-+	}
-+
-+	return true;
++	res = (const struct tb_xdp_properties_response *)res_buf;
++	return tb_xdomain_properties_response_valid(&prop_req, res, res_size,
++						    pkg->frame.size);
 +}
 +
 +static bool tb_xdomain_match_common(const struct tb_cfg_request *req,
@@ -431,7 +507,7 @@ index cc2bb5ffd9ee..c0be863daefa 100644
  bool tb_is_xdomain_enabled(void)
  {
  	return tb_xdomain_enabled && tb_acpi_is_xdomain_allowed();
-@@ -149,85 +521,102 @@ bool tb_xdomain_debug_enabled(void)
+@@ -149,85 +597,102 @@ bool tb_xdomain_debug_enabled(void)
  static bool tb_xdomain_match(const struct tb_cfg_request *req,
  			     const struct ctl_pkg *pkg)
  {
@@ -593,20 +669,44 @@ index cc2bb5ffd9ee..c0be863daefa 100644
  		return true;
  	}
  
-@@ -239,9 +628,9 @@ static bool tb_xdomain_match(const struct tb_cfg_request *req,
+@@ -239,10 +704,34 @@ static bool tb_xdomain_match(const struct tb_cfg_request *req,
  static bool tb_xdomain_copy(struct tb_cfg_request *req,
  			    const struct ctl_pkg *pkg)
  {
 -	size_t len = min_t(size_t, pkg->frame.size, req->response_size);
--
++	struct tb_xdp_properties prop_req = {};
++	const struct tb_xdp_header *req_hdr;
++	size_t copied, req_size;
+ 
 -	memcpy(req->response, pkg->buffer, len);
 +	memset(req->response, 0, req->response_size);
-+	tb_xdomain_bridge_unpad_copy(req->response, req->response_size,
-+				     pkg->buffer, pkg->frame.size);
++	copied = tb_xdomain_bridge_unpad_copy(req->response, req->response_size,
++					      pkg->buffer, pkg->frame.size);
  	req->result.err = 0;
++
++	if (!xdomain_bridge_pad ||
++	    req->response_type != TB_CFG_PKG_XDOMAIN_RESP ||
++	    req->request_size < sizeof(*req_hdr) ||
++	    req->response_size < sizeof(struct tb_xdp_properties_response))
++		return true;
++
++	req_hdr = req->request;
++	if (!uuid_equal(&req_hdr->uuid, &tb_xdp_uuid) ||
++	    req_hdr->type != PROPERTIES_REQUEST)
++		return true;
++
++	req_size = tb_xdomain_bridge_unpad_copy(&prop_req, sizeof(prop_req),
++					       req->request,
++					       req->request_size);
++	if (req_size < sizeof(prop_req) ||
++	    !tb_xdomain_properties_response_valid(&prop_req, req->response,
++						  copied, copied))
++		req->result.err = -EINVAL;
++
  	return true;
  }
-@@ -254,23 +643,36 @@ static void response_ready(void *data)
+ 
+@@ -254,23 +743,36 @@ static void response_ready(void *data)
  static int __tb_xdomain_response(struct tb_ctl *ctl, const void *response,
  				 size_t size, enum tb_cfg_pkg_type type)
  {
@@ -647,7 +747,7 @@ index cc2bb5ffd9ee..c0be863daefa 100644
  	return ret;
  }
  
-@@ -298,17 +700,28 @@ static int __tb_xdomain_request(struct tb_ctl *ctl, const void *request,
+@@ -298,17 +800,28 @@ static int __tb_xdomain_request(struct tb_ctl *ctl, const void *request,
  	size_t response_size, enum tb_cfg_pkg_type response_type,
  	unsigned int timeout_msec)
  {
@@ -679,7 +779,7 @@ index cc2bb5ffd9ee..c0be863daefa 100644
  	req->request_type = request_type;
  	req->response = response;
  	req->response_size = response_size;
-@@ -317,6 +730,8 @@ static int __tb_xdomain_request(struct tb_ctl *ctl, const void *request,
+@@ -317,6 +830,8 @@ static int __tb_xdomain_request(struct tb_ctl *ctl, const void *request,
  	res = tb_cfg_request_sync(ctl, req, timeout_msec);
  
  	tb_cfg_request_put(req);
@@ -688,7 +788,7 @@ index cc2bb5ffd9ee..c0be863daefa 100644
  
  	return res.err == 1 ? -EIO : res.err;
  }
-@@ -389,45 +804,74 @@ static int tb_xdp_uuid_request(struct tb_ctl *ctl, u64 route, int retry,
+@@ -389,45 +904,74 @@ static int tb_xdp_uuid_request(struct tb_ctl *ctl, u64 route, int retry,
  {
  	struct tb_xdp_uuid_response res;
  	struct tb_xdp_uuid req;
@@ -793,7 +893,7 @@ index cc2bb5ffd9ee..c0be863daefa 100644
  }
  
  static int tb_xdp_uuid_response(struct tb_ctl *ctl, u64 route, u8 sequence,
-@@ -473,10 +917,13 @@ static int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
+@@ -473,10 +1017,13 @@ static int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
  {
  	struct tb_xdp_properties_response *res;
  	struct tb_xdp_properties req;
@@ -808,7 +908,7 @@ index cc2bb5ffd9ee..c0be863daefa 100644
  
  	total_size = sizeof(*res) + TB_XDP_PROPERTIES_MAX_DATA_LENGTH * 4;
  	res = kzalloc(total_size, GFP_KERNEL);
-@@ -490,113 +937,185 @@ static int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
+@@ -490,113 +1037,185 @@ static int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
  	memcpy(&req.dst_uuid, dst_uuid, sizeof(*dst_uuid));
  
  	data_len = 0;
@@ -1076,7 +1176,7 @@ index cc2bb5ffd9ee..c0be863daefa 100644
  
  	kfree(res);
  
-@@ -631,12 +1150,14 @@ static int tb_xdp_properties_response(struct tb *tb, struct tb_ctl *ctl,
+@@ -631,12 +1250,14 @@ static int tb_xdp_properties_response(struct tb *tb, struct tb_ctl *ctl,
  	 */
  	if (!uuid_equal(xd->local_uuid, &req->dst_uuid)) {
  		if (xdomain_debug)
@@ -1095,7 +1195,7 @@ index cc2bb5ffd9ee..c0be863daefa 100644
  		return 0;
  	}
  
-@@ -644,16 +1165,21 @@ static int tb_xdp_properties_response(struct tb *tb, struct tb_ctl *ctl,
+@@ -644,16 +1265,21 @@ static int tb_xdp_properties_response(struct tb *tb, struct tb_ctl *ctl,
  
  	if (req->offset >= xd->local_property_block_len) {
  		if (xdomain_debug)
@@ -1121,7 +1221,7 @@ index cc2bb5ffd9ee..c0be863daefa 100644
  	total_size = sizeof(*res) + len * 4;
  
  	res = kzalloc(total_size, GFP_KERNEL);
-@@ -2904,17 +3430,29 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+@@ -2904,17 +3530,29 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
  	const struct tb_protocol_handler *handler, *tmp;
  	const struct tb_xdp_header *hdr = buf;
  	struct tb_xdomain *source_xd = NULL;
@@ -1153,7 +1253,7 @@ index cc2bb5ffd9ee..c0be863daefa 100644
  
  	/*
  	 * Handle XDomain discovery protocol packets directly here. For
-@@ -2922,8 +3460,12 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+@@ -2922,8 +3560,12 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
  	 * handlers in turn.
  	 */
  	if (uuid_equal(&hdr->uuid, &tb_xdp_uuid)) {
@@ -1168,7 +1268,7 @@ index cc2bb5ffd9ee..c0be863daefa 100644
  		return false;
  	}
  
-@@ -2969,8 +3511,13 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+@@ -2969,8 +3611,13 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
  	}
  
  	tb_xdomain_put(source_xd);
