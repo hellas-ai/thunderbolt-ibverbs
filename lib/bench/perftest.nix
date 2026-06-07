@@ -132,6 +132,9 @@ let
     # Completion path: CQ batching / polling.
     (mkBwOdd  { tag = "cqmod16";     bin = "ib_write_bw"; size = 1024;  opts = { "cq-mod" = 16; }; })
     (mkBwOdd  { tag = "cqepoll64";   bin = "ib_write_bw"; size = 65536; qp = 4; opts = { cqe_poll = 64; }; })
+    (mkBwOdd  { tag = "txd16";       bin = "ib_write_bw"; size = 65536; qp = 8; opts = { "tx-depth" = 16; }; })
+    (mkBwOdd  { tag = "txd32";       bin = "ib_write_bw"; size = 65536; qp = 8; opts = { "tx-depth" = 32; }; })
+    (mkBwOdd  { tag = "txd64";       bin = "ib_write_bw"; size = 65536; qp = 8; opts = { "tx-depth" = 64; }; })
 
     # Timing / reporting: warmup, lat gap, CPU%.
     (mkLatOdd { tag = "warmup";      bin = "ib_write_lat"; size = 1024; opts = { perform_warm_up = true; }; })
