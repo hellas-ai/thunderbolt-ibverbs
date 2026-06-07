@@ -137,6 +137,36 @@
             maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
           };
         };
+      mkBenchHarnessShellcheck =
+        pkgs:
+        pkgs.stdenv.mkDerivation {
+          pname = "thunderbolt-ibverbs-bench-harness-shellcheck";
+          version = "0.1.0";
+          src = ./.;
+
+          nativeBuildInputs = [ pkgs.shellcheck ];
+
+          dontConfigure = true;
+
+          buildPhase = ''
+            runHook preBuild
+            shellcheck \
+              userspace/bench/tbv_app_gate.sh \
+              userspace/bench/tbv_rocshmem_example.sh \
+              userspace/bench/tbv_vllm_smoke.sh
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out"
+            runHook postInstall
+          '';
+
+          meta = {
+            maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+          };
+        };
       mkPortableKernelPatchCheck =
         pkgs:
         let
@@ -440,6 +470,7 @@
           thunderbolt-ibverbs = pkgsAt.thunderbolt-ibverbs;
           portable-kernel-patches = mkPortableKernelPatchCheck pkgs;
           script-syntax = mkScriptSyntaxCheck pkgs;
+          bench-harness-shellcheck = mkBenchHarnessShellcheck pkgs;
           proto-smoke = mkProtoSmoke pkgs;
           rdma-core-usb4 = pkgsAt.rdma-core-usb4;
           verbs-smoke-build = mkVerbsSmokeBuild pkgs;
