@@ -440,6 +440,14 @@
               maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
             };
           };
+          tbv-pytorch-chunk-sweep = {
+            type = "app";
+            program = "${pkgsAt.bench-tools}/bin/tbv_pytorch_chunk_sweep.sh";
+            meta = {
+              description = "Run the PyTorch USB4 GDA chunk-size discriminator";
+              maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+            };
+          };
           tbv-perftest = {
             type = "app";
             program = lib.getExe pkgsAt.tbv-perftest;
