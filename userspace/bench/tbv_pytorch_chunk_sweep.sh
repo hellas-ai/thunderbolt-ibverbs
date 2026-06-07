@@ -58,6 +58,7 @@ Options:
   --torch-rccl-lib PATH     Default: $torch_rccl_lib
   --pytorch-sizes CSV       Default: $pytorch_sizes
   --pytorch-iters N         Default: $pytorch_iters
+  --torch-collectives CSV   Default: $torch_collectives
   --reps N                  Default: $reps
   --torch-validate 0|1      Default: $torch_validate
   --pytorch-dv-check MODE   Default: $pytorch_dv_check
@@ -89,6 +90,7 @@ while (($#)); do
     --torch-rccl-lib) torch_rccl_lib=$2; shift 2 ;;
     --pytorch-sizes) pytorch_sizes=$2; shift 2 ;;
     --pytorch-iters) pytorch_iters=$2; shift 2 ;;
+    --torch-collectives) torch_collectives=$2; shift 2 ;;
     --reps) reps=$2; shift 2 ;;
     --torch-validate) torch_validate=$2; shift 2 ;;
     --pytorch-dv-check) pytorch_dv_check=$2; shift 2 ;;
@@ -173,7 +175,9 @@ run_chunk() {
     return 0
   fi
 
-  if ! env "${env_vars[@]}" "${cmd[@]}"; then
+  if env "${env_vars[@]}" "${cmd[@]}"; then
+    status=0
+  else
     status=$?
   fi
   if [[ "$summarize" == 1 && -d "$root" ]]; then
