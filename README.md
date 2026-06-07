@@ -70,7 +70,20 @@ if you want a batteries-included image with vllm / llama.cpp / rdma-core-usb4 / 
 ## that sounds complicated, is there any easier way?
 sure, download and write the usb-bootable image from here, insert it into your machines, hit f11 while its booting to select the usb stick
 
-TODO: instructions for how to start vllm once its booted. check benchmark/test scripts for reference.
+For a repeatable two-node vLLM transport smoke, use the packaged bench helper.
+It starts Ray, runs a tiny TP=2 vLLM workload, captures
+`/sys/kernel/debug/thunderbolt_ibverbs/summary` before/after, and fails if the
+TP run completes without moving RDMA counters:
+
+```sh
+tbv_vllm_smoke.sh \
+  --hosts 192.168.23.136,192.168.23.192 \
+  --iface eno1 \
+  --transport native \
+  --hca usb4_rdma5 \
+  --wrapper /path/to/vllm-env \
+  --require-rdma auto
+```
 
 ## Status
 
