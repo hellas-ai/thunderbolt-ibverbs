@@ -128,7 +128,7 @@ prepend_path() {
   [[ -n "$path" && -d "$path" ]] || return 0
   case ":$current:" in
     *":$path:"*) ;;
-    *) printf -v "$var" '%s%s%s' "$path" "${current:+:}" "$current"; export "$var" ;;
+    *) printf -v "$var" '%s%s%s' "$path" "${current:+:}" "$current"; export "${var?}" ;;
   esac
 }
 
@@ -301,7 +301,7 @@ capture_counters "$before_label" "$log_root/counters" "$counter_hosts"
 mpirun_cmd=(
   timeout "$timeout_s"
   mpirun -np "$np" --host "$hosts" --map-by ppr:1:node
-  --mca pml ob1 --mca btl self,tcp --mca btl_tcp_if_include "$iface"
+  --mca pml ob1 --mca btl "self,tcp" --mca btl_tcp_if_include "$iface"
   -x LD_LIBRARY_PATH -x PATH -x ROCM_PATH -x ROCM_HOME -x HIP_PATH -x HIP_PLATFORM
   -x HIP_VISIBLE_DEVICES -x ROCR_VISIBLE_DEVICES -x HSA_NO_SCRATCH_RECLAIM -x HSA_ENABLE_INTERRUPT -x HSA_OVERRIDE_GFX_VERSION
   -x ROCSHMEM_BACKEND -x ROCSHMEM_GDA_PROVIDER -x ROCSHMEM_GDA_ENABLE_DMABUF -x ROCSHMEM_HCA_LIST

@@ -457,7 +457,7 @@ prepend_path() {
   [[ -n "$path" && -d "$path" ]] || return 0
   case ":$current:" in
     *":$path:"*) ;;
-    *) printf -v "$var" '%s%s%s' "$path" "${current:+:}" "$current"; export "$var" ;;
+    *) printf -v "$var" '%s%s%s' "$path" "${current:+:}" "$current"; export "${var?}" ;;
   esac
 }
 
