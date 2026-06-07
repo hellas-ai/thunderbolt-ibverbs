@@ -27,6 +27,14 @@ torch_rccl_lib=${TBV_TORCH_RCCL_LIB:-auto}
 pytorch_dv_check=${TBV_PYTORCH_DV_CHECK:-require}
 torch_collectives=${TBV_TORCH_COLLECTIVES:-all_to_all}
 torch_validate=${TBV_TORCH_VALIDATE:-0}
+rccl_num_sym_buf=${TBV_RCCL_NUM_SYM_BUF:-${RCCL_ROCSHMEM_NUM_SYM_BUF:-}}
+hoststream_fixed_symid=${TBV_RCCL_HOSTSTREAM_FIXED_SYMID:-${RCCL_ROCSHMEM_HOST_STREAM_FIXED_SYMID:-}}
+hoststream_fixed_src_symid=${TBV_RCCL_HOSTSTREAM_FIXED_SRC_SYMID:-${RCCL_ROCSHMEM_HOST_STREAM_FIXED_SRC_SYMID:-}}
+hoststream_fixed_dst_symid=${TBV_RCCL_HOSTSTREAM_FIXED_DST_SYMID:-${RCCL_ROCSHMEM_HOST_STREAM_FIXED_DST_SYMID:-}}
+hoststream_addr_log=${TBV_RCCL_HOSTSTREAM_ADDR_LOG:-${RCCL_ROCSHMEM_HOST_STREAM_ADDR_LOG:-}}
+hoststream_timing=${TBV_RCCL_HOSTSTREAM_TIMING:-${RCCL_ROCSHMEM_HOST_STREAM_TIMING:-}}
+usb4_a2a_post_log=${TBV_ROCSHMEM_USB4_A2A_POST_LOG:-${ROCSHMEM_GDA_USB4_A2A_POST_LOG:-}}
+usb4_a2a_timing_log=${TBV_ROCSHMEM_USB4_A2A_TIMING_LOG:-${ROCSHMEM_GDA_USB4_A2A_TIMING_LOG:-}}
 dry_run=0
 continue_on_error=0
 summarize=1
@@ -64,6 +72,14 @@ Options:
   --reps N                  Default: $reps
   --torch-validate 0|1      Default: $torch_validate
   --pytorch-dv-check MODE   Default: $pytorch_dv_check
+  --rocshmem-num-sym-buf N  Set RCCL_ROCSHMEM_NUM_SYM_BUF
+  --hoststream-fixed-symid N
+  --hoststream-fixed-src-symid N
+  --hoststream-fixed-dst-symid N
+  --hoststream-addr-log 0|1
+  --hoststream-timing 0|1
+  --usb4-a2a-post-log 0|1
+  --usb4-a2a-timing-log 0|1
   --allow-late-send-ack-no-qp
   --continue-on-error       Keep sweeping after a failed chunk
   --no-summary              Skip tbv_app_gate_summarize.sh after each run
@@ -97,6 +113,14 @@ while (($#)); do
     --reps) reps=$2; shift 2 ;;
     --torch-validate) torch_validate=$2; shift 2 ;;
     --pytorch-dv-check) pytorch_dv_check=$2; shift 2 ;;
+    --rocshmem-num-sym-buf) rccl_num_sym_buf=$2; shift 2 ;;
+    --hoststream-fixed-symid) hoststream_fixed_symid=$2; shift 2 ;;
+    --hoststream-fixed-src-symid) hoststream_fixed_src_symid=$2; shift 2 ;;
+    --hoststream-fixed-dst-symid) hoststream_fixed_dst_symid=$2; shift 2 ;;
+    --hoststream-addr-log) hoststream_addr_log=$2; shift 2 ;;
+    --hoststream-timing) hoststream_timing=$2; shift 2 ;;
+    --usb4-a2a-post-log) usb4_a2a_post_log=$2; shift 2 ;;
+    --usb4-a2a-timing-log) usb4_a2a_timing_log=$2; shift 2 ;;
     --allow-late-send-ack-no-qp) allow_late_send_ack_no_qp=1; shift ;;
     --continue-on-error) continue_on_error=1; shift ;;
     --no-summary) summarize=0; shift ;;
@@ -129,6 +153,15 @@ append_dir_arg() {
   argv+=("$opt" "$value")
 }
 
+append_value_arg() {
+  local -n argv_ref=$1
+  local opt=$2
+  local value=$3
+
+  [[ -n "$value" ]] || return 0
+  argv_ref+=("$opt" "$value")
+}
+
 run_chunk() {
   local chunk=$1
   local root
@@ -143,6 +176,9 @@ run_chunk() {
     "ROCSHMEM_GDA_USB4_A2A_CHUNK_BYTES=$chunk"
     "TBV_APP_TIMEOUT=$timeout_s"
   )
+  if [[ -n "$hoststream_timing" ]]; then
+    env_vars+=("RCCL_ROCSHMEM_HOST_STREAM_TIMING=$hoststream_timing")
+  fi
   cmd=(
     bash "$script_dir/tbv_app_gate.sh"
     --hosts "$hosts"
@@ -168,6 +204,13 @@ run_chunk() {
   append_dir_arg cmd --rdma-lib "$rdma_lib"
   append_dir_arg cmd --numactl-lib "$numactl_lib"
   append_dir_arg cmd --expected-rccl-lib "$expected_rccl_lib"
+  append_value_arg cmd --rocshmem-num-sym-buf "$rccl_num_sym_buf"
+  append_value_arg cmd --hoststream-fixed-symid "$hoststream_fixed_symid"
+  append_value_arg cmd --hoststream-fixed-src-symid "$hoststream_fixed_src_symid"
+  append_value_arg cmd --hoststream-fixed-dst-symid "$hoststream_fixed_dst_symid"
+  append_value_arg cmd --hoststream-addr-log "$hoststream_addr_log"
+  append_value_arg cmd --usb4-a2a-post-log "$usb4_a2a_post_log"
+  append_value_arg cmd --usb4-a2a-timing-log "$usb4_a2a_timing_log"
   if [[ "$allow_late_send_ack_no_qp" == 1 ]]; then
     cmd+=(--allow-late-send-ack-no-qp)
   fi
