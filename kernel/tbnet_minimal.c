@@ -1162,6 +1162,31 @@ tbv_tbnet_minimal_send_logout_request(struct tbv_tbnet_minimal_session *session,
 	return ret;
 }
 
+static void
+tbv_tbnet_minimal_send_shutdown_logout(struct tbv_tbnet_minimal_session *session)
+{
+	bool should_logout;
+	u8 sequence;
+	int ret;
+
+	mutex_lock(&session->lock);
+	should_logout = session->login_sent || session->login_received ||
+			session->path_enabled;
+	sequence = (u8)(atomic_read(&session->command_id) & 0x3);
+	mutex_unlock(&session->lock);
+
+	if (!should_logout)
+		return;
+
+	ret = tbv_tbnet_minimal_send_logout_request(session, sequence);
+	if (ret)
+		pr_info("minimal TBnet shutdown logout route=0x%llx failed: %d\n",
+			session->xd->route, ret);
+	else
+		pr_info("minimal TBnet shutdown logout route=0x%llx acknowledged\n",
+			session->xd->route);
+}
+
 static int tbv_tbnet_minimal_handle_packet_common(
 	struct tb_xdomain *source_xd, const void *buf, size_t size, void *data)
 {
@@ -1416,6 +1441,7 @@ tbv_tbnet_minimal_destroy_session(struct tbv_tbnet_minimal_session *session)
 	cancel_work_sync(&session->disconnect_work);
 	cancel_work_sync(&session->rx_work);
 	cancel_delayed_work_sync(&session->tx_poll_work);
+	tbv_tbnet_minimal_send_shutdown_logout(session);
 	if (session->handler_registered) {
 		tb_unregister_protocol_handler(&session->handler);
 		session->handler_registered = false;
