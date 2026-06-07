@@ -1,0 +1,34 @@
+From a81b1139b462d0ed0c58a145de3d9299af550332 Mon Sep 17 00:00:00 2001
+From: georgewhewell <georgerw@gmail.com>
+Date: Sun, 7 Jun 2026 03:44:06 +0200
+Subject: [PATCH] thunderbolt: accept final short XDomain properties chunks
+
+---
+ drivers/thunderbolt/xdomain.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+index 121ec2db2a54..9f75301edffc 100644
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -1274,13 +1274,15 @@ static int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
+ 			 * least size of the response structure.
+ 			 */
+ 			len = res->hdr.xd_hdr.length_sn & TB_XDOMAIN_LENGTH_MASK;
+-			if (len < sizeof(*res) / 4) {
++			if (len < sizeof(*res) / 4 -
++			    sizeof(res->hdr.xd_hdr) / 4) {
+ 				ret = -EINVAL;
+ 				if (xdomain_debug)
+ 					pr_info("thunderbolt xdomain: properties response too short route=%llx offset=%u chunk_attempt=%u/%u xdp_len=%u min=%zu type=%s(%#x) src=%pUb dst=%pUb\n",
+ 						route, req.offset, attempt + 1,
+ 						attempts, len,
+-						sizeof(*res) / 4,
++						sizeof(*res) / 4 -
++						sizeof(res->hdr.xd_hdr) / 4,
+ 						tb_xdp_type_name(res->hdr.type),
+ 						res->hdr.type, &res->src_uuid,
+ 						&res->dst_uuid);
+-- 
+2.54.0
+

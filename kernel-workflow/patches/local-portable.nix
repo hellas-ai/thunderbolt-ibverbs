@@ -23,4 +23,12 @@ builtins.filter (patch: !(builtins.elem patch.name debugNames)) (import ./local.
     name = "usb4-xdomain-bridge-pad-mode";
     patch = ./0011-thunderbolt-xdomain-bridge-pad-mode.patch;
   }
+  {
+    name = "usb4-xdomain-bridge-sideband-mode";
+    patch = ./0013-thunderbolt-xdomain-add-bridge-sideband-mode.patch;
+  }
+  {
+    name = "usb4-xdomain-final-short-properties-chunk";
+    patch = ./0014-thunderbolt-accept-final-short-xdomain-properties-chunks.patch;
+  }
 ]

@@ -1,0 +1,381 @@
+From e5aacea866b8a42c924a6f5e7f47da81ce1acd20 Mon Sep 17 00:00:00 2001
+From: georgewhewell <georgerw@gmail.com>
+Date: Sun, 7 Jun 2026 02:55:57 +0200
+Subject: [PATCH] thunderbolt: add XDomain bridge sideband mode
+
+---
+ drivers/thunderbolt/xdomain.c | 226 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 220 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+index a2883a016a97..121ec2db2a54 100644
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -74,6 +74,11 @@ module_param_named(xdomain_bridge_pad, xdomain_bridge_pad, bool, 0644);
+ MODULE_PARM_DESC(xdomain_bridge_pad,
+ 		 "pad XDomain packets at routed-hub clobber windows (default: false)");
+ 
++static bool xdomain_bridge_sideband;
++module_param_named(xdomain_bridge_sideband, xdomain_bridge_sideband, bool, 0644);
++MODULE_PARM_DESC(xdomain_bridge_sideband,
++		 "carry XDP discovery data in preserved header fields on routed hubs (default: false)");
++
+ static unsigned int xdomain_bridge_properties_chunk;
+ module_param_named(xdomain_bridge_properties_chunk,
+ 		   xdomain_bridge_properties_chunk, uint, 0644);
+@@ -115,6 +120,16 @@ struct tb_xdomain_protocol_header {
+ #define XDOMAIN_BRIDGE_PAD_BYTES		(XDOMAIN_BRIDGE_PAD_DWORDS * 4)
+ #define XDOMAIN_BRIDGE_DATA_DWORDS		4
+ 
++#define XDOMAIN_BRIDGE_SIDEBAND			BIT(29)
++#define XDOMAIN_BRIDGE_SB_OFFSET_MASK		GENMASK(14, 6)
++#define XDOMAIN_BRIDGE_SB_OFFSET_SHIFT		6
++#define XDOMAIN_BRIDGE_SB_DATA_LEN_MASK		GENMASK(23, 15)
++#define XDOMAIN_BRIDGE_SB_DATA_LEN_SHIFT	15
++#define XDOMAIN_BRIDGE_SB_CHUNK_LEN_MASK	GENMASK(26, 24)
++#define XDOMAIN_BRIDGE_SB_CHUNK_LEN_SHIFT	24
++#define XDOMAIN_BRIDGE_SB_MAX_FIELD		0x1ff
++#define XDOMAIN_BRIDGE_SB_MAX_CHUNK		4
++
+ static u64 tb_xdomain_route(const struct tb_xdomain_header *hdr)
+ {
+ 	return ((u64)(hdr->route_hi & ~BIT(31)) << 32) | hdr->route_lo;
+@@ -178,6 +193,52 @@ static const char *tb_xdp_type_name(enum tb_xdp_type type)
+ 	}
+ }
+ 
++static bool tb_xdp_bridge_sideband(const struct tb_xdp_header *hdr)
++{
++	return xdomain_bridge_sideband &&
++	       (hdr->xd_hdr.length_sn & XDOMAIN_BRIDGE_SIDEBAND);
++}
++
++static u16 tb_xdp_bridge_sideband_offset(const struct tb_xdp_header *hdr)
++{
++	return (hdr->xd_hdr.length_sn & XDOMAIN_BRIDGE_SB_OFFSET_MASK) >>
++	       XDOMAIN_BRIDGE_SB_OFFSET_SHIFT;
++}
++
++static u16 tb_xdp_bridge_sideband_data_len(const struct tb_xdp_header *hdr)
++{
++	return (hdr->xd_hdr.length_sn & XDOMAIN_BRIDGE_SB_DATA_LEN_MASK) >>
++	       XDOMAIN_BRIDGE_SB_DATA_LEN_SHIFT;
++}
++
++static u8 tb_xdp_bridge_sideband_chunk_len(const struct tb_xdp_header *hdr)
++{
++	return (hdr->xd_hdr.length_sn & XDOMAIN_BRIDGE_SB_CHUNK_LEN_MASK) >>
++	       XDOMAIN_BRIDGE_SB_CHUNK_LEN_SHIFT;
++}
++
++static void tb_xdp_bridge_set_sideband(struct tb_xdp_header *hdr, u16 offset,
++				       u16 data_len, u8 chunk_len)
++{
++	hdr->xd_hdr.length_sn &= ~(XDOMAIN_BRIDGE_SIDEBAND |
++				   XDOMAIN_BRIDGE_SB_OFFSET_MASK |
++				   XDOMAIN_BRIDGE_SB_DATA_LEN_MASK |
++				   XDOMAIN_BRIDGE_SB_CHUNK_LEN_MASK);
++	hdr->xd_hdr.length_sn |= XDOMAIN_BRIDGE_SIDEBAND;
++	hdr->xd_hdr.length_sn |=
++		((u32)min_t(u16, offset, XDOMAIN_BRIDGE_SB_MAX_FIELD) <<
++		 XDOMAIN_BRIDGE_SB_OFFSET_SHIFT) &
++		XDOMAIN_BRIDGE_SB_OFFSET_MASK;
++	hdr->xd_hdr.length_sn |=
++		((u32)min_t(u16, data_len, XDOMAIN_BRIDGE_SB_MAX_FIELD) <<
++		 XDOMAIN_BRIDGE_SB_DATA_LEN_SHIFT) &
++		XDOMAIN_BRIDGE_SB_DATA_LEN_MASK;
++	hdr->xd_hdr.length_sn |=
++		((u32)min_t(u8, chunk_len, XDOMAIN_BRIDGE_SB_MAX_CHUNK) <<
++		 XDOMAIN_BRIDGE_SB_CHUNK_LEN_SHIFT) &
++		XDOMAIN_BRIDGE_SB_CHUNK_LEN_MASK;
++}
++
+ static void tb_xdomain_set_length(struct tb_xdp_header *hdr, u32 length)
+ {
+ 	hdr->xd_hdr.length_sn &= ~TB_XDOMAIN_LENGTH_MASK;
+@@ -210,6 +271,10 @@ static enum tb_xdp_type tb_xdp_expected_response_type(enum tb_xdp_type type)
+ 	}
+ }
+ 
++static inline void tb_xdp_fill_header(struct tb_xdp_header *hdr, u64 route,
++				      u8 sequence, enum tb_xdp_type type,
++				      size_t size);
++
+ static u32 tb_xdomain_bridge_pad_dwords(u32 dwords)
+ {
+ 	if (dwords <= XDOMAIN_BRIDGE_PAD_OFFSET_DWORDS)
+@@ -488,6 +553,24 @@ static bool tb_xdomain_match_common(const struct tb_cfg_request *req,
+ 	}
+ 
+ 	if (!uuid_equal(&res_hdr->uuid, &req_hdr->uuid)) {
++		if (xdomain_bridge_sideband &&
++		    uuid_equal(&req_hdr->uuid, &tb_xdp_uuid) &&
++		    req->request_size >= sizeof(struct tb_xdp_header) &&
++		    pkg->frame.size >= sizeof(struct tb_xdp_header) &&
++		    tb_xdp_bridge_sideband((const struct tb_xdp_header *)res_hdr)) {
++			const struct tb_xdp_header *req_xdp = req->request;
++			const struct tb_xdp_header *res_xdp = pkg->buffer;
++
++			if ((req_xdp->type == UUID_REQUEST ||
++			     req_xdp->type == UUID_REQUEST_OLD) &&
++			    res_xdp->type == UUID_RESPONSE)
++				return true;
++
++			if (req_xdp->type == PROPERTIES_REQUEST &&
++			    res_xdp->type == PROPERTIES_RESPONSE)
++				return true;
++		}
++
+ 		if (xdomain_debug)
+ 			pr_info_ratelimited("thunderbolt xdomain: match drop protocol uuid req_uuid=%pUb res_uuid=%pUb route=%llx frame_size=%u\n",
+ 					    &req_hdr->uuid, &res_hdr->uuid,
+@@ -512,7 +595,7 @@ static void *tb_xdomain_bridge_pad_copy(const void *src, size_t src_size,
+ 	u8 *dst;
+ 
+ 	*dst_size = src_size;
+-	if (!xdomain_bridge_pad || src_size % 4 ||
++	if (xdomain_bridge_sideband || !xdomain_bridge_pad || src_size % 4 ||
+ 	    src_dwords <= XDOMAIN_BRIDGE_PAD_OFFSET_DWORDS)
+ 		return NULL;
+ 
+@@ -561,6 +644,16 @@ static u16 tb_xdomain_bridge_properties_max_data_length(void)
+ 	u32 max_data = TB_XDP_PROPERTIES_MAX_DATA_LENGTH;
+ 	u32 fixed_dwords, dwords;
+ 
++	if (xdomain_bridge_sideband) {
++		if (xdomain_bridge_properties_chunk)
++			max_data = min_t(u32, XDOMAIN_BRIDGE_SB_MAX_CHUNK,
++					 xdomain_bridge_properties_chunk);
++		else
++			max_data = XDOMAIN_BRIDGE_SB_MAX_CHUNK;
++
++		return min_t(u32, max_data, TB_XDP_PROPERTIES_MAX_DATA_LENGTH);
++	}
++
+ 	if (!xdomain_bridge_pad)
+ 		return max_data;
+ 
+@@ -644,6 +737,7 @@ static bool tb_xdomain_match(const struct tb_cfg_request *req,
+ 			const struct tb_xdp_header *res_hdr = pkg->buffer;
+ 			const struct tb_xdp_header *req_hdr = req->request;
+ 			enum tb_xdp_type expected_type;
++			bool sideband;
+ 
+ 			if (req->request_size < sizeof(*req_hdr) ||
+ 			    pkg->frame.size < sizeof(*res_hdr)) {
+@@ -657,6 +751,7 @@ static bool tb_xdomain_match(const struct tb_cfg_request *req,
+ 			}
+ 
+ 			expected_type = tb_xdp_expected_response_type(req_hdr->type);
++			sideband = tb_xdp_bridge_sideband(res_hdr);
+ 			if (res_hdr->type != expected_type &&
+ 			    res_hdr->type != ERROR_RESPONSE) {
+ 				if (xdomain_debug)
+@@ -674,7 +769,7 @@ static bool tb_xdomain_match(const struct tb_cfg_request *req,
+ 				return false;
+ 			}
+ 
+-			if (req_hdr->type == PROPERTIES_REQUEST &&
++			if (req_hdr->type == PROPERTIES_REQUEST && !sideband &&
+ 			    !tb_xdomain_match_properties(req, pkg))
+ 				return false;
+ 
+@@ -701,6 +796,53 @@ static bool tb_xdomain_match(const struct tb_cfg_request *req,
+ 	}
+ }
+ 
++static bool tb_xdomain_copy_properties_sideband(struct tb_cfg_request *req,
++					       const struct ctl_pkg *pkg)
++{
++	const struct tb_xdp_header *res_hdr = pkg->buffer;
++	const struct tb_xdp_properties *prop_req = req->request;
++	struct tb_xdp_properties_response *res = req->response;
++	u16 offset, data_len;
++	u8 chunk_len;
++
++	if (!xdomain_bridge_sideband ||
++	    req->response_type != TB_CFG_PKG_XDOMAIN_RESP ||
++	    req->request_size < sizeof(*prop_req) ||
++	    req->response_size < sizeof(*res) ||
++	    pkg->frame.size < sizeof(*res_hdr) ||
++	    !uuid_equal(&prop_req->hdr.uuid, &tb_xdp_uuid) ||
++	    prop_req->hdr.type != PROPERTIES_REQUEST ||
++	    res_hdr->type != PROPERTIES_RESPONSE ||
++	    !tb_xdp_bridge_sideband(res_hdr))
++		return false;
++
++	offset = tb_xdp_bridge_sideband_offset(res_hdr);
++	data_len = tb_xdp_bridge_sideband_data_len(res_hdr);
++	chunk_len = tb_xdp_bridge_sideband_chunk_len(res_hdr);
++
++	if (!data_len || data_len > TB_XDP_PROPERTIES_MAX_LENGTH ||
++	    !chunk_len || chunk_len > XDOMAIN_BRIDGE_SB_MAX_CHUNK ||
++	    offset >= data_len || offset + chunk_len > data_len ||
++	    sizeof(*res) + chunk_len * 4 > req->response_size) {
++		req->result.err = -EINVAL;
++		return true;
++	}
++
++	memset(res, 0, req->response_size);
++	tb_xdp_fill_header(&res->hdr, tb_xdp_route(res_hdr),
++			   tb_xdp_sequence(res_hdr), PROPERTIES_RESPONSE,
++			   sizeof(*res) + chunk_len * 4);
++	uuid_copy(&res->src_uuid, &prop_req->dst_uuid);
++	uuid_copy(&res->dst_uuid, &prop_req->src_uuid);
++	res->offset = offset;
++	res->data_length = data_len;
++	res->generation = 1;
++	memcpy(res->data, &res_hdr->uuid, chunk_len * 4);
++	req->result.err = 0;
++
++	return true;
++}
++
+ static bool tb_xdomain_copy(struct tb_cfg_request *req,
+ 			    const struct ctl_pkg *pkg)
+ {
+@@ -709,6 +851,9 @@ static bool tb_xdomain_copy(struct tb_cfg_request *req,
+ 	size_t copied, req_size;
+ 
+ 	memset(req->response, 0, req->response_size);
++	if (tb_xdomain_copy_properties_sideband(req, pkg))
++		return true;
++
+ 	copied = tb_xdomain_bridge_unpad_copy(req->response, req->response_size,
+ 					      pkg->buffer, pkg->frame.size);
+ 	req->result.err = 0;
+@@ -947,6 +1092,19 @@ static int tb_xdp_uuid_request(struct tb_ctl *ctl, u64 route, int retry,
+ 		}
+ 
+ 		candidate_route = (u64)res.src_route_hi << 32 | res.src_route_lo;
++		if (tb_xdp_bridge_sideband(&res.hdr) &&
++		    !uuid_equal(&res.hdr.uuid, &tb_xdp_uuid) &&
++		    !uuid_is_null(&res.hdr.uuid)) {
++			uuid_copy(uuid, &res.hdr.uuid);
++			*remote_route = tb_xdp_route(&res.hdr);
++			if (xdomain_debug)
++				pr_info("thunderbolt xdomain: rx sideband UUID response req_route=%llx res_route=%llx seq=%u attempt=%u/%u uuid=%pUb\n",
++					route, *remote_route,
++					tb_xdp_sequence(&res.hdr), attempt + 1,
++					attempts, uuid);
++			return 0;
++		}
++
+ 		if (xdomain_bridge_pad &&
+ 		    (uuid_is_null(&res.src_uuid) ||
+ 		     tb_route_length(candidate_route) > TB_SWITCH_MAX_DEPTH)) {
+@@ -986,6 +1144,10 @@ static int tb_xdp_uuid_response(struct tb_ctl *ctl, u64 route, u8 sequence,
+ 	uuid_copy(&res.src_uuid, uuid);
+ 	res.src_route_hi = upper_32_bits(route);
+ 	res.src_route_lo = lower_32_bits(route);
++	if (xdomain_bridge_sideband) {
++		uuid_copy(&res.hdr.uuid, uuid);
++		tb_xdp_bridge_set_sideband(&res.hdr, 0, 0, 0);
++	}
+ 	if (xdomain_debug)
+ 		pr_info("thunderbolt xdomain: tx UUID response route=%llx seq=%u uuid=%pUb\n",
+ 			route, sequence, uuid);
+@@ -1047,6 +1209,9 @@ static int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
+ 
+ 		for (attempt = 0; attempt < attempts; attempt++) {
+ 			tb_xdomain_set_sequence(&req.hdr, sequence++ % 4);
++			if (xdomain_bridge_sideband)
++				tb_xdp_bridge_set_sideband(&req.hdr, req.offset,
++							   0, 0);
+ 			memset(res, 0, total_size);
+ 
+ 			if (xdomain_debug)
+@@ -1231,11 +1396,35 @@ static int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
+ static int tb_xdp_properties_response(struct tb *tb, struct tb_ctl *ctl,
+ 	struct tb_xdomain *xd, u8 sequence, const struct tb_xdp_properties *req)
+ {
++	struct tb_xdp_properties sideband_req;
+ 	struct tb_xdp_properties_response *res;
++	bool sideband = tb_xdp_bridge_sideband(&req->hdr);
+ 	size_t total_size;
+ 	u16 len;
+ 	int ret;
+ 
++	if (sideband) {
++		if (xd->remote_uuid) {
++			memcpy(&sideband_req, req, sizeof(sideband_req));
++			uuid_copy(&sideband_req.src_uuid, xd->remote_uuid);
++			uuid_copy(&sideband_req.dst_uuid, xd->local_uuid);
++			sideband_req.offset =
++				tb_xdp_bridge_sideband_offset(&req->hdr);
++			sideband_req.reserved = 0;
++			req = &sideband_req;
++
++			if (xdomain_debug)
++				dev_info(&xd->dev, "XDomain sideband properties request packet_route=%llx xd_route=%llx seq=%u offset=%u src=%pUb dst=%pUb\n",
++					 tb_xdp_route(&req->hdr), xd->route,
++					 sequence, req->offset, &req->src_uuid,
++					 &req->dst_uuid);
++		} else if (xdomain_debug) {
++			dev_info(&xd->dev, "XDomain sideband properties request missing remote UUID packet_route=%llx xd_route=%llx seq=%u offset=%u\n",
++				 tb_xdp_route(&req->hdr), xd->route, sequence,
++				 tb_xdp_bridge_sideband_offset(&req->hdr));
++		}
++	}
++
+ 	if (xdomain_debug)
+ 		dev_info(&xd->dev, "XDomain rx properties request packet_route=%llx xd_route=%llx state=%s seq=%u offset=%u src=%pUb dst=%pUb local=%pUb remote=%pUb\n",
+ 			 tb_xdp_route(&req->hdr), xd->route,
+@@ -1254,8 +1443,8 @@ static int tb_xdp_properties_response(struct tb *tb, struct tb_ctl *ctl,
+ 				 tb_xdp_route(&req->hdr), xd->route, sequence,
+ 				 req->offset, &req->src_uuid, &req->dst_uuid,
+ 				 xd->local_uuid, xd->remote_uuid,
+-				 xdomain_bridge_pad);
+-		if (!xdomain_bridge_pad)
++				 xdomain_bridge_pad || sideband);
++		if (!xdomain_bridge_pad && !sideband)
+ 			tb_xdp_error_response(ctl, xd->route, sequence,
+ 					      ERROR_UNKNOWN_DOMAIN);
+ 		return 0;
+@@ -1269,9 +1458,9 @@ static int tb_xdp_properties_response(struct tb *tb, struct tb_ctl *ctl,
+ 				 tb_xdp_route(&req->hdr), xd->route, sequence,
+ 				 req->offset, xd->local_property_block_len,
+ 				 &req->src_uuid, &req->dst_uuid,
+-				 xdomain_bridge_pad);
++				 xdomain_bridge_pad || sideband);
+ 		mutex_unlock(&xd->lock);
+-		return xdomain_bridge_pad ? 0 : -EINVAL;
++		return (xdomain_bridge_pad || sideband) ? 0 : -EINVAL;
+ 	}
+ 
+ 	len = xd->local_property_block_len - req->offset;
+@@ -1280,6 +1469,31 @@ static int tb_xdp_properties_response(struct tb *tb, struct tb_ctl *ctl,
+ 		mutex_unlock(&xd->lock);
+ 		return -EMSGSIZE;
+ 	}
++
++	if (xdomain_bridge_sideband) {
++		struct tb_xdp_header sideband_res;
++
++		memset(&sideband_res, 0, sizeof(sideband_res));
++		tb_xdp_fill_header(&sideband_res, xd->route, sequence,
++				   PROPERTIES_RESPONSE, sizeof(sideband_res));
++		tb_xdp_bridge_set_sideband(&sideband_res, req->offset,
++					   xd->local_property_block_len, len);
++		memset(&sideband_res.uuid, 0, sizeof(sideband_res.uuid));
++		memcpy(&sideband_res.uuid, &xd->local_property_block[req->offset],
++		       len * 4);
++
++		if (xdomain_debug)
++			dev_info(&xd->dev, "XDomain tx sideband properties response route=%llx seq=%u offset=%u chunk_len=%u block_len=%u gen=%u\n",
++				 xd->route, sequence, req->offset, len,
++				 xd->local_property_block_len,
++				 xd->local_property_block_gen);
++
++		mutex_unlock(&xd->lock);
++		return __tb_xdomain_response(ctl, &sideband_res,
++					     sizeof(sideband_res),
++					     TB_CFG_PKG_XDOMAIN_RESP);
++	}
++
+ 	total_size = sizeof(*res) + len * 4;
+ 
+ 	res = kzalloc(total_size, GFP_KERNEL);
+-- 
+2.54.0
+
