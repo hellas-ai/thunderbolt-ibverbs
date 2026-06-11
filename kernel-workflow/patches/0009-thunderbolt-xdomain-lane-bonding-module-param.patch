@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: georgewhewell <georgerw@gmail.com>
+Date: Fri, 5 Jun 2026 02:25:00 +0200
+Subject: [PATCH] thunderbolt: add XDomain lane bonding module parameter
+
+Add a debug module parameter that can skip the automatic XDomain lane
+bonding handshake while leaving the default behavior unchanged.
+
+This is useful when investigating non-standard topologies where the two
+domains report asymmetric link state through an intermediate hub.
+---
+ drivers/thunderbolt/xdomain.c | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+index 7e0d0641242a..47fd0994b919 100644
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -53,6 +53,11 @@ static const char * const state_names[] = {
+ 	[XDOMAIN_STATE_ERROR] = "ERROR",
+ };
+ 
++static bool xdomain_lane_bonding = true;
++module_param_named(xdomain_lane_bonding, xdomain_lane_bonding, bool, 0644);
++MODULE_PARM_DESC(xdomain_lane_bonding,
++		 "enable automatic XDomain lane bonding (default: true)");
++
+ struct xdomain_request_work {
+ 	struct work_struct work;
+ 	struct tb_xdp_header *pkg;
+@@ -1726,10 +1731,14 @@ static void tb_xdomain_state_work(struct work_struct *work)
+ 			tb_xdomain_failed(xd);
+ 		} else {
+ 			tb_xdomain_queue_properties_changed(xd);
+-			if (xd->bonding_possible)
+-				tb_xdomain_queue_link_status(xd);
+-			else
+-				tb_xdomain_queue_properties(xd);
++			if (xd->bonding_possible && xdomain_lane_bonding) {
++				tb_xdomain_queue_link_status(xd);
++			} else {
++				if (xd->bonding_possible)
++					dev_dbg(&xd->dev,
++						"XDomain lane bonding disabled by module parameter\n");
++				tb_xdomain_queue_properties(xd);
++			}
+ 		}
+ 		break;
+ 
+-- 
+2.53.0

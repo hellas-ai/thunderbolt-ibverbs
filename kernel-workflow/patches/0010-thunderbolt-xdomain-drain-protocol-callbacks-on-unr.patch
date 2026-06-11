@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: georgewhewell <georgerw@gmail.com>
+Date: Mon, 8 Jun 2026 00:00:00 +0000
+Subject: [PATCH] thunderbolt: xdomain: drain protocol callbacks on unregister
+
+tb_unregister_protocol_handler() removes the handler from the dispatch list,
+but before this change it could return while a protocol dispatch that selected
+that handler was still running.  The dispatcher also drops xdomain_lock while
+calling a handler, so a concurrent unregister can remove another handler that
+the in-flight list walk has already saved as its next pointer.
+
+Module owner pinning protects callback text.  It does not protect dynamically
+allocated handler objects or handler->data.
+
+Track active XDomain protocol dispatches and wait for them to drain after
+removing a handler from the list.  After tb_unregister_protocol_handler()
+returns, the caller can free handler-owned callback data without a separate
+delay or driver-private grace period.
+
+Signed-off-by: georgewhewell <georgerw@gmail.com>
+---
+ drivers/thunderbolt/xdomain.c | 15 +++++++++++++++
+ include/linux/thunderbolt.h   |  1 +
+ 2 files changed, 16 insertions(+)
+
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+index ccc04a2..09a0ef4 100644
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -7,6 +7,7 @@
+  *          Mika Westerberg <mika.westerberg@linux.intel.com>
+  */
+ 
++#include <linux/atomic.h>
+ #include <linux/device.h>
+ #include <linux/delay.h>
+ #include <linux/kmod.h>
+@@ -17,6 +18,7 @@
+ #include <linux/string_helpers.h>
+ #include <linux/utsname.h>
+ #include <linux/uuid.h>
++#include <linux/wait.h>
+ #include <linux/workqueue.h>
+ 
+ #include "tb.h"
+@@ -76,6 +78,8 @@ static u32 xdomain_property_block_gen;
+ 
+ /* Additional protocol handlers */
+ static LIST_HEAD(protocol_handlers);
++static atomic_t protocol_dispatch_active = ATOMIC_INIT(0);
++static DECLARE_WAIT_QUEUE_HEAD(protocol_dispatch_wait);
+ 
+ /* UUID for XDomain discovery protocol: b638d70e-42ff-40bb-97c2-90e2c0b2ff07 */
+ static const uuid_t tb_xdp_uuid =
+@@ -701,6 +705,8 @@ void tb_unregister_protocol_handler(struct tb_protocol_handler *handler)
+ 	mutex_lock(&xdomain_lock);
+ 	list_del_init(&handler->list);
+ 	mutex_unlock(&xdomain_lock);
++	wait_event(protocol_dispatch_wait,
++		   !atomic_read(&protocol_dispatch_active));
+ }
+ EXPORT_SYMBOL_GPL(tb_unregister_protocol_handler);
+ 
+@@ -2702,6 +2708,7 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 	route = ((u64)hdr->xd_hdr.route_hi << 32 | hdr->xd_hdr.route_lo) &
+ 		~BIT_ULL(63);
+ 	source_xd = tb_xdomain_find_by_route_locked(tb, route);
++	atomic_inc(&protocol_dispatch_active);
+ 
+ 	mutex_lock(&xdomain_lock);
+ 	list_for_each_entry_safe(handler, tmp, &protocol_handlers, list) {
+@@ -2731,6 +2738,9 @@ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 	}
+ 	mutex_unlock(&xdomain_lock);
+ 
++	if (atomic_dec_and_test(&protocol_dispatch_active))
++		wake_up_all(&protocol_dispatch_wait);
++
+ 	if (!matched) {
+ 		const u32 *w = buf;
+ 		size_t n = size / 4;
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index 4698440..40cb20e 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -385,5 +385,6 @@ int tb_xdomain_request(struct tb_xdomain *xd, const void *request,
+ #define TB_PROTOCOL_HANDLER_HAS_XDOMAIN 1
+ #define TB_PROTOCOL_HANDLER_HAS_OWNER 1
++#define TB_PROTOCOL_HANDLER_UNREGISTER_DRAINS 1
+ struct module;
+ struct tb_protocol_handler {
+ 	const uuid_t *uuid;
+-- 
+2.54.0

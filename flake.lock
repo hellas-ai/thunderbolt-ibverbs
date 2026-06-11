@@ -3,10 +3,10 @@
     "linux-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1779802034,
-        "narHash": "sha256-AtgoTQnF7yPt7dyYJjQIy8zt1JGdebkHSmVcoUxu7Xo=",
+        "lastModified": 1780549139,
+        "narHash": "sha256-HkhLiKigaUCQeH6z5enWhExJtW2LLh4NHVBrSlZc3XU=",
         "ref": "refs/heads/next",
-        "rev": "d73a08958e66849ea713d2f458b2fcf7b183f987",
+        "rev": "503c5ae1e72aa9ed91925dafa3d82ee2e992747f",
         "shallow": true,
         "type": "git",
         "url": "https://git.kernel.org/pub/scm/linux/kernel/git/westeri/thunderbolt.git"

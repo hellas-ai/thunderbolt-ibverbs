@@ -94,4 +94,50 @@ nix run .#tbv-perftest -- --hosts strix-1,strix-2 \
   --tag rxe-tbnet --csv "$out/rxe-tbnet.csv" --jsonl "$out/rxe-tbnet.jsonl"
 ```
 
+## Apple Thunderbolt RDMA
+
+Apple `rdma_en*` devices need the Thunderbolt interface, not `bridge0`, to own
+the per-port test IP. Use MLX's configurator or equivalent `ifconfig` setup
+before running perftest; this creates the IPv4-mapped GID at index 1 that
+JACCL and Apple's provider expect.
+
+```sh
+# Run from the first Mac. Use LAN/Wi-Fi/Ethernet SSH names here, not the
+# Thunderbolt data addresses.
+mlx.distributed_config \
+  --hosts localhost,<peer-lan-host-or-ip> \
+  --over thunderbolt \
+  --backend jaccl \
+  --auto-setup \
+  --output-hostfile /tmp/mlx_hosts_auto.json
+```
+
+When SSH and RDMA use different addresses, tell `tbv-perftest` both. The
+runner still SSHs `--server` / `--client`, but passes `--*-data-addr` to the
+perftest client so address exchange selects the Thunderbolt GID.
+
+```sh
+# Example: goblin rdma_en2 at 192.168.0.1, mbp rdma_en3 at 192.168.0.2.
+nix run .#tbv-perftest -- \
+  --server goblin \
+  --client 192.168.23.240 \
+  --server-dev rdma_en2 \
+  --client-dev rdma_en3 \
+  --server-data-addr 192.168.0.1 \
+  --client-data-addr 192.168.0.2 \
+  --only 'bw.uc.ib_send_bw.size65536.qps1' \
+  --only 'lat.uc.ib_send_lat.size4096' \
+  --directions both \
+  --no-rail-check \
+  --tag apple-uc-smoke \
+  --csv "$out/apple-uc-smoke.csv" \
+  --jsonl "$out/apple-uc-smoke.jsonl"
+```
+
+For `rdma_en*` UC cases the runner defaults to `--gid-index 1`, `--mtu 1024`,
+and caps UC SEND queue depths at 32. These defaults match the working JACCL
+shape. UC SEND is the reliable Apple smoke path; UC WRITE cases are still useful
+for investigation but can hang or report misleading bandwidth depending on the
+peer implementation.
+
 Historical checked-in result sets live under `bench/results/`.

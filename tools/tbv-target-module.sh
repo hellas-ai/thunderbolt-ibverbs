@@ -16,6 +16,9 @@ kernel.
 Options:
   --nixos-config PATH          NixOS config flake, default ../nixos-config.
   --config ATTR                nixosConfigurations attr, default TARGET.
+  --booted-kernel              Build directly against TARGET's currently
+                              booted kernel store derivation, skipping the
+                              NixOS config evaluation.
   --ssh HOST                   SSH host, default TARGET.
   --copy-to STORE             Nix copy destination, default ssh-ng://SSH_HOST.
   --copy                      Copy the verified module closure to TARGET.
@@ -37,6 +40,7 @@ Options:
 Examples:
   tools/tbv-target-module.sh router --nixos-config ../nixos-config
   tools/tbv-target-module.sh router --copy
+  tools/tbv-target-module.sh strix-1 --booted-kernel --reload --options 'profile=linux_perf ...'
   tools/tbv-target-module.sh router --reload --options 'profile=mac_compat ...'
 EOF
 }
@@ -52,7 +56,7 @@ sh_quote() {
 }
 
 abs_dir() {
-	(CDPATH= cd -- "$1" && pwd)
+	(CDPATH=; cd -- "$1" && pwd)
 }
 
 repo_root="$(abs_dir "$(dirname -- "${BASH_SOURCE[0]}")/..")"
@@ -63,6 +67,7 @@ ssh_host=""
 copy_to=""
 copy=0
 reload=0
+booted_kernel=0
 allow_empty_options=0
 allow_kernel_path_mismatch=0
 check_sigs=0
@@ -85,6 +90,9 @@ while (($#)); do
 		shift
 		[[ $# -gt 0 ]] || die "--config requires an attr name"
 		config_attr="$1"
+		;;
+	--booted-kernel)
+		booted_kernel=1
 		;;
 	--ssh)
 		shift
@@ -162,23 +170,38 @@ trap cleanup EXIT
 
 expr="$tmpdir/module.nix"
 kernel_expr="$tmpdir/kernel-path.nix"
-cat >"$expr" <<EOF
-let
-  flake = builtins.getFlake "path:$nixos_config";
-  cfg = (builtins.getAttr "$config_attr" flake.nixosConfigurations).config;
-in
-  cfg.boot.kernelPackages.callPackage $repo_root/nix/module.nix {
-    source = $repo_root;
-  }
-EOF
 
-cat >"$kernel_expr" <<EOF
-let
-  flake = builtins.getFlake "path:$nixos_config";
-  cfg = (builtins.getAttr "$config_attr" flake.nixosConfigurations).config;
-in
-  toString cfg.boot.kernelPackages.kernel
-EOF
+find_booted_kernel_dev() {
+	local kernel_path=$1
+	local drv
+	local output
+	local -a dev_outputs=()
+
+	[[ -n "$kernel_path" ]] || die "remote booted kernel path is empty"
+	[[ -e "$kernel_path" ]] ||
+		die "remote booted kernel path is not present in the local store: $kernel_path"
+
+	drv="$(nix-store -q --deriver "$kernel_path" 2>/dev/null || true)"
+	[[ -n "$drv" && "$drv" != "unknown-deriver" ]] ||
+		die "could not find local deriver for booted kernel $kernel_path"
+
+	while IFS= read -r output; do
+		[[ -n "$output" ]] || continue
+		case "$output" in
+		*-dev)
+			dev_outputs+=("$output")
+			;;
+		esac
+	done < <(nix-store -q --outputs "$drv")
+
+	if [[ "${#dev_outputs[@]}" -ne 1 ]]; then
+		printf 'kernel derivation outputs for %s:\n' "$drv" >&2
+		nix-store -q --outputs "$drv" >&2 || true
+		die "expected exactly one booted-kernel dev output, found ${#dev_outputs[@]}"
+	fi
+
+	printf '%s\n' "${dev_outputs[0]}"
+}
 
 printf '==> Target: %s via ssh %s\n' "$config_attr" "$ssh_host"
 remote_uname="$(ssh "$ssh_host" 'uname -r')"
@@ -189,16 +212,58 @@ if [[ -n "$remote_kernel" ]]; then
 	printf '==> Remote booted kernel: %s\n' "$remote_kernel"
 fi
 
-config_kernel="$(nix eval --impure --raw "${nix_override_args[@]}" --expr "$(<"$kernel_expr")")"
-printf '==> Config kernel: %s\n' "$config_kernel"
-if [[ -n "$remote_kernel" && "$config_kernel" != "$remote_kernel" ]]; then
-	if [[ "$allow_kernel_path_mismatch" != 1 ]]; then
-		die "config kernel does not match remote booted kernel; deploy/reboot the target or pass --allow-kernel-path-mismatch for an explicit ABI-only experiment"
+if [[ "$booted_kernel" == 1 ]]; then
+	booted_kernel_dev="$(find_booted_kernel_dev "$remote_kernel")"
+	printf '==> Booted kernel dev: %s\n' "$booted_kernel_dev"
+	cat >"$expr" <<EOF
+let
+  flake = builtins.getFlake "path:$repo_root";
+  pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; };
+  kernel = {
+    modDirVersion = "$remote_uname";
+    dev = builtins.storePath "$booted_kernel_dev";
+    moduleBuildDependencies = pkgs.linuxPackages.kernel.moduleBuildDependencies;
+  };
+in
+  pkgs.callPackage $repo_root/nix/module.nix {
+    inherit kernel;
+    source = $repo_root;
+  }
+EOF
+else
+	cat >"$expr" <<EOF
+let
+  flake = builtins.getFlake "path:$nixos_config";
+  cfg = (builtins.getAttr "$config_attr" flake.nixosConfigurations).config;
+in
+  cfg.boot.kernelPackages.callPackage $repo_root/nix/module.nix {
+    source = $repo_root;
+  }
+EOF
+
+	cat >"$kernel_expr" <<EOF
+let
+  flake = builtins.getFlake "path:$nixos_config";
+  cfg = (builtins.getAttr "$config_attr" flake.nixosConfigurations).config;
+in
+  toString cfg.boot.kernelPackages.kernel
+EOF
+
+	config_kernel="$(nix eval --impure --raw "${nix_override_args[@]}" --expr "$(<"$kernel_expr")")"
+	printf '==> Config kernel: %s\n' "$config_kernel"
+	if [[ -n "$remote_kernel" && "$config_kernel" != "$remote_kernel" ]]; then
+		if [[ "$allow_kernel_path_mismatch" != 1 ]]; then
+			die "config kernel does not match remote booted kernel; deploy/reboot the target or pass --allow-kernel-path-mismatch for an explicit ABI-only experiment"
+		fi
+		printf 'warning: config kernel path differs from remote booted kernel; continuing by request\n' >&2
 	fi
-	printf 'warning: config kernel path differs from remote booted kernel; continuing by request\n' >&2
 fi
 
-printf '==> Building module for %s\n' "$config_attr"
+if [[ "$booted_kernel" == 1 ]]; then
+	printf '==> Building module for %s booted kernel\n' "$config_attr"
+else
+	printf '==> Building module for %s configured kernel\n' "$config_attr"
+fi
 module_pkg="$(nix build --impure --no-link --print-out-paths "${nix_override_args[@]}" --expr "$(<"$expr")" | tail -n1)"
 [[ -n "$module_pkg" ]] || die "nix build produced no output path"
 
@@ -225,6 +290,7 @@ if [[ "$copy" == 1 ]]; then
 	printf '==> Copying module closure to %s\n' "$copy_to"
 	nix "${copy_args[@]}"
 
+	# shellcheck disable=SC2029 # $module is intentionally expanded locally.
 	remote_module_uname="$(ssh "$ssh_host" "modinfo -F vermagic $(sh_quote "$module") | awk '{print \$1}'")"
 	[[ "$remote_module_uname" == "$remote_uname" ]] ||
 		die "remote copied module vermagic '$remote_module_uname' does not match remote uname '$remote_uname'"
@@ -236,6 +302,7 @@ if [[ "$reload" == 1 ]]; then
 	fi
 	printf '==> Reloading thunderbolt_ibverbs on %s\n' "$ssh_host"
 	printf 'warning: --reload is non-atomic; a remote insmod failure leaves thunderbolt_ibverbs unloaded\n' >&2
+	# shellcheck disable=SC2029 # Module path/options are intentionally expanded locally.
 	ssh "$ssh_host" \
 		"sudo -n env TBV_MODULE=$(sh_quote "$module") TBV_EXPECTED_UNAME=$(sh_quote "$remote_uname") TBV_OPTIONS=$(sh_quote "$module_options") TBV_WAIT_SECS=$(sh_quote "$wait_secs") bash -s" <<'REMOTE'
 set -euo pipefail

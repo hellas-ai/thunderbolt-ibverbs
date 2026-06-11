@@ -170,6 +170,28 @@ tbv_tbnet_minimal_ctrl_matches(const struct tbv_tbnet_minimal_session *session,
 	       uuid_equal(&ctrl->target_uuid, session->xd->local_uuid);
 }
 
+static bool
+tbv_tbnet_minimal_response_matches(
+	const struct tbv_tbnet_minimal_session *session,
+	const struct tbv_tbip_control *request,
+	const struct tbv_tbip_control *response)
+{
+	/*
+	 * macOS echoes command_id in direct responses but advances sequence from
+	 * its own control stream. command_id identifies the request; sequence is
+	 * only meaningful for the sender's XDomain control flow.
+	 */
+	return tbv_tbnet_minimal_ctrl_matches(session, response) &&
+	       response->command_id == request->command_id;
+}
+
+static bool
+tbv_tbnet_minimal_status_matches(const struct tbv_tbnet_minimal_session *session,
+				 const struct tbv_tbip_control *response)
+{
+	return tbv_tbnet_minimal_ctrl_matches(session, response);
+}
+
 static u32 tbv_tbnet_minimal_frame_len(const struct ring_frame *frame)
 {
 	return frame->size ? frame->size : (u32)TBV_TBNET_MIN_FRAME_SIZE;
@@ -485,6 +507,29 @@ out:
 	return ready;
 }
 
+bool tbv_tbnet_minimal_path_ready(struct tbv_tbnet_identity *identity,
+				  const uuid_t *remote_uuid)
+{
+	struct tbv_tbnet_minimal_session *session;
+	bool ready = false;
+
+	if (identity->mode != TBV_TBNET_ID_MINIMAL_PACKET)
+		return false;
+
+	mutex_lock(&identity->lock);
+	list_for_each_entry(session, &identity->minimal_sessions, node) {
+		if (remote_uuid &&
+		    !uuid_equal(session->xd->remote_uuid, remote_uuid))
+			continue;
+		if (!READ_ONCE(session->path_enabled))
+			continue;
+		ready = true;
+		break;
+	}
+	mutex_unlock(&identity->lock);
+	return ready;
+}
+
 void tbv_tbnet_minimal_clear_neighbors_locked(struct tbv_tbnet_identity *identity)
 {
 	struct tbv_tbnet_minimal_session *session;
@@ -503,7 +548,8 @@ static void tbv_tbnet_minimal_recompute_state(struct tbv_tbnet_identity *identit
 
 	mutex_lock(&identity->lock);
 	tbv_tbnet_minimal_recompute_state_locked(identity);
-	ready = identity->state & TBV_TBNET_ID_STATE_NEIGHBOR_READY;
+	ready = identity->state & (TBV_TBNET_ID_STATE_PACKET_PATH_ACTIVE |
+				   TBV_TBNET_ID_STATE_NEIGHBOR_READY);
 	mutex_unlock(&identity->lock);
 
 	if (ready)
@@ -895,7 +941,6 @@ static void tbv_tbnet_minimal_teardown_path(struct tbv_tbnet_minimal_session *s)
 	}
 	s->login_sent = false;
 	s->login_received = false;
-	s->logout_reset_sent = false;
 	s->login_retries = 0;
 	mutex_unlock(&s->lock);
 
@@ -1005,6 +1050,11 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 	mutex_unlock(&session->lock);
 
 	if (need_reset) {
+		/*
+		 * A reload can leave macOS with a half-open ThunderboltIP
+		 * connection from the previous module instance. Clear that
+		 * protocol state before starting this session's LOGIN exchange.
+		 */
 		ret = tbv_tbnet_minimal_send_logout_request(session, sequence);
 		if (ret && ret != -ETIMEDOUT && ret != -ENODEV)
 			pr_debug("minimal TBnet logout reset route=0x%llx ret=%d\n",
@@ -1040,7 +1090,8 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 		ret = tbv_tbip_parse_login_response(reply, sizeof(reply),
 						    &response);
 	if (!ret &&
-	    (!tbv_tbnet_minimal_ctrl_matches(session, &response.ctrl) ||
+	    (!tbv_tbnet_minimal_response_matches(session, &params.ctrl,
+						 &response.ctrl) ||
 	     response.status)) {
 		ret = -EPROTO;
 	}
@@ -1070,6 +1121,7 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 			session->xd->route);
 	}
 	mutex_unlock(&session->lock);
+	tbv_services_tbnet_identity_ready(session->identity);
 	queue_work(system_long_wq, &session->connected_work);
 	if (retry_later)
 		queue_delayed_work(system_long_wq, &session->login_work,
@@ -1147,7 +1199,7 @@ tbv_tbnet_minimal_send_logout_request(struct tbv_tbnet_minimal_session *session,
 	if (!ret)
 		ret = tbv_tbip_parse_status(reply, sizeof(reply), &status);
 	if (!ret &&
-	    (!tbv_tbnet_minimal_ctrl_matches(session, &status.ctrl) ||
+	    (!tbv_tbnet_minimal_status_matches(session, &status.ctrl) ||
 	     status.status)) {
 		ret = -EPROTO;
 	}
@@ -1157,6 +1209,31 @@ tbv_tbnet_minimal_send_logout_request(struct tbv_tbnet_minimal_session *session,
 	}
 
 	return ret;
+}
+
+static void
+tbv_tbnet_minimal_send_shutdown_logout(struct tbv_tbnet_minimal_session *session)
+{
+	bool should_logout;
+	u8 sequence;
+	int ret;
+
+	mutex_lock(&session->lock);
+	should_logout = session->login_sent || session->login_received ||
+			session->path_enabled;
+	sequence = (u8)(atomic_read(&session->command_id) & 0x3);
+	mutex_unlock(&session->lock);
+
+	if (!should_logout)
+		return;
+
+	ret = tbv_tbnet_minimal_send_logout_request(session, sequence);
+	if (ret)
+		pr_info("minimal TBnet shutdown logout route=0x%llx failed: %d\n",
+			session->xd->route, ret);
+	else
+		pr_info("minimal TBnet shutdown logout route=0x%llx acknowledged\n",
+			session->xd->route);
 }
 
 static int tbv_tbnet_minimal_handle_packet_common(
@@ -1202,6 +1279,7 @@ static int tbv_tbnet_minimal_handle_packet_common(
 						   &session->login_work, 0);
 		}
 		mutex_unlock(&session->lock);
+		tbv_services_tbnet_identity_ready(session->identity);
 		queue_work(system_long_wq, &session->connected_work);
 		return 1;
 
@@ -1347,6 +1425,9 @@ static int tbv_tbnet_minimal_probe(struct tb_service *svc,
 #else
 	session->handler.callback = tbv_tbnet_minimal_handle_packet;
 #endif
+#ifdef TB_PROTOCOL_HANDLER_HAS_OWNER
+	session->handler.owner = THIS_MODULE;
+#endif
 	session->handler.data = session;
 	ret = tb_register_protocol_handler(&session->handler);
 	if (ret)
@@ -1359,8 +1440,7 @@ static int tbv_tbnet_minimal_probe(struct tb_service *svc,
 	mutex_unlock(&identity->lock);
 
 	tb_service_set_drvdata(svc, session);
-	queue_delayed_work(system_long_wq, &session->login_work,
-			   msecs_to_jiffies(1000));
+	queue_delayed_work(system_long_wq, &session->login_work, 0);
 	pr_info("bound minimal TBnet service id=%d route=0x%llx tx_path=%d mac=%pM prtcstns=0x%x\n",
 		svc->id, xd->route, session->local_transmit_path,
 		session->mac, svc->prtcstns);
@@ -1408,15 +1488,16 @@ tbv_tbnet_minimal_destroy_session(struct tbv_tbnet_minimal_session *session)
 	session->removing = true;
 	mutex_unlock(&session->lock);
 
+	if (session->handler_registered) {
+		tb_unregister_protocol_handler(&session->handler);
+		session->handler_registered = false;
+	}
 	cancel_delayed_work_sync(&session->login_work);
 	cancel_work_sync(&session->connected_work);
 	cancel_work_sync(&session->disconnect_work);
 	cancel_work_sync(&session->rx_work);
 	cancel_delayed_work_sync(&session->tx_poll_work);
-	if (session->handler_registered) {
-		tb_unregister_protocol_handler(&session->handler);
-		session->handler_registered = false;
-	}
+	tbv_tbnet_minimal_send_shutdown_logout(session);
 	tbv_tbnet_minimal_teardown_path(session);
 
 	mutex_lock(&identity->lock);
@@ -1457,6 +1538,11 @@ int tbv_tbnet_minimal_start(struct tbv_tbnet_identity *identity)
 {
 	u32 prtcstns = TBV_TBNET_MATCH_FRAGS_ID | TBV_TBNET_64K_FRAMES;
 	int ret;
+
+#ifndef TB_PROTOCOL_HANDLER_UNREGISTER_DRAINS
+	pr_err("tbnet_identity=minimal_packet requires XDomain protocol handler unregister-drain support\n");
+	return -EOPNOTSUPP;
+#endif
 
 	if (identity->minimal_started)
 		return 0;

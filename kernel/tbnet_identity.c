@@ -299,7 +299,7 @@ int tbv_tbip_parse_status(const void *buf, size_t size,
 
 	if (!result)
 		return -EINVAL;
-	if (size < sizeof(*msg))
+	if (!buf || size < sizeof(*msg))
 		return -EINVAL;
 
 	memset(result, 0, sizeof(*result));
