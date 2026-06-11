@@ -33,6 +33,7 @@
 #include <net/net_namespace.h>
 
 #include "tbv.h"
+#include "proto/tbnet.h"
 
 #define TBV_TBNET_MIN_LOGIN_DELAY_MS	4500
 #define TBV_TBNET_MIN_LOGIN_TIMEOUT_MS	500
@@ -40,9 +41,6 @@
 #define TBV_TBNET_MIN_LOGOUT_TIMEOUT_MS	1000
 #define TBV_TBNET_MIN_RING_SIZE		256
 #define TBV_TBNET_MIN_FRAME_SIZE	SZ_4K
-#define TBV_TBNET_E2E			BIT(0)
-#define TBV_TBNET_MATCH_FRAGS_ID	BIT(1)
-#define TBV_TBNET_64K_FRAMES		BIT(2)
 #define TBV_TBNET_L0_PORT_NUM(route)	((route) & GENMASK(5, 0))
 #define TBV_TBNET_PDF_FRAME_START	1
 #define TBV_TBNET_PDF_FRAME_END		2
@@ -387,8 +385,8 @@ tbv_tbnet_minimal_alloc_rings(struct tbv_tbnet_minimal_session *session)
 	int hopid;
 	int ret;
 
-	if (session->identity->minimal_e2e &&
-	    session->svc->prtcstns & TBV_TBNET_E2E)
+	if (tbv_tbnet_minimal_e2e_enabled(session->identity->minimal_e2e,
+					  session->svc->prtcstns))
 		flags |= RING_FLAG_E2E;
 
 	session->tx_ring = tb_ring_alloc_tx(session->xd->tb->nhi, -1,
@@ -1536,7 +1534,7 @@ static struct tb_service_driver tbv_tbnet_minimal_driver = {
 
 int tbv_tbnet_minimal_start(struct tbv_tbnet_identity *identity)
 {
-	u32 prtcstns = TBV_TBNET_MATCH_FRAGS_ID | TBV_TBNET_64K_FRAMES;
+	u32 prtcstns = tbv_tbnet_minimal_prtcstns(identity->minimal_e2e);
 	int ret;
 
 #ifndef TB_PROTOCOL_HANDLER_UNREGISTER_DRAINS
@@ -1556,8 +1554,6 @@ int tbv_tbnet_minimal_start(struct tbv_tbnet_identity *identity)
 					       "prtcvers", 1);
 	ret = ret ?: tb_property_add_immediate(identity->minimal_dir,
 					       "prtcrevs", 1);
-	if (identity->minimal_e2e)
-		prtcstns |= TBV_TBNET_E2E;
 	ret = ret ?: tb_property_add_immediate(identity->minimal_dir,
 					       "prtcstns",
 					       prtcstns);

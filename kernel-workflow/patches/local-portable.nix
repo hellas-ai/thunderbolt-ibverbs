@@ -15,8 +15,4 @@ builtins.filter (patch: !(builtins.elem patch.name debugNames)) (import ./local.
     name = "usb4-xdomain-lane-bonding-module-param";
     patch = ./0009-thunderbolt-xdomain-lane-bonding-module-param.patch;
   }
-  {
-    name = "usb4-xdomain-route-trace";
-    patch = ./0010-thunderbolt-trace-XDomain-route-matching.patch;
-  }
 ]
