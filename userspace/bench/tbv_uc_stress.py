@@ -41,6 +41,7 @@ CSV_FIELDS = [
     "repeat_index",
     "repeat_count",
     "port",
+    "connect_host",
     "status",
     "duration_s",
     "sender_rc",
@@ -103,6 +104,12 @@ def ssh_command(host: str, command: str) -> list[str]:
 
 def shell_join(args: list[str]) -> str:
     return " ".join(shlex.quote(arg) for arg in args)
+
+
+def safe_name(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
+    value = value.strip("-")
+    return value or "run"
 
 
 def uc_command(
@@ -237,13 +244,21 @@ def run_case(
 ) -> dict[str, str]:
     sender_tool = args.sender_tool or args.tool
     receiver_tool = args.receiver_tool or args.tool
-    connect_host = args.connect_host or receiver
+    if args.connect_host:
+        connect_host = args.connect_host
+    elif receiver == args.server:
+        connect_host = args.server_connect_host or receiver
+    elif receiver == args.client:
+        connect_host = args.client_connect_host or receiver
+    else:
+        connect_host = receiver
+    log_prefix = f"{safe_name(args.tag)}-" if args.tag else ""
     receiver_log = log_dir / (
-        f"{direction}-size{size}-sd{send_depth}-mtu{mtu}-"
+        f"{log_prefix}{direction}-port{port}-size{size}-sd{send_depth}-mtu{mtu}-"
         f"rep{repeat_index}-recv.log"
     )
     sender_log = log_dir / (
-        f"{direction}-size{size}-sd{send_depth}-mtu{mtu}-"
+        f"{log_prefix}{direction}-port{port}-size{size}-sd{send_depth}-mtu{mtu}-"
         f"rep{repeat_index}-send.log"
     )
 
@@ -346,6 +361,7 @@ def run_case(
         "repeat_index": str(repeat_index),
         "repeat_count": str(args.repeats),
         "port": str(port),
+        "connect_host": connect_host,
         "status": "ok" if ok else "fail",
         "duration_s": f"{time.monotonic() - start:.3f}",
         "sender_rc": str(sender_rc),
@@ -384,6 +400,16 @@ def main() -> int:
         help="Name/IP sender passes to --connect; defaults to receiver host.",
     )
     parser.add_argument(
+        "--server-connect-host",
+        default="",
+        help="Name/IP senders use when the server side is receiving.",
+    )
+    parser.add_argument(
+        "--client-connect-host",
+        default="",
+        help="Name/IP senders use when the client side is receiving.",
+    )
+    parser.add_argument(
         "--csv",
         default=f"tbv-uc-stress-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.csv",
     )
@@ -405,6 +431,7 @@ def main() -> int:
     parser.add_argument("--stop-on-fail", action="store_true")
     parser.add_argument("--no-check", dest="check", action="store_false")
     parser.add_argument("--no-check-any-order", dest="check_any_order", action="store_false")
+    parser.add_argument("--strict-order", dest="check_any_order", action="store_false")
     parser.set_defaults(check=True, check_any_order=True)
     args = parser.parse_args()
 

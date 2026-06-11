@@ -135,21 +135,21 @@ static bool tbv_service_backend_data_enabled(const struct tbv_state *state,
 	return state->native_data;
 }
 
-static bool tbv_service_tbnet_neighbor_ready(struct tbv_state *state,
-					     const struct tb_xdomain *xd)
+static bool tbv_service_tbnet_path_ready(struct tbv_state *state,
+					 const struct tb_xdomain *xd)
 {
 	if (state->cfg.tbnet_identity != TBV_TBNET_ID_MINIMAL_PACKET)
 		return true;
 
-	return tbv_tbnet_minimal_neighbor_ready(&state->tbnet_identity,
-						xd ? xd->remote_uuid : NULL);
+	return tbv_tbnet_minimal_path_ready(&state->tbnet_identity,
+					    xd ? xd->remote_uuid : NULL);
 }
 
-static bool tbv_service_should_defer_apple_tunnel(struct tbv_state *state,
-						  const struct tb_xdomain *xd)
+static bool tbv_service_should_defer_apple_rail(struct tbv_state *state,
+						const struct tb_xdomain *xd)
 {
-	return state->apple_tunnels_wait_tbnet &&
-	       !tbv_service_tbnet_neighbor_ready(state, xd);
+	return state->apple_rails_wait_tbnet &&
+	       !tbv_service_tbnet_path_ready(state, xd);
 }
 
 static bool tbv_service_has_pending_apple_rail_locked(struct tbv_state *state)
@@ -164,42 +164,75 @@ static bool tbv_service_has_pending_apple_rail_locked(struct tbv_state *state)
 
 		list_for_each_entry(rail, &peer->rails, node)
 			if (!rail->removing &&
-			    rail->path.state == TBV_PATH_RING_STARTED)
+			    !READ_ONCE(rail->ibdev) &&
+			    !READ_ONCE(rail->ibdev_register_failed) &&
+			    !READ_ONCE(rail->ibdev_register_deferred) &&
+			    tbv_rail_apple_service_ready(rail))
 				return true;
 	}
 
 	return false;
 }
 
-static void tbv_service_refresh_apple_tunnels_pending(struct tbv_state *state)
+static void tbv_service_refresh_apple_rails_pending(struct tbv_state *state)
 {
 	mutex_lock(&state->lock);
-	state->apple_tunnels_pending =
+	state->apple_rails_pending =
 		tbv_service_has_pending_apple_rail_locked(state);
 	mutex_unlock(&state->lock);
 }
 
-static int tbv_service_enable_apple_tunnel(struct tbv_rail *rail)
+static int tbv_service_enable_apple_rail_tunnel(struct tbv_rail *rail)
+{
+	struct tbv_peer *peer = rail->peer;
+	struct tbv_state *state = peer ? peer->state : NULL;
+	bool enable = false;
+	int ret = 0;
+
+	if (!peer || !state || !peer->xd)
+		return -ENODEV;
+
+	mutex_lock(&peer->control_lock);
+	mutex_lock(&state->lock);
+	if (rail->removing) {
+		ret = -ENODEV;
+	} else if (rail->path.state == TBV_PATH_TUNNEL_ENABLED) {
+		ret = 0;
+	} else if (rail->path.state == TBV_PATH_RING_STARTED) {
+		enable = true;
+	} else {
+		ret = -ENOTCONN;
+	}
+	mutex_unlock(&state->lock);
+
+	if (enable) {
+		ret = tbv_path_enable_tunnel(&rail->path, peer->xd,
+					     rail->path.cfg.receive_path);
+		if (!ret)
+			pr_info("enabled Apple data path service route=0x%llx tx_path=%d rx_path=%d tx_hop=%d rx_hop=%d\n",
+				peer->xd->route, rail->path.local_transmit_path,
+				rail->path.remote_transmit_path,
+				rail->path.local_tx_hop, rail->path.local_rx_hop);
+	}
+	mutex_unlock(&peer->control_lock);
+
+	return ret;
+}
+
+static int tbv_service_publish_apple_rail(struct tbv_rail *rail)
 {
 	struct tbv_peer *peer = rail->peer;
 	int ret;
 
-	ret = tbv_path_enable_tunnel(&rail->path, peer->xd,
-				     rail->path.cfg.receive_path);
+	ret = tbv_service_enable_apple_rail_tunnel(rail);
 	if (ret)
 		return ret;
 
-	pr_info("enabled Apple data path service route=0x%llx tx_path=%d rx_path=%d tx_hop=%d rx_hop=%d\n",
+	pr_info("publishing Apple data service route=0x%llx tx_path=%d rx_path=%d tx_hop=%d rx_hop=%d state=%s\n",
 		peer->xd->route, rail->path.local_transmit_path,
 		rail->path.remote_transmit_path, rail->path.local_tx_hop,
-		rail->path.local_rx_hop);
-	/*
-	 * Apple rails have no separate native HELLO/READY; the tunnel coming
-	 * up IS the data-ready edge. Publish here while we still hold a
-	 * stable reference to rail.
-	 */
-	tbv_ibdev_rail_event(peer->state, rail, true);
-	return 0;
+		rail->path.local_rx_hop, tbv_path_state_name(rail->path.state));
+	return tbv_ibdev_rail_event(peer->state, rail, true);
 }
 
 static struct tbv_rail *
@@ -217,29 +250,32 @@ tbv_service_next_pending_apple_rail(struct tbv_state *state)
 
 		list_for_each_entry(rail, &peer->rails, node) {
 			if (rail->removing ||
-			    rail->path.state != TBV_PATH_RING_STARTED)
+			    READ_ONCE(rail->ibdev) ||
+			    READ_ONCE(rail->ibdev_register_failed) ||
+			    READ_ONCE(rail->ibdev_register_deferred) ||
+			    !tbv_rail_apple_service_ready(rail))
 				continue;
 			pending = true;
-			if (!tbv_service_tbnet_neighbor_ready(state, peer->xd))
+			if (!tbv_service_tbnet_path_ready(state, peer->xd))
 				continue;
 			refcount_inc(&rail->refcnt);
 			mutex_unlock(&state->lock);
 			return rail;
 		}
 	}
-	state->apple_tunnels_pending = pending;
+	state->apple_rails_pending = pending;
 	mutex_unlock(&state->lock);
 	return NULL;
 }
 
-static void tbv_service_apple_tunnel_work(struct work_struct *work)
+static void tbv_service_apple_rail_work(struct work_struct *work)
 {
 	struct tbv_state *state =
-		container_of(work, struct tbv_state, apple_tunnel_work);
+		container_of(work, struct tbv_state, apple_rail_work);
 
 	if (!state->services_registered || !state->enable_tunnels)
 		return;
-	if (!tbv_service_tbnet_neighbor_ready(state, NULL))
+	if (!tbv_service_tbnet_path_ready(state, NULL))
 		return;
 
 	for (;;) {
@@ -250,11 +286,11 @@ static void tbv_service_apple_tunnel_work(struct work_struct *work)
 		if (!rail)
 			return;
 
-		ret = tbv_service_enable_apple_tunnel(rail);
+		ret = tbv_service_publish_apple_rail(rail);
 		if (ret) {
 			struct tbv_peer *peer = rail->peer;
 
-			pr_warn("failed to enable deferred Apple data path peer=%u route=0x%llx rail=0x%x state=%s ret=%d\n",
+			pr_warn("failed to publish deferred Apple data service peer=%u route=0x%llx rail=0x%x state=%s ret=%d\n",
 				peer->peer_id, peer->xd->route,
 				rail->rail_id,
 				tbv_path_state_name(rail->path.state), ret);
@@ -272,26 +308,33 @@ void tbv_services_tbnet_identity_ready(struct tbv_tbnet_identity *identity)
 
 	if (!state || identity != &state->tbnet_identity)
 		return;
-	if (!state->services_registered || !state->apple_tunnels_wait_tbnet)
+	if (!state->services_registered || !state->apple_rails_wait_tbnet)
 		return;
-	if (!tbv_service_tbnet_neighbor_ready(state, NULL))
+	if (!tbv_service_tbnet_path_ready(state, NULL))
 		return;
 
-	queue_work(system_long_wq, &state->apple_tunnel_work);
+	queue_work(system_long_wq, &state->apple_rail_work);
 }
 
-static bool tbv_service_apple_xdomain_allowed(const struct tbv_state *state,
-					      const struct tb_xdomain *xd)
+static bool tbv_service_apple_xdomain_allowed(const struct tb_xdomain *xd)
 {
 	const char *vendor = xd && xd->vendor_name ? xd->vendor_name : NULL;
 
-	if (state->cfg.profile != TBV_PROFILE_MIXED)
-		return true;
-
+	/*
+	 * FA57 is an Apple interop backend, not the Linux peer protocol. Linux
+	 * peers advertise and negotiate the native services; binding their AD key
+	 * here creates a second, weaker transport path to the same machine.
+	 */
 	if (vendor && !strcmp(vendor, "Apple Inc."))
 		return true;
 
-	pr_info("skipping Apple AD/FA57 service from non-Apple peer vendor='%s' in mixed profile\n",
+	if (!vendor) {
+		pr_warn("allowing Apple AD/FA57 service route=0x%llx with unknown peer vendor\n",
+			xd ? xd->route : 0);
+		return true;
+	}
+
+	pr_info("skipping Apple AD/FA57 service from non-Apple peer vendor='%s'\n",
 		vendor ?: "<unknown>");
 	return false;
 }
@@ -345,7 +388,7 @@ static int tbv_service_probe(struct tb_service *svc,
 		return -ENODEV;
 
 	if (backend == TBV_BACKEND_APPLE &&
-	    !tbv_service_apple_xdomain_allowed(tbv_service_state, xd))
+	    !tbv_service_apple_xdomain_allowed(xd))
 		return -ENODEV;
 
 	if (backend == TBV_BACKEND_NATIVE &&
@@ -376,13 +419,14 @@ static int tbv_service_probe(struct tb_service *svc,
 	if (tbv_service_state->allocate_rings &&
 	    tbv_service_backend_data_enabled(tbv_service_state, backend)) {
 		ret = tbv_path_alloc_rings(&rail->path, xd, -1);
-		if (ret) {
+		if (ret)
 			goto err_remove_rail;
-		}
+
 		if (!rail->path.tx_ring || !rail->path.rx_ring) {
 			ret = -EIO;
 			goto err_remove_rail;
 		}
+
 		pr_info("allocated rings service id=%d native_lane=%u tx_hop=%d rx_hop=%d out_hop=%d\n",
 			svc->id, backend == TBV_BACKEND_NATIVE ? native_lane : 0,
 			rail->path.tx_ring->hop,
@@ -391,9 +435,9 @@ static int tbv_service_probe(struct tb_service *svc,
 
 		if (tbv_service_state->start_rings) {
 			ret = tbv_path_start_rings(&rail->path);
-			if (ret) {
+			if (ret)
 				goto err_remove_rail;
-			}
+
 			pr_info("started rings service id=%d native_lane=%u tx_hop=%d rx_hop=%d\n",
 				svc->id,
 				backend == TBV_BACKEND_NATIVE ? native_lane : 0,
@@ -401,17 +445,17 @@ static int tbv_service_probe(struct tb_service *svc,
 				rail->path.rx_ring->hop);
 
 			if (backend == TBV_BACKEND_NATIVE &&
-			    tbv_service_state->negotiate_native)
+			    tbv_service_state->negotiate_native) {
 				tbv_native_control_queue_rail(tbv_service_state,
 							      rail);
-			else if (backend == TBV_BACKEND_APPLE &&
-				 tbv_service_state->enable_tunnels) {
-				if (tbv_service_should_defer_apple_tunnel(tbv_service_state, xd)) {
-					tbv_service_state->apple_tunnels_pending = true;
-					pr_info("deferring Apple data path service id=%d route=0x%llx until TBnet neighbor is proven\n",
+			} else if (backend == TBV_BACKEND_APPLE &&
+				   tbv_service_state->enable_tunnels) {
+				if (tbv_service_should_defer_apple_rail(tbv_service_state, xd)) {
+					tbv_service_state->apple_rails_pending = true;
+					pr_info("deferring Apple data service id=%d route=0x%llx until ThunderboltIP packet path is active\n",
 						svc->id, xd->route);
 				} else {
-					ret = tbv_service_enable_apple_tunnel(rail);
+					ret = tbv_service_publish_apple_rail(rail);
 					if (ret)
 						goto err_remove_rail;
 				}
@@ -432,7 +476,7 @@ static int tbv_service_probe(struct tb_service *svc,
 err_remove_rail:
 	tbv_peer_remove_rail(rail);
 	if (backend == TBV_BACKEND_APPLE)
-		tbv_service_refresh_apple_tunnels_pending(tbv_service_state);
+		tbv_service_refresh_apple_rails_pending(tbv_service_state);
 err_put_peer:
 	tbv_peer_put(tbv_service_state, peer);
 err_free_binding:
@@ -449,7 +493,7 @@ static void tbv_service_remove(struct tb_service *svc)
 
 		tbv_peer_remove_rail(binding->rail);
 		if (backend == TBV_BACKEND_APPLE)
-			tbv_service_refresh_apple_tunnels_pending(tbv_service_state);
+			tbv_service_refresh_apple_rails_pending(tbv_service_state);
 		tbv_peer_put(tbv_service_state, binding->peer);
 	}
 	tb_service_set_drvdata(svc, NULL);
@@ -602,15 +646,16 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 	state->negotiate_native = service_cfg->negotiate_native;
 	state->enable_tunnels = service_cfg->enable_tunnels;
 	/*
-	 * Minimal TBnet identity is still advertised so macOS sees a normal
-	 * ThunderboltIP-capable peer, but Apple AD/FA57 data tunnels must not
-	 * depend on macOS bringing the matching IP interface up. macOS can keep
-	 * the RDMA port usable while the enX side is inactive or has not
-	 * exchanged neighbor traffic yet.
+	 * Apple's RDMA interface is layered on an AppleThunderboltIP-backed
+	 * IOEthernetInterface. In minimal-packet mode, publish the Apple verbs rail
+	 * only after reciprocal LOGIN/LOGIN_RESPONSE and ThunderboltIP path
+	 * programming. FA57 DMA tunnel setup is part of rail publication, so
+	 * userspace cannot create a QP on an unprogrammed Apple data path.
 	 */
-	state->apple_tunnels_wait_tbnet = false;
-	state->apple_tunnels_pending = false;
-	INIT_WORK(&state->apple_tunnel_work, tbv_service_apple_tunnel_work);
+	state->apple_rails_wait_tbnet =
+		state->cfg.tbnet_identity == TBV_TBNET_ID_MINIMAL_PACKET;
+	state->apple_rails_pending = false;
+	INIT_WORK(&state->apple_rail_work, tbv_service_apple_rail_work);
 
 	if (!bind_services) {
 		pr_info("Thunderbolt service binding disabled\n");
@@ -671,8 +716,8 @@ void tbv_services_stop(struct tbv_state *state)
 		tb_unregister_service_driver(&tbv_service_driver);
 		state->services_registered = false;
 	}
-	cancel_work_sync(&state->apple_tunnel_work);
-	state->apple_tunnels_pending = false;
+	cancel_work_sync(&state->apple_rail_work);
+	state->apple_rails_pending = false;
 
 	tbv_tbnet_minimal_stop(&state->tbnet_identity);
 	tbv_native_control_stop(state);

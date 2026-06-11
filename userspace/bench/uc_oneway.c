@@ -61,6 +61,8 @@ struct opts {
 	int check_any_order;
 	int recv_wr_id_base;
 	int send_wr_id_base;
+	int hold_after_rts_ms;
+	int hold_before_destroy_ms;
 	size_t size;
 };
 
@@ -168,6 +170,7 @@ static void usage(const char *argv0)
 		"          [--mtu 256|512|1024|2048|4096]\n"
 		"          [--recv-post-delay-ms N]\n"
 		"          [--recv-wr-id-base N] [--send-wr-id-base N]\n"
+		"          [--hold-after-rts-ms N] [--hold-before-destroy-ms N]\n"
 		"          [--check] [--check-any-order]\n",
 		argv0);
 }
@@ -285,6 +288,12 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 		} else if (!strcmp(argv[i], "--send-wr-id-base") && i + 1 < argc) {
 			if (parse_int(argv[++i], &o->send_wr_id_base))
 				return -1;
+		} else if (!strcmp(argv[i], "--hold-after-rts-ms") && i + 1 < argc) {
+			if (parse_int(argv[++i], &o->hold_after_rts_ms))
+				return -1;
+		} else if (!strcmp(argv[i], "--hold-before-destroy-ms") && i + 1 < argc) {
+			if (parse_int(argv[++i], &o->hold_before_destroy_ms))
+				return -1;
 		} else if (!strcmp(argv[i], "--count") && i + 1 < argc) {
 			if (parse_int(argv[++i], &o->count))
 				return -1;
@@ -307,7 +316,8 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	if (!o->role || !o->dev || o->port <= 0 || o->port > 65535 ||
 	    o->gid_index < -1 || o->ib_port <= 0 || o->depth <= 0 ||
 	    o->depth > 4095 || o->send_slots < 0 || o->recv_posts < 0 ||
-	    o->recv_posts > 4095 || o->count <= 0)
+	    o->recv_posts > 4095 || o->count <= 0 ||
+	    o->hold_after_rts_ms < 0 || o->hold_before_destroy_ms < 0)
 		return -1;
 	if (o->mtu != 256 && o->mtu != 512 && o->mtu != 1024 &&
 	    o->mtu != 2048 && o->mtu != 4096)
@@ -904,6 +914,12 @@ int main(int argc, char **argv)
 		goto out_qp;
 	fprintf(stderr, "QP is RTS\n");
 	fflush(stderr);
+	if (o.hold_after_rts_ms > 0) {
+		fprintf(stderr, "holding after RTS for %d ms\n",
+			o.hold_after_rts_ms);
+		fflush(stderr);
+		usleep((useconds_t)o.hold_after_rts_ms * 1000u);
+	}
 
 	if (!is_sender || is_bidi) {
 		if (o.recv_post_delay_ms > 0) {
@@ -1203,6 +1219,12 @@ int main(int argc, char **argv)
 	}
 
 	print_rate(o.role, o.count, o.count, o.size, start, &last_t, &last_done);
+	if (o.hold_before_destroy_ms > 0) {
+		fprintf(stderr, "holding before destroy for %d ms\n",
+			o.hold_before_destroy_ms);
+		fflush(stderr);
+		usleep((useconds_t)o.hold_before_destroy_ms * 1000u);
+	}
 	ret = 0;
 
 out_qp:

@@ -16,7 +16,7 @@
  * recycle. 1024 entries passed checked Mac-to-Linux UC bursts beyond one full
  * ring while keeping per-direction buffer cost modest.
  */
-#define TBV_APPLE_RING_SIZE 16384
+#define TBV_APPLE_RING_SIZE 1024
 #define TBV_DATA_FRAME_SIZE SZ_4K
 #define TBV_CONTROL_FRAME_SIZE 256
 #define TBV_CONTROL_QUEUE_MULTIPLIER 4
@@ -80,6 +80,11 @@ module_param(apple_rx_raw_mode, bool, 0644);
 MODULE_PARM_DESC(apple_rx_raw_mode,
 		 "Use RAW descriptors for Apple-compatible RX rings; default keeps FRAME reassembly");
 
+static uint native_tx_max_inflight = TBV_DATA_TX_MAX_INFLIGHT;
+module_param(native_tx_max_inflight, uint, 0644);
+MODULE_PARM_DESC(native_tx_max_inflight,
+		 "Maximum native data TX descriptors posted per path before waiting for completions; 0 disables native throttling");
+
 struct tbv_data_frame {
 	struct ring_frame frame;
 	struct tbv_path *path;
@@ -133,6 +138,19 @@ static u32 tbv_path_control_packet_count(const struct tbv_path *path)
 	u32 count = path->cfg.tx_ring_size * TBV_CONTROL_QUEUE_MULTIPLIER;
 
 	return clamp_t(u32, count, 64, 4096);
+}
+
+static u32 tbv_path_tx_inflight_limit(const struct tbv_path *path)
+{
+	u32 limit = TBV_DATA_TX_MAX_INFLIGHT;
+
+	if (path->rail && path->rail->peer &&
+	    path->rail->peer->backend == TBV_BACKEND_NATIVE)
+		limit = READ_ONCE(native_tx_max_inflight);
+	if (!limit)
+		return 0;
+
+	return clamp_t(u32, limit, 1, path->cfg.tx_ring_size);
 }
 
 static u32 tbv_path_data_packet_count(const struct tbv_path *path)
@@ -246,8 +264,12 @@ static bool tbv_path_progress_poll_enabled(const struct tbv_path *path)
 	if (!path->rail || !path->rail->peer)
 		return false;
 
-	return path->rail->peer->backend == TBV_BACKEND_NATIVE ||
-	       path->rail->peer->backend == TBV_BACKEND_APPLE;
+	/*
+	 * Apple FA57 has no transport-level ACK. Early local TX polling can open
+	 * the verbs SQ window before macOS has consumed the previous SEND group.
+	 * Use normal NHI TX callbacks for Apple and reserve polling for native.
+	 */
+	return path->rail->peer->backend == TBV_BACKEND_NATIVE;
 }
 
 static void tbv_path_queue_delayed_work(struct tbv_path *path,
@@ -834,8 +856,12 @@ static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	u32 add_remote_credits = 0;
 	bool was_raw_payload;
 
-	if (canceled)
+	if (canceled) {
+		if (state)
+			atomic64_inc(&state->data_rx_canceled);
+		atomic64_inc(&path->data_rx_canceled);
 		return;
+	}
 	if (state)
 		atomic64_inc(&state->data_rx_completed);
 	atomic64_inc(&path->data_rx_completed);
@@ -855,14 +881,32 @@ static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 			return_rx_credits = 1;
 			tbv_path_rx_raw_payload(path, state, f->buf, len);
 		} else {
-			ret = tbv_native_data_parse_header(f->buf, len, &hdr);
-			if (!ret && hdr.opcode == TBV_NATIVE_DATA_OP_PATH_CREDIT) {
-				if (tbv_native_data_valid_path_credit(&hdr))
-					add_remote_credits = hdr.imm_data;
-				else
-					atomic64_inc(&state->data_rx_bad_header);
-			} else if (!ret &&
-				   (hdr.flags & TBV_NATIVE_DATA_F_RAW_STREAM)) {
+				ret = tbv_native_data_parse_header(f->buf, len, &hdr);
+				if (!ret && hdr.opcode == TBV_NATIVE_DATA_OP_PATH_CREDIT) {
+					if (tbv_native_data_valid_path_credit(&hdr)) {
+						add_remote_credits = hdr.imm_data;
+					} else {
+						atomic64_inc(&state->data_rx_bad_header);
+						atomic64_inc(&state->data_rx_bad_header_path_credit);
+						pr_warn_ratelimited("native RX bad header reason=path_credit frame_len=%u flags=0x%x len=%u imm=%u psn=%u peer=%u rail=%u path_id=%u route=0x%llx\n",
+								    len, hdr.flags,
+								    hdr.length, hdr.imm_data,
+								    hdr.psn,
+								    path->rail && path->rail->peer ?
+								    path->rail->peer->peer_id :
+								    U32_MAX,
+								    path->rail ?
+								    path->rail->rail_id :
+								    U32_MAX,
+								    path->rail ?
+								    path->rail->key.path_id :
+								    0,
+								    path->rail ?
+								    (unsigned long long)path->rail->key.route :
+								    0);
+					}
+				} else if (!ret &&
+					   (hdr.flags & TBV_NATIVE_DATA_F_RAW_STREAM)) {
 				if (len != TBV_NATIVE_DATA_HDR_SIZE ||
 				    !hdr.length ||
 				    (hdr.flags & ~(TBV_NATIVE_DATA_F_LAST |
@@ -1304,6 +1348,26 @@ int tbv_path_enable_tunnel(struct tbv_path *path, struct tb_xdomain *xd,
 	return 0;
 }
 
+int tbv_path_disable_tunnel(struct tbv_path *path, struct tb_xdomain *xd)
+{
+	int ret;
+
+	if (path->state != TBV_PATH_TUNNEL_ENABLED)
+		return 0;
+
+	ret = tb_xdomain_disable_paths(xd, path->local_transmit_path,
+				       path->local_tx_hop,
+				       path->remote_transmit_path,
+				       path->local_rx_hop);
+	if (ret)
+		return ret;
+
+	tb_xdomain_release_in_hopid(xd, path->remote_transmit_path);
+	path->remote_transmit_path = -1;
+	path->state = TBV_PATH_RING_STARTED;
+	return 0;
+}
+
 static struct tbv_tx_packet *
 tbv_path_alloc_data_packet_owned(struct tbv_path *path, u8 *buf, u32 len,
 				 tbv_path_tx_done_fn done, void *done_ctx)
@@ -1678,12 +1742,17 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 			needs_staging = !packet->zcopy;
 		}
 
-		if (!from_control_queue &&
-		    atomic_read(&path->tx_inflight) >=
-			    TBV_DATA_TX_MAX_INFLIGHT) {
-			path->tx_scheduling = false;
-			spin_unlock_irqrestore(&path->tx_lock, flags);
-			return;
+		if (!from_control_queue) {
+			u32 tx_inflight_limit =
+				tbv_path_tx_inflight_limit(path);
+
+			if (tx_inflight_limit &&
+			    atomic_read(&path->tx_inflight) >=
+				    tx_inflight_limit) {
+				path->tx_scheduling = false;
+				spin_unlock_irqrestore(&path->tx_lock, flags);
+				return;
+			}
 		}
 
 		if (needs_staging && list_empty(&path->tx_free)) {
@@ -2482,23 +2551,26 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 	bool rings_started = tunnel_enabled ||
 			     path->state == TBV_PATH_RING_STARTED;
 
+	cancel_delayed_work_sync(&path->tx_poll_work);
+	cancel_delayed_work_sync(&path->rx_supp_poll_work);
+
+	if (tunnel_enabled) {
+		int ret = tbv_path_disable_tunnel(path, xd);
+
+		if (ret)
+			pr_warn("disable tunnel route path tx=%d rx=%d failed: %d\n",
+				path->local_transmit_path,
+				path->remote_transmit_path, ret);
+		if (ret && path->remote_transmit_path >= 0) {
+			tb_xdomain_release_in_hopid(xd, path->remote_transmit_path);
+			path->remote_transmit_path = -1;
+		}
+	}
 	if (rings_started) {
 		if (path->rx_ring)
 			tb_ring_stop(path->rx_ring);
 		if (path->tx_ring)
 			tb_ring_stop(path->tx_ring);
-		path->state = TBV_PATH_RING_ALLOCATED;
-	}
-	cancel_delayed_work_sync(&path->tx_poll_work);
-	cancel_delayed_work_sync(&path->rx_supp_poll_work);
-
-	if (tunnel_enabled) {
-		tb_xdomain_disable_paths(xd, path->local_transmit_path,
-					 path->local_tx_hop,
-					 path->remote_transmit_path,
-					 path->local_rx_hop);
-		tb_xdomain_release_in_hopid(xd, path->remote_transmit_path);
-		path->remote_transmit_path = -1;
 		path->state = TBV_PATH_RING_ALLOCATED;
 	}
 	if (!tunnel_enabled && path->remote_transmit_path >= 0) {

@@ -22,4 +22,12 @@
     name = "usb4-xdomain-pin-protocol-handler-owner";
     patch = ./0008-thunderbolt-xdomain-pin-protocol-handler-owner.patch;
   }
+  {
+    name = "usb4-xdomain-property-identity-match";
+    patch = ./0009-thunderbolt-xdomain-match-properties-by-identity.patch;
+  }
+  {
+    name = "usb4-xdomain-drain-protocol-callbacks";
+    patch = ./0010-thunderbolt-xdomain-drain-protocol-callbacks-on-unr.patch;
+  }
 ]

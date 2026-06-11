@@ -201,6 +201,7 @@ struct tbv_path {
 	atomic64_t data_tx_credit_stalls;
 	atomic64_t data_tx_credit_received;
 	atomic64_t data_rx_completed;
+	atomic64_t data_rx_canceled;
 	atomic64_t data_rx_credit_sent;
 	atomic64_t data_rx_credit_send_error;
 	atomic64_t data_rx_repost_failed;
@@ -249,6 +250,7 @@ struct tbv_rail {
 	 */
 	struct tbv_ibdev *ibdev;
 	atomic_t native_qp_bind_count;
+	u32 apple_tunnel_qps;
 	u32 rail_id;
 	u32 link_speed;
 	u32 link_width;
@@ -319,6 +321,14 @@ static inline bool tbv_rail_data_ready(const struct tbv_rail *rail)
 static inline bool tbv_rail_apple_data_ready(const struct tbv_rail *rail)
 {
 	return rail && rail->path.state == TBV_PATH_TUNNEL_ENABLED;
+}
+
+static inline bool tbv_rail_apple_service_ready(const struct tbv_rail *rail)
+{
+	if (!rail)
+		return false;
+	return rail->path.state == TBV_PATH_RING_STARTED ||
+	       rail->path.state == TBV_PATH_TUNNEL_ENABLED;
 }
 
 struct tbv_tbnet_identity {
@@ -450,9 +460,9 @@ struct tbv_state {
 	bool native_control_registered;
 	bool native_control_source_aware;
 	bool native_legacy_multicable_warned;
-	bool apple_tunnels_wait_tbnet;
-	bool apple_tunnels_pending;
-	struct work_struct apple_tunnel_work;
+	bool apple_rails_wait_tbnet;
+	bool apple_rails_pending;
+	struct work_struct apple_rail_work;
 	struct workqueue_struct *workqueue;
 	struct notifier_block ibdev_netdev_nb;
 	atomic_t verbs_ucontexts;
@@ -496,11 +506,21 @@ struct tbv_state {
 	atomic64_t data_tx_credit_stalls;
 	atomic64_t data_tx_credit_received;
 	atomic64_t data_rx_completed;
+	atomic64_t data_rx_canceled;
 	atomic64_t data_rx_credit_sent;
 	atomic64_t data_rx_credit_send_error;
 	atomic64_t data_rx_repost_failed;
 	atomic64_t data_rx_bad_frame;
 	atomic64_t data_rx_bad_header;
+	atomic64_t data_rx_bad_header_parse;
+	atomic64_t data_rx_bad_header_len;
+	atomic64_t data_rx_bad_header_path_credit;
+	atomic64_t data_rx_bad_header_opcode;
+	atomic64_t data_rx_bad_header_recv_credit;
+	atomic64_t data_rx_bad_header_ack;
+	atomic64_t data_rx_bad_header_write;
+	atomic64_t data_rx_bad_header_read_req;
+	atomic64_t data_rx_bad_header_mad;
 	atomic64_t data_rx_send;
 	atomic64_t data_rx_op_send;
 	atomic64_t data_rx_op_send_imm;
@@ -572,6 +592,9 @@ struct tbv_state {
 	atomic64_t apple_rx_no_sof_when_idle;
 	atomic64_t apple_rx_eof_without_active;
 	atomic64_t apple_rx_len_overrun;
+	atomic64_t apple_rx_resync_dropped;
+	atomic64_t apple_rx_rail_mismatch;
+	atomic64_t apple_rx_cq_overflow;
 	atomic64_t data_cq_overflow;
 	atomic64_t native_legacy_ambiguous_limited;
 	struct xarray verbs_mrs_xa;
@@ -693,6 +716,8 @@ void tbv_tbnet_minimal_stop(struct tbv_tbnet_identity *identity);
 void tbv_tbnet_minimal_recompute_state_locked(struct tbv_tbnet_identity *identity);
 bool tbv_tbnet_minimal_neighbor_ready(struct tbv_tbnet_identity *identity,
 				      const uuid_t *remote_uuid);
+bool tbv_tbnet_minimal_path_ready(struct tbv_tbnet_identity *identity,
+				  const uuid_t *remote_uuid);
 void tbv_tbnet_minimal_clear_neighbors_locked(struct tbv_tbnet_identity *identity);
 void tbv_tbnet_minimal_debugfs_show(struct seq_file *s,
 				    struct tbv_tbnet_identity *identity);
@@ -748,6 +773,7 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 int tbv_path_start_rings(struct tbv_path *path);
 int tbv_path_enable_tunnel(struct tbv_path *path, struct tb_xdomain *xd,
 			   int remote_transmit_path);
+int tbv_path_disable_tunnel(struct tbv_path *path, struct tb_xdomain *xd);
 void tbv_path_set_remote_rx_capacity(struct tbv_path *path, u32 rx_ring_size);
 void tbv_path_add_remote_rx_credits(struct tbv_path *path, u32 credits);
 int tbv_path_reserve_data(struct tbv_path *path, u32 frames);
