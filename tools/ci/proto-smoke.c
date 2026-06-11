@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "proto/native_data.h"
+#include "proto/tbnet.h"
 
 static int hello_equal(const struct tbv_native_wire_hello *a,
 		       const struct tbv_native_wire_hello *b)
@@ -138,6 +139,27 @@ static int test_fragment_shapes(void)
 	return 0;
 }
 
+static int test_minimal_tbnet_e2e_policy(void)
+{
+	tbv_tbnet_u32 peer_e2e =
+		TBV_TBNET_MINIMAL_BASE_PRTCSTNS | TBV_TBNET_PRTCSTNS_E2E;
+
+	if (tbv_tbnet_minimal_prtcstns(false) !=
+	    TBV_TBNET_MINIMAL_BASE_PRTCSTNS)
+		return 1;
+	if (tbv_tbnet_minimal_prtcstns(true) != peer_e2e)
+		return 2;
+	if (tbv_tbnet_minimal_e2e_enabled(false, peer_e2e))
+		return 3;
+	if (tbv_tbnet_minimal_e2e_enabled(true,
+					  TBV_TBNET_MINIMAL_BASE_PRTCSTNS))
+		return 4;
+	if (!tbv_tbnet_minimal_e2e_enabled(true, peer_e2e))
+		return 5;
+
+	return 0;
+}
+
 int main(void)
 {
 	unsigned char hello_buf[TBV_NATIVE_WIRE_HELLO_MSG_SIZE];
@@ -223,6 +245,8 @@ int main(void)
 		return 14;
 	if (test_fragment_shapes())
 		return 15;
+	if (test_minimal_tbnet_e2e_policy())
+		return 16;
 
 	puts("protocol header smoke OK");
 	return 0;
