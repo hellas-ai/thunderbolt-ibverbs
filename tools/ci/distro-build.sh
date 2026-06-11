@@ -141,7 +141,7 @@ build_userspace_smoke() {
 build_with_dkms() {
 	local kver="$1"
 	local pkg="thunderbolt-ibverbs"
-	local ver="0.1.0"
+	local ver="0.3.0"
 	local dkms_src="/usr/src/$pkg-$ver"
 	local built
 

@@ -51,6 +51,11 @@ fi
 /usr/src/%{modname}-%{version}/*
 
 %changelog
+* Fri Jun 12 2026 George Whewell <george@hellas.ai> - 0.3.0-1
+- v0.3.0: correctness release with the reliability engine spine,
+  configfs link model, portable Thunderbolt patch stack, and Apple-compatible
+  transport hardening.
+
 * Sat May 30 2026 George Whewell <george@hellas.ai> - 0.2.1-1
 - v0.2.1: no DKMS-side changes; release cut alongside Ubuntu 22.04 and
   24.04 usb4-rdma-provider .debs so PyTorch / vllm / llama.cpp users can

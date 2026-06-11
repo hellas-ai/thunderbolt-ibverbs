@@ -29,6 +29,10 @@ install -m 0644 %{_sourcedir}/usb4_rdma.driver %{buildroot}%{provider_etc_dir}/
 %{provider_etc_dir}/usb4_rdma.driver
 
 %changelog
+* Fri Jun 12 2026 George Whewell <george@hellas.ai> - 0.3.0-1
+- v0.3.0: release alongside thunderbolt-ibverbs correctness fixes and
+  refreshed kernel workflow packaging.
+
 * Sat May 30 2026 George Whewell <george@hellas.ai> - 0.2.1-1
 - v0.2.1: Ubuntu 22.04 / 24.04 .deb variants added alongside this rpm.
   Provider C backported with ifdef guards for rdma-core API drift
