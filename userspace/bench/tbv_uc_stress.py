@@ -42,6 +42,7 @@ CSV_FIELDS = [
     "repeat_count",
     "port",
     "connect_host",
+    "hold_before_destroy_ms",
     "status",
     "duration_s",
     "sender_rc",
@@ -69,6 +70,8 @@ WC_ERROR_RE = re.compile(
     r"recv wc error wr_id=\d+ status=(?P<status>\d+) "
     r"opcode=(?P<opcode>\d+) byte_len=(?P<byte_len>\d+)"
 )
+APPLE_RDMA_DEV_PREFIX = "rdma_"
+APPLE_RDMA_HOLD_BEFORE_DESTROY_MS = 1000
 
 
 def die(msg: str) -> None:
@@ -112,6 +115,34 @@ def safe_name(value: str) -> str:
     return value or "run"
 
 
+def apple_rdma_pair(receiver_dev: str, sender_dev: str) -> bool:
+    return receiver_dev.startswith(APPLE_RDMA_DEV_PREFIX) or sender_dev.startswith(
+        APPLE_RDMA_DEV_PREFIX
+    )
+
+
+def hold_before_destroy_ms(
+    args: argparse.Namespace, receiver_dev: str, sender_dev: str
+) -> int:
+    if args.hold_before_destroy_ms >= 0:
+        return args.hold_before_destroy_ms
+    if apple_rdma_pair(receiver_dev, sender_dev):
+        return APPLE_RDMA_HOLD_BEFORE_DESTROY_MS
+    return 0
+
+
+def host_tool(args: argparse.Namespace, host: str, role: str) -> str:
+    if host == args.server and args.server_tool:
+        return args.server_tool
+    if host == args.client and args.client_tool:
+        return args.client_tool
+    if role == "recv" and args.receiver_tool:
+        return args.receiver_tool
+    if role == "send" and args.sender_tool:
+        return args.sender_tool
+    return args.tool
+
+
 def uc_command(
     tool: str,
     *,
@@ -128,6 +159,7 @@ def uc_command(
     send_slots: int | None = None,
     recv_posts: int | None = None,
     connect: str | None = None,
+    hold_before_destroy_ms: int = 0,
 ) -> str:
     parts = [
         tool,
@@ -154,6 +186,8 @@ def uc_command(
         parts.extend(["--send-slots", str(send_slots)])
     if connect is not None:
         parts.extend(["--connect", connect])
+    if hold_before_destroy_ms:
+        parts.extend(["--hold-before-destroy-ms", str(hold_before_destroy_ms)])
     if check_any_order:
         parts.append("--check-any-order")
     elif check:
@@ -242,8 +276,8 @@ def run_case(
     port: int,
     log_dir: Path,
 ) -> dict[str, str]:
-    sender_tool = args.sender_tool or args.tool
-    receiver_tool = args.receiver_tool or args.tool
+    sender_tool = host_tool(args, sender, "send")
+    receiver_tool = host_tool(args, receiver, "recv")
     if args.connect_host:
         connect_host = args.connect_host
     elif receiver == args.server:
@@ -252,6 +286,7 @@ def run_case(
         connect_host = args.client_connect_host or receiver
     else:
         connect_host = receiver
+    hold_ms = hold_before_destroy_ms(args, receiver_dev, sender_dev)
     log_prefix = f"{safe_name(args.tag)}-" if args.tag else ""
     receiver_log = log_dir / (
         f"{log_prefix}{direction}-port{port}-size{size}-sd{send_depth}-mtu{mtu}-"
@@ -275,6 +310,7 @@ def run_case(
         mtu=mtu,
         check=args.check,
         check_any_order=args.check_any_order,
+        hold_before_destroy_ms=hold_ms,
     )
     send_cmd = uc_command(
         sender_tool,
@@ -290,6 +326,7 @@ def run_case(
         check=args.check,
         check_any_order=False,
         connect=connect_host,
+        hold_before_destroy_ms=hold_ms,
     )
 
     start = time.monotonic()
@@ -362,6 +399,7 @@ def run_case(
         "repeat_count": str(args.repeats),
         "port": str(port),
         "connect_host": connect_host,
+        "hold_before_destroy_ms": str(hold_ms),
         "status": "ok" if ok else "fail",
         "duration_s": f"{time.monotonic() - start:.3f}",
         "sender_rc": str(sender_rc),
@@ -392,6 +430,8 @@ def main() -> int:
     parser.add_argument("--server-gid-index", type=int, default=1)
     parser.add_argument("--client-gid-index", type=int, default=1)
     parser.add_argument("--tool", default="uc_oneway")
+    parser.add_argument("--server-tool", default="")
+    parser.add_argument("--client-tool", default="")
     parser.add_argument("--receiver-tool", default="")
     parser.add_argument("--sender-tool", default="")
     parser.add_argument(
@@ -427,6 +467,15 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--receiver-drain-timeout", type=float, default=10.0)
     parser.add_argument("--start-delay", type=float, default=1.0)
+    parser.add_argument(
+        "--hold-before-destroy-ms",
+        type=int,
+        default=-1,
+        help=(
+            "Pass uc_oneway --hold-before-destroy-ms; -1 selects 1000 ms for "
+            "Apple rdma_* devices and 0 otherwise."
+        ),
+    )
     parser.add_argument("--base-port", type=int, default=24000)
     parser.add_argument("--stop-on-fail", action="store_true")
     parser.add_argument("--no-check", dest="check", action="store_false")
@@ -445,6 +494,8 @@ def main() -> int:
         die("--send-depths must be positive")
     if args.send_slots < 0:
         die("--send-slots must be non-negative")
+    if args.hold_before_destroy_ms < -1:
+        die("--hold-before-destroy-ms must be -1 or non-negative")
 
     csv_path = Path(args.csv)
     log_dir = Path(args.log_dir) if args.log_dir else csv_path.with_suffix("")
