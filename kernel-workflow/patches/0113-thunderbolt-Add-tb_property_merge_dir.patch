@@ -16,14 +16,9 @@ diff --git a/drivers/thunderbolt/property.c b/drivers/thunderbolt/property.c
 index 50cbfc92fe65..6b9666b61181 100644
 --- a/drivers/thunderbolt/property.c
 +++ b/drivers/thunderbolt/property.c
-@@ -38,6 +38,7 @@ struct tb_property_dir_entry {
- static struct tb_property_dir *__tb_property_parse_dir(const u32 *block,
- 	size_t block_len, unsigned int dir_offset, size_t dir_len,
- 	bool is_root);
+@@ -53,0 +54,2 @@ static inline void format_dwdata(void *dst, const void *src, size_t dwords)
++
 +static struct tb_property *tb_property_copy(const struct tb_property *property);
- 
- static inline void parse_dwdata(void *dst, const void *src, size_t dwords)
- {
 @@ -507,17 +508,9 @@ ssize_t tb_property_format_dir(const struct tb_property_dir *dir, u32 *block,
  	return ret < 0 ? ret : 0;
  }
@@ -229,4 +224,3 @@ index bbdbbc84c999..e98d569779f9 100644
  int tb_property_add_immediate(struct tb_property_dir *parent, const char *key,
 -- 
 2.53.0
-

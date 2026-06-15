@@ -72,6 +72,7 @@ WC_ERROR_RE = re.compile(
 )
 APPLE_RDMA_DEV_PREFIX = "rdma_"
 APPLE_RDMA_HOLD_BEFORE_DESTROY_MS = 1000
+APPLE_UC_QUEUE_DEPTH = 32
 
 
 def die(msg: str) -> None:
@@ -119,6 +120,12 @@ def apple_rdma_pair(receiver_dev: str, sender_dev: str) -> bool:
     return receiver_dev.startswith(APPLE_RDMA_DEV_PREFIX) or sender_dev.startswith(
         APPLE_RDMA_DEV_PREFIX
     )
+
+
+def apple_queue_depth(value: int, receiver_dev: str, sender_dev: str) -> int:
+    if apple_rdma_pair(receiver_dev, sender_dev):
+        return min(value, APPLE_UC_QUEUE_DEPTH)
+    return value
 
 
 def hold_before_destroy_ms(
@@ -287,6 +294,13 @@ def run_case(
     else:
         connect_host = receiver
     hold_ms = hold_before_destroy_ms(args, receiver_dev, sender_dev)
+    recv_depth = apple_queue_depth(args.recv_depth, receiver_dev, sender_dev)
+    recv_posts = apple_queue_depth(args.recv_posts, receiver_dev, sender_dev)
+    send_depth = apple_queue_depth(send_depth, receiver_dev, sender_dev)
+    send_slots = args.send_slots or send_depth
+    send_slots = apple_queue_depth(send_slots, receiver_dev, sender_dev)
+    if args.check and send_slots < send_depth:
+        send_slots = send_depth
     log_prefix = f"{safe_name(args.tag)}-" if args.tag else ""
     receiver_log = log_dir / (
         f"{log_prefix}{direction}-port{port}-size{size}-sd{send_depth}-mtu{mtu}-"
@@ -305,8 +319,8 @@ def run_case(
         port=port,
         size=size,
         count=args.count,
-        depth=args.recv_depth,
-        recv_posts=args.recv_posts,
+        depth=recv_depth,
+        recv_posts=recv_posts,
         mtu=mtu,
         check=args.check,
         check_any_order=args.check_any_order,
@@ -321,7 +335,7 @@ def run_case(
         size=size,
         count=args.count,
         depth=send_depth,
-        send_slots=args.send_slots or None,
+        send_slots=send_slots,
         mtu=mtu,
         check=args.check,
         check_any_order=False,
@@ -391,9 +405,9 @@ def run_case(
         "size_bytes": str(size),
         "count": str(args.count),
         "send_depth": str(send_depth),
-        "send_slots": str(args.send_slots or send_depth),
-        "recv_depth": str(args.recv_depth),
-        "recv_posts": str(args.recv_posts),
+        "send_slots": str(send_slots),
+        "recv_depth": str(recv_depth),
+        "recv_posts": str(recv_posts),
         "mtu": str(mtu),
         "repeat_index": str(repeat_index),
         "repeat_count": str(args.repeats),
@@ -457,10 +471,10 @@ def main() -> int:
     parser.add_argument("--tag", default="")
     parser.add_argument("--directions", choices=["forward", "reverse", "both"], default="forward")
     parser.add_argument("--sizes", type=parse_csv_ints, default=parse_csv_ints("32768"))
-    parser.add_argument("--send-depths", type=parse_csv_ints, default=parse_csv_ints("16,32,64"))
+    parser.add_argument("--send-depths", type=parse_csv_ints, default=parse_csv_ints("16,32"))
     parser.add_argument("--send-slots", type=int, default=0)
-    parser.add_argument("--recv-depth", type=int, default=64)
-    parser.add_argument("--recv-posts", type=int, default=64)
+    parser.add_argument("--recv-depth", type=int, default=APPLE_UC_QUEUE_DEPTH)
+    parser.add_argument("--recv-posts", type=int, default=APPLE_UC_QUEUE_DEPTH)
     parser.add_argument("--mtus", type=parse_csv_ints, default=parse_csv_ints("4096"))
     parser.add_argument("--count", type=int, default=100000)
     parser.add_argument("--repeats", type=int, default=3)
@@ -566,10 +580,17 @@ def main() -> int:
                         for repeat in range(1, args.repeats + 1):
                             run_index += 1
                             port = args.base_port + run_index
+                            effective_send_depth = apple_queue_depth(
+                                send_depth, receiver_dev, sender_dev
+                            )
+                            effective_recv_posts = apple_queue_depth(
+                                args.recv_posts, receiver_dev, sender_dev
+                            )
                             print(
                                 "tbv-uc-stress: "
-                                f"{direction} size={size} send_depth={send_depth} "
-                                f"recv_posts={args.recv_posts} mtu={mtu} "
+                                f"{direction} size={size} "
+                                f"send_depth={effective_send_depth} "
+                                f"recv_posts={effective_recv_posts} mtu={mtu} "
                                 f"repeat={repeat}/{args.repeats}",
                                 flush=True,
                             )
