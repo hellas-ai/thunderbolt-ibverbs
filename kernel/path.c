@@ -78,7 +78,7 @@ MODULE_PARM_DESC(apple_tx_e2e,
 static bool apple_rx_raw_mode;
 module_param(apple_rx_raw_mode, bool, 0644);
 MODULE_PARM_DESC(apple_rx_raw_mode,
-		 "Use RAW descriptors for Apple-compatible RX rings; default keeps FRAME reassembly");
+		 "Compatibility no-op: Apple RAW RX is disabled because raw descriptor boundaries are not yet message-safe");
 
 static uint native_tx_max_inflight = TBV_DATA_TX_MAX_INFLIGHT;
 module_param(native_tx_max_inflight, uint, 0644);
@@ -543,7 +543,9 @@ bool tbv_path_apple_tx_raw_mode(void)
 
 bool tbv_path_apple_rx_raw_mode(void)
 {
-	return READ_ONCE(apple_rx_raw_mode);
+	if (READ_ONCE(apple_rx_raw_mode))
+		pr_warn_once("apple_rx_raw_mode is ignored: Apple RAW RX descriptor boundaries are not message-safe\n");
+	return false;
 }
 
 void tbv_path_default_config(enum tbv_backend_type backend,
