@@ -35,7 +35,12 @@
 #include "tbv.h"
 #include "proto/tbnet.h"
 
-#define TBV_TBNET_MIN_LOGIN_DELAY_MS	4500
+/*
+ * macOS may keep a half-open ThunderboltIP state across module reloads; retry
+ * the LOGIN/LOGOUT reset cadence promptly so Apple rail publication is not
+ * held behind a multi-second backoff.
+ */
+#define TBV_TBNET_MIN_LOGIN_DELAY_MS	1000
 #define TBV_TBNET_MIN_LOGIN_TIMEOUT_MS	500
 #define TBV_TBNET_MIN_LOGIN_RETRIES	60
 #define TBV_TBNET_MIN_LOGOUT_TIMEOUT_MS	1000
