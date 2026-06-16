@@ -70,9 +70,12 @@ WC_ERROR_RE = re.compile(
     r"recv wc error wr_id=\d+ status=(?P<status>\d+) "
     r"opcode=(?P<opcode>\d+) byte_len=(?P<byte_len>\d+)"
 )
+PORT_ACTIVE_RE = re.compile(r"\bstate:\s+PORT_ACTIVE\b")
 APPLE_RDMA_DEV_PREFIX = "rdma_"
 APPLE_RDMA_HOLD_BEFORE_DESTROY_MS = 1000
 APPLE_UC_QUEUE_DEPTH = 32
+SSH_CONFIG = ""
+SSH_OPTIONS: list[str] = []
 
 
 def die(msg: str) -> None:
@@ -94,16 +97,20 @@ def parse_csv_ints(value: str) -> list[int]:
 def ssh_command(host: str, command: str) -> list[str]:
     if host in ("", "local", "localhost"):
         return ["bash", "-lc", command]
-    return [
+    args = [
         "ssh",
         "-o",
         "ConnectTimeout=8",
         "-o",
         "BatchMode=yes",
         "-n",
-        host,
-        command,
     ]
+    if SSH_CONFIG:
+        args.extend(["-F", SSH_CONFIG])
+    for option in SSH_OPTIONS:
+        args.extend(["-o", option])
+    args.extend([host, command])
+    return args
 
 
 def shell_join(args: list[str]) -> str:
@@ -224,6 +231,97 @@ def run_with_timeout(cmd: list[str], timeout: float) -> tuple[int, str]:
         raise
 
 
+def run_host_capture(
+    host: str, command: str, *, timeout: float = 15.0
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ssh_command(host, command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def connect_host_for_receiver(args: argparse.Namespace, receiver: str) -> str:
+    if args.connect_host:
+        return args.connect_host
+    if receiver == args.server:
+        return args.server_connect_host or receiver
+    if receiver == args.client:
+        return args.client_connect_host or receiver
+    return receiver
+
+
+def preflight_device(host: str, dev: str) -> list[str]:
+    command = "\n".join(
+        [
+            "if ! command -v ibv_devices >/dev/null 2>&1; then",
+            "  echo 'missing ibv_devices in PATH'",
+            "  exit 127",
+            "fi",
+            "if ! command -v ibv_devinfo >/dev/null 2>&1; then",
+            "  echo 'missing ibv_devinfo in PATH'",
+            "  exit 127",
+            "fi",
+            "echo __TBV_IBV_DEVICES__",
+            "ibv_devices",
+            "echo __TBV_IBV_DEVINFO__",
+            f"ibv_devinfo -d {shlex.quote(dev)}",
+        ]
+    )
+    errors: list[str] = []
+    try:
+        proc = run_host_capture(host, command)
+    except subprocess.TimeoutExpired:
+        return [f"{host}:{dev}: preflight timed out"]
+
+    output = proc.stdout or ""
+    if proc.returncode:
+        tail = output.strip()[-500:]
+        return [f"{host}:{dev}: preflight command failed rc={proc.returncode}: {tail}"]
+    if not re.search(rf"(^|\n)\s*{re.escape(dev)}\s", output):
+        errors.append(f"{host}:{dev}: device not listed by ibv_devices")
+    if not PORT_ACTIVE_RE.search(output):
+        errors.append(f"{host}:{dev}: ibv_devinfo did not report PORT_ACTIVE")
+    return errors
+
+
+def run_preflight(args: argparse.Namespace, directions: list[tuple]) -> None:
+    print("tbv-uc-stress: preflight active", flush=True)
+    errors: list[str] = []
+    checked: set[tuple[str, str]] = set()
+
+    for (
+        direction,
+        receiver,
+        sender,
+        receiver_dev,
+        sender_dev,
+        _receiver_gid,
+        _sender_gid,
+    ) in directions:
+        connect_host = connect_host_for_receiver(args, receiver)
+        print(
+            "tbv-uc-stress: preflight "
+            f"{direction}: receiver={receiver}:{receiver_dev} "
+            f"sender={sender}:{sender_dev} connect_host={connect_host}",
+            flush=True,
+        )
+        for host, dev in ((receiver, receiver_dev), (sender, sender_dev)):
+            key = (host, dev)
+            if key in checked:
+                continue
+            checked.add(key)
+            errors.extend(preflight_device(host, dev))
+
+    if errors:
+        die("preflight failed:\n  - " + "\n  - ".join(errors))
+
+    print("tbv-uc-stress: preflight OK", flush=True)
+
+
 def cleanup_port(host: str, tool_basename: str, port: int) -> None:
     pattern = (
         rf"(^|/){re.escape(tool_basename)}([[:space:]]|$)"
@@ -287,14 +385,7 @@ def run_case(
 ) -> dict[str, str]:
     sender_tool = host_tool(args, sender, "send")
     receiver_tool = host_tool(args, receiver, "recv")
-    if args.connect_host:
-        connect_host = args.connect_host
-    elif receiver == args.server:
-        connect_host = args.server_connect_host or receiver
-    elif receiver == args.client:
-        connect_host = args.client_connect_host or receiver
-    else:
-        connect_host = receiver
+    connect_host = connect_host_for_receiver(args, receiver)
     hold_ms = hold_before_destroy_ms(args, receiver_dev, sender_dev)
     recv_depth = apple_queue_depth(
         args.recv_depth, receiver_dev, sender_dev, args.apple_queue_depth
@@ -506,6 +597,35 @@ def main() -> int:
             "and fail-fast."
         ),
     )
+    parser.add_argument(
+        "--preflight",
+        dest="preflight",
+        action="store_true",
+        default=None,
+        help="Check that selected RDMA devices exist and are PORT_ACTIVE before running.",
+    )
+    parser.add_argument(
+        "--no-preflight",
+        dest="preflight",
+        action="store_false",
+        help="Disable the automatic preflight used by --apple-gate.",
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Run preflight checks and exit without starting uc_oneway.",
+    )
+    parser.add_argument(
+        "--ssh-config",
+        default=os.environ.get("TBV_SSH_CONFIG", ""),
+        help="ssh_config file passed to ssh with -F.",
+    )
+    parser.add_argument(
+        "--ssh-option",
+        action="append",
+        default=[],
+        help="extra ssh -o option; may be repeated.",
+    )
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--receiver-drain-timeout", type=float, default=10.0)
     parser.add_argument("--start-delay", type=float, default=1.0)
@@ -525,6 +645,9 @@ def main() -> int:
     parser.add_argument("--strict-order", dest="check_any_order", action="store_false")
     parser.set_defaults(check=True, check_any_order=True)
     args = parser.parse_args()
+    global SSH_CONFIG, SSH_OPTIONS
+    SSH_CONFIG = args.ssh_config or ""
+    SSH_OPTIONS = list(args.ssh_option or [])
 
     if args.apple_gate:
         args.directions = "both"
@@ -552,6 +675,11 @@ def main() -> int:
             flush=True,
         )
 
+    if args.preflight is None:
+        args.preflight = args.apple_gate
+    if args.preflight_only:
+        args.preflight = True
+
     if args.count <= 0:
         die("--count must be positive")
     if args.repeats <= 0:
@@ -566,10 +694,6 @@ def main() -> int:
         die("--apple-queue-depth must be non-negative")
     if args.hold_before_destroy_ms < -1:
         die("--hold-before-destroy-ms must be -1 or non-negative")
-
-    csv_path = Path(args.csv)
-    log_dir = Path(args.log_dir) if args.log_dir else csv_path.with_suffix("")
-    log_dir.mkdir(parents=True, exist_ok=True)
 
     if args.directions == "forward":
         directions = [
@@ -616,6 +740,15 @@ def main() -> int:
                 args.server_gid_index,
             ),
         ]
+
+    if args.preflight:
+        run_preflight(args, directions)
+        if args.preflight_only:
+            return 0
+
+    csv_path = Path(args.csv)
+    log_dir = Path(args.log_dir) if args.log_dir else csv_path.with_suffix("")
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     handle, writer = open_csv(csv_path)
     failures = 0
