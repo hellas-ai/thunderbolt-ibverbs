@@ -51,6 +51,10 @@ fi
 /usr/src/%{modname}-%{version}/*
 
 %changelog
+* Tue Jun 16 2026 George Whewell <george@hellas.ai> - 0.3.3-1
+- v0.3.3: disable unsafe Apple raw RX mode until raw descriptor
+  boundaries are proven message-safe.
+
 * Tue Jun 16 2026 George Whewell <george@hellas.ai> - 0.3.2-1
 - v0.3.2: verify Apple raw RX chunk CRC trailers and expose raw CRC
   integrity failures in debugfs.
