@@ -592,6 +592,7 @@ struct tbv_state {
 	atomic64_t apple_rx_no_sof_when_idle;
 	atomic64_t apple_rx_eof_without_active;
 	atomic64_t apple_rx_len_overrun;
+	atomic64_t apple_rx_raw_crc_error;
 	atomic64_t apple_rx_resync_dropped;
 	atomic64_t apple_rx_rail_mismatch;
 	atomic64_t apple_rx_cq_overflow;

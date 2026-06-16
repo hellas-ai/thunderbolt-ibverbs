@@ -365,6 +365,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->apple_rx_eof_without_active));
 	seq_printf(s, "apple_rx_len_overrun: %lld\n",
 		   atomic64_read(&state->apple_rx_len_overrun));
+	seq_printf(s, "apple_rx_raw_crc_error: %lld\n",
+		   atomic64_read(&state->apple_rx_raw_crc_error));
 	seq_printf(s, "apple_rx_resync_dropped: %lld\n",
 		   atomic64_read(&state->apple_rx_resync_dropped));
 	seq_printf(s, "apple_rx_rail_mismatch: %lld\n",
