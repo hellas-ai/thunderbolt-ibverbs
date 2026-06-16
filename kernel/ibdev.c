@@ -68,6 +68,7 @@
 #define TBV_APPLE_RAW_SPLIT_USER_SIZE 16
 #define TBV_APPLE_RAW_TAIL_USER_SIZE 240
 #define TBV_APPLE_RAW_DESCS_PER_CHUNK 17
+#define TBV_APPLE_TX_MAX_INFLIGHT_FRAMES_DEFAULT 4
 #define TBV_QP_TIMEOUT_DEFAULT_MS 5000
 #define TBV_QP_TIMEOUT_WORK_INTERVAL_MS 1000
 #define TBV_SEND_MAX_RETRIES 7
@@ -105,10 +106,11 @@ module_param(apple_tx_max_inflight_wr, uint, 0644);
 MODULE_PARM_DESC(apple_tx_max_inflight_wr,
 		 "Maximum Apple-compatible single-frame UC SEND work requests in flight per QP; multi-frame SENDs are serialized by protocol");
 
-static uint apple_tx_max_inflight_frames = 64;
+static uint apple_tx_max_inflight_frames =
+	TBV_APPLE_TX_MAX_INFLIGHT_FRAMES_DEFAULT;
 module_param(apple_tx_max_inflight_frames, uint, 0644);
 MODULE_PARM_DESC(apple_tx_max_inflight_frames,
-		 "Maximum Apple-compatible 4 KiB FA57 frames posted per SEND group; 0 disables the frame window");
+		 "Maximum Apple-compatible 4 KiB FA57 frames posted before waiting for TX completions; 0 disables macOS receiver backpressure");
 
 static uint apple_tx_completion_delay_us;
 module_param(apple_tx_completion_delay_us, uint, 0644);

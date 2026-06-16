@@ -203,6 +203,77 @@ find_booted_kernel_dev() {
 	printf '%s\n' "${dev_outputs[0]}"
 }
 
+module_option_value() {
+	local name=$1
+	local default=$2
+	local opt opt_name opt_value
+
+	read -r -a opt_args <<< "$module_options"
+	for opt in "${opt_args[@]}"; do
+		opt_name="${opt%%=*}"
+		[[ "$opt_name" == "$name" ]] || continue
+		if [[ "$opt" == *=* ]]; then
+			opt_value="${opt#*=}"
+		else
+			opt_value=1
+		fi
+		printf '%s\n' "$opt_value"
+		return 0
+	done
+
+	printf '%s\n' "$default"
+}
+
+option_truthy() {
+	case "$1" in
+	1|y|Y|yes|YES|true|TRUE|on|ON)
+		return 0
+		;;
+	*)
+		return 1
+		;;
+	esac
+}
+
+validate_module_options() {
+	local module=$1
+	local opt opt_name
+	local known_params
+
+	known_params="$(modinfo -p "$module" | sed 's/:.*//' | sort -u)"
+	read -r -a opt_args <<< "$module_options"
+	for opt in "${opt_args[@]}"; do
+		[[ -n "$opt" ]] || continue
+		opt_name="${opt%%=*}"
+		if ! grep -qxF "$opt_name" <<< "$known_params"; then
+			die "--options includes unknown module parameter '$opt_name' for $module"
+		fi
+	done
+}
+
+validate_kernel_feature_options() {
+	local kernel_dev=$1
+	local tbnet_identity
+	local bind_services
+	local -a header_roots=()
+
+	tbnet_identity="$(module_option_value tbnet_identity "")"
+	bind_services="$(module_option_value bind_services "0")"
+
+	[[ -d "$kernel_dev/include" ]] && header_roots+=("$kernel_dev/include")
+	[[ -d "$kernel_dev/lib/modules" ]] && header_roots+=("$kernel_dev/lib/modules")
+	if [[ "${#header_roots[@]}" -eq 0 ]]; then
+		header_roots+=("$kernel_dev")
+	fi
+
+	if [[ "$tbnet_identity" == "minimal_packet" ]] &&
+	   option_truthy "$bind_services" &&
+	   ! grep -Rqs "TB_PROTOCOL_HANDLER_UNREGISTER_DRAINS" \
+		"${header_roots[@]}"; then
+		die "tbnet_identity=minimal_packet with bind_services requires target kernel headers to define TB_PROTOCOL_HANDLER_UNREGISTER_DRAINS"
+	fi
+}
+
 printf '==> Target: %s via ssh %s\n' "$config_attr" "$ssh_host"
 remote_uname="$(ssh "$ssh_host" 'uname -r')"
 remote_kernel="$(ssh "$ssh_host" 'readlink -f /run/booted-system/kernel 2>/dev/null || readlink -f /run/current-system/kernel 2>/dev/null || true')"
@@ -214,6 +285,7 @@ fi
 
 if [[ "$booted_kernel" == 1 ]]; then
 	booted_kernel_dev="$(find_booted_kernel_dev "$remote_kernel")"
+	kernel_dev="$booted_kernel_dev"
 	printf '==> Booted kernel dev: %s\n' "$booted_kernel_dev"
 	cat >"$expr" <<EOF
 let
@@ -251,6 +323,8 @@ EOF
 
 	config_kernel="$(nix eval --impure --raw "${nix_override_args[@]}" --expr "$(<"$kernel_expr")")"
 	printf '==> Config kernel: %s\n' "$config_kernel"
+	kernel_dev="$(find_booted_kernel_dev "$config_kernel")"
+	printf '==> Config kernel dev: %s\n' "$kernel_dev"
 	if [[ -n "$remote_kernel" && "$config_kernel" != "$remote_kernel" ]]; then
 		if [[ "$allow_kernel_path_mismatch" != 1 ]]; then
 			die "config kernel does not match remote booted kernel; deploy/reboot the target or pass --allow-kernel-path-mismatch for an explicit ABI-only experiment"
@@ -281,6 +355,9 @@ printf '==> Module vermagic kernel: %s\n' "$module_uname"
 if [[ "$module_uname" != "$remote_uname" ]]; then
 	die "module vermagic kernel '$module_uname' does not match remote uname '$remote_uname'"
 fi
+
+validate_module_options "$module"
+validate_kernel_feature_options "$kernel_dev"
 
 if [[ "$copy" == 1 ]]; then
 	copy_args=(copy --to "$copy_to" "$module_pkg")
