@@ -718,6 +718,7 @@ int main(int argc, char **argv)
 	int last_done = 0;
 	int initial_recvs = 0;
 	int wr_depth;
+	int send_depth;
 	int send_slots;
 	int sgid_index;
 	uint8_t *seen = NULL;
@@ -737,6 +738,7 @@ int main(int argc, char **argv)
 			initial_recvs = o.count;
 	}
 	wr_depth = o.depth;
+	send_depth = o.depth;
 	if (!is_sender && initial_recvs > wr_depth)
 		wr_depth = initial_recvs;
 	send_slots = (is_sender || is_bidi) ?
@@ -834,7 +836,7 @@ int main(int argc, char **argv)
 	qpia.qp_context = ctx;
 	qpia.send_cq = cq;
 	qpia.recv_cq = cq;
-	qpia.cap.max_send_wr = (is_sender || is_bidi) ? (uint32_t)o.depth : 1;
+	qpia.cap.max_send_wr = (is_sender || is_bidi) ? (uint32_t)send_depth : 1;
 	qpia.cap.max_recv_wr = (!is_sender || is_bidi) ? (uint32_t)wr_depth : 1;
 	qpia.cap.max_send_sge = 1;
 	qpia.cap.max_recv_sge = 1;
@@ -849,6 +851,28 @@ int main(int argc, char **argv)
 		qp->qp_num, qpia.cap.max_send_wr, qpia.cap.max_recv_wr,
 		qpia.cap.max_send_sge, qpia.cap.max_recv_sge);
 	fflush(stderr);
+	if ((is_sender || is_bidi) && !qpia.cap.max_send_wr) {
+		fprintf(stderr, "provider returned max_send_wr=0\n");
+		goto out_qp;
+	}
+	if ((!is_sender || is_bidi) && !qpia.cap.max_recv_wr) {
+		fprintf(stderr, "provider returned max_recv_wr=0\n");
+		goto out_qp;
+	}
+	if ((is_sender || is_bidi) &&
+	    send_depth > (int)qpia.cap.max_send_wr) {
+		fprintf(stderr,
+			"clamping send depth %d to provider max_send_wr %u\n",
+			send_depth, qpia.cap.max_send_wr);
+		send_depth = (int)qpia.cap.max_send_wr;
+	}
+	if ((!is_sender || is_bidi) &&
+	    initial_recvs > (int)qpia.cap.max_recv_wr) {
+		fprintf(stderr,
+			"clamping initial recv posts %d to provider max_recv_wr %u\n",
+			initial_recvs, qpia.cap.max_recv_wr);
+		initial_recvs = (int)qpia.cap.max_recv_wr;
+	}
 	debug_step("modify init");
 	if (qp_to_init(qp, o.ib_port))
 		goto out_qp;
@@ -930,18 +954,28 @@ int main(int argc, char **argv)
 		}
 		fprintf(stderr, "posting %d receives\n", initial_recvs);
 		fflush(stderr);
+		int posted_initial_recvs = 0;
 		for (int i = 0; i < initial_recvs; i++) {
 			errno = 0;
 			int post_ret = post_recv_slot(&o, qp, mr, recv_buf,
 						      stride, o.size, i);
 			if (post_ret) {
+				if (i > 0) {
+					fprintf(stderr,
+						"provider accepted only %d/%d initial receives; continuing with repost window %d (ret=%d errno=%d)\n",
+						i, initial_recvs, i, post_ret,
+						errno);
+					initial_recvs = i;
+					break;
+				}
 				fprintf(stderr,
 					"ibv_post_recv[%d/%d] ret=%d errno=%d\n",
 					i, initial_recvs, post_ret, errno);
 				goto out_qp;
 			}
+			posted_initial_recvs++;
 		}
-		fprintf(stderr, "posted receives\n");
+		fprintf(stderr, "posted %d receives\n", posted_initial_recvs);
 		fflush(stderr);
 	}
 
@@ -997,7 +1031,7 @@ int main(int argc, char **argv)
 
 		while (send_completed < o.count || recv_completed < o.count) {
 			while (send_posted < o.count &&
-			       send_in_flight < o.depth) {
+			       send_in_flight < send_depth) {
 				int slot = send_posted % send_slots;
 				struct ibv_sge sge;
 				struct ibv_send_wr wr;
@@ -1020,6 +1054,15 @@ int main(int argc, char **argv)
 				wr.opcode = IBV_WR_SEND;
 				wr.send_flags = IBV_SEND_SIGNALED;
 				if (ibv_post_send(qp, &wr, &bad)) {
+					if (send_in_flight > 0 &&
+					    send_depth > send_in_flight) {
+						fprintf(stderr,
+							"provider accepted only %d/%d in-flight sends; continuing with send depth %d\n",
+							send_in_flight, send_depth,
+							send_in_flight);
+						send_depth = send_in_flight;
+						break;
+					}
 					perror("ibv_post_send");
 					goto out_qp;
 				}
@@ -1111,7 +1154,7 @@ int main(int argc, char **argv)
 		int posted = 0, completed = 0, in_flight = 0;
 
 		while (completed < o.count) {
-			while (posted < o.count && in_flight < o.depth) {
+			while (posted < o.count && in_flight < send_depth) {
 				int slot = posted % send_slots;
 				struct ibv_sge sge;
 				struct ibv_send_wr wr;
@@ -1133,6 +1176,14 @@ int main(int argc, char **argv)
 				wr.opcode = IBV_WR_SEND;
 				wr.send_flags = IBV_SEND_SIGNALED;
 				if (ibv_post_send(qp, &wr, &bad)) {
+					if (in_flight > 0 && send_depth > in_flight) {
+						fprintf(stderr,
+							"provider accepted only %d/%d in-flight sends; continuing with send depth %d\n",
+							in_flight, send_depth,
+							in_flight);
+						send_depth = in_flight;
+						break;
+					}
 					perror("ibv_post_send");
 					goto out_qp;
 				}
