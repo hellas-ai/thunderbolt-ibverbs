@@ -51,6 +51,10 @@ fi
 /usr/src/%{modname}-%{version}/*
 
 %changelog
+* Tue Jun 16 2026 George Whewell <george@hellas.ai> - 0.3.4-1
+- v0.3.4: improve Apple TX window admission sharing, minimal login
+  cadence, and uc_oneway queue-depth handling.
+
 * Tue Jun 16 2026 George Whewell <george@hellas.ai> - 0.3.3-1
 - v0.3.3: disable unsafe Apple raw RX mode until raw descriptor
   boundaries are proven message-safe.

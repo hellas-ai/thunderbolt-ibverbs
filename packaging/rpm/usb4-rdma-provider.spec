@@ -29,6 +29,10 @@ install -m 0644 %{_sourcedir}/usb4_rdma.driver %{buildroot}%{provider_etc_dir}/
 %{provider_etc_dir}/usb4_rdma.driver
 
 %changelog
+* Tue Jun 16 2026 George Whewell <george@hellas.ai> - 0.3.4-1
+- v0.3.4: release alongside Apple TX window and uc_oneway queue-depth
+  validation improvements in thunderbolt-ibverbs.
+
 * Tue Jun 16 2026 George Whewell <george@hellas.ai> - 0.3.3-1
 - v0.3.3: release alongside Apple raw RX safety hardening in
   thunderbolt-ibverbs.

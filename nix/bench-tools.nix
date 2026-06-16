@@ -45,7 +45,7 @@ stdenv.mkDerivation {
     if isDarwin
     then "thunderbolt-ibverbs-bench-tools-apple-rdma"
     else "thunderbolt-ibverbs-bench-tools";
-  version = "0.3.3";
+  version = "0.3.4";
 
   src = lib.cleanSourceWith {
     src = source;
