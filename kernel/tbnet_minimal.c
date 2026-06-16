@@ -93,7 +93,6 @@ struct tbv_tbnet_minimal_session {
 	bool path_enabled;
 	bool login_sent;
 	bool login_received;
-	bool logout_reset_sent;
 	bool neighbor_seen;
 	bool handler_registered;
 	bool removing;
@@ -1084,16 +1083,16 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 		return;
 	}
 	sequence = session->login_retries % 4;
-	need_reset = !session->login_received && !session->logout_reset_sent;
-	if (need_reset)
-		session->logout_reset_sent = true;
+	need_reset = !session->login_received;
 	mutex_unlock(&session->lock);
 
 	if (need_reset) {
 		/*
 		 * A reload can leave macOS with a half-open ThunderboltIP
 		 * connection from the previous module instance. Clear that
-		 * protocol state before starting this session's LOGIN exchange.
+		 * protocol state before each LOGIN attempt until the peer's
+		 * reciprocal LOGIN arrives; one reset is not sufficient for all
+		 * observed macOS wakeup states.
 		 */
 		ret = tbv_tbnet_minimal_send_logout_request(session, sequence);
 		if (ret && ret != -ETIMEDOUT && ret != -ENODEV)
