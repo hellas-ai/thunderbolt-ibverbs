@@ -397,6 +397,29 @@ module_uname="$(modinfo -F vermagic "$TBV_MODULE" | awk '{print $1}')"
 [[ "$module_uname" == "$actual_uname" ]] ||
 	fail "module vermagic kernel '$module_uname' does not match uname '$actual_uname'"
 
+read -r -a opt_args <<< "$TBV_OPTIONS"
+tbnet_identity=""
+tbnet_identity_tbnet="thunderbolt0"
+roce_netdev=""
+for opt in "${opt_args[@]}"; do
+	case "$opt" in
+	tbnet_identity=*)
+		tbnet_identity="${opt#tbnet_identity=}"
+		;;
+	tbnet_identity_tbnet=*)
+		tbnet_identity_tbnet="${opt#tbnet_identity_tbnet=}"
+		;;
+	roce_netdev=*)
+		roce_netdev="${opt#roce_netdev=}"
+		;;
+	esac
+done
+
+if [[ "$tbnet_identity" == "minimal_packet" ]] &&
+   grep -q '^thunderbolt_net ' /proc/modules; then
+	fail "tbnet_identity=minimal_packet requires thunderbolt_net to be absent before reload; reboot with thunderbolt_net blacklisted or unload it before using --reload"
+fi
+
 modprobe ib_uverbs || true
 
 if grep -q '^thunderbolt_ibverbs ' /proc/modules; then
@@ -424,15 +447,23 @@ for dep in $(modinfo -F depends "$TBV_MODULE" | tr ',' ' ' || true); do
 	modprobe "$dep"
 done
 
-read -r -a opt_args <<< "$TBV_OPTIONS"
-roce_netdev=""
-for opt in "${opt_args[@]}"; do
-	case "$opt" in
-	roce_netdev=*)
-		roce_netdev="${opt#roce_netdev=}"
-		;;
-	esac
-done
+case "$tbnet_identity" in
+stock|stock_proxy)
+	modprobe thunderbolt_net
+	for _ in $(seq 1 20); do
+		if ip link show "$tbnet_identity_tbnet" >/dev/null 2>&1; then
+			ip link set "$tbnet_identity_tbnet" up || true
+			break
+		fi
+		sleep 0.5
+	done
+	;;
+minimal_packet)
+	if grep -q '^thunderbolt_net ' /proc/modules; then
+		fail "tbnet_identity=minimal_packet requires thunderbolt_net to be absent at load time"
+	fi
+	;;
+esac
 
 insmod "$TBV_MODULE" "${opt_args[@]}"
 
