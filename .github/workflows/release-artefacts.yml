@@ -59,7 +59,7 @@ jobs:
             rdma_glob: 'dist/usb4-rdma-provider_*~noble_amd64.deb'
             upload_glob: 'dist/usb4-rdma-provider_*~noble_amd64.deb'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build DKMS package in ${{ matrix.image }}
         if: matrix.build_dkms
@@ -100,7 +100,7 @@ jobs:
             bash tools/ci/distro-install.sh '${{ matrix.rdma_glob }}'
 
       - name: Upload artefacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: thunderbolt-ibverbs-${{ matrix.name }}
           path: ${{ matrix.upload_glob }}
@@ -114,10 +114,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all artefacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
