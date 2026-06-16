@@ -29,6 +29,10 @@ install -m 0644 %{_sourcedir}/usb4_rdma.driver %{buildroot}%{provider_etc_dir}/
 %{provider_etc_dir}/usb4_rdma.driver
 
 %changelog
+* Tue Jun 16 2026 George Whewell <george@hellas.ai> - 0.3.2-1
+- v0.3.2: release alongside Apple raw RX CRC verification in
+  thunderbolt-ibverbs.
+
 * Tue Jun 16 2026 George Whewell <george@hellas.ai> - 0.3.1-1
 - v0.3.1: release alongside Apple compatibility wakeup and stress-tool
   hardening in thunderbolt-ibverbs.
