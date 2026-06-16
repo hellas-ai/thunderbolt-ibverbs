@@ -662,6 +662,7 @@ def main() -> int:
         args.apple_queue_depth = 256
         args.timeout = max(args.timeout, 120.0)
         args.receiver_drain_timeout = max(args.receiver_drain_timeout, 30.0)
+        args.start_delay = max(args.start_delay, 2.0)
         args.hold_before_destroy_ms = max(args.hold_before_destroy_ms, 1500)
         args.stop_on_fail = True
         args.check = True
