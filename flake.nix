@@ -97,7 +97,7 @@
         pkgs:
         pkgs.stdenv.mkDerivation {
           pname = "thunderbolt-ibverbs-script-syntax";
-          version = "0.3.0";
+          version = "0.3.1";
           src = ./.;
 
           nativeBuildInputs = [ pkgs.bash ];
@@ -146,7 +146,7 @@
         in
         pkgs.stdenv.mkDerivation {
           pname = "thunderbolt-portable-kernel-patches-apply-check";
-          version = "0.3.0";
+          version = "0.3.1";
           src = pkgs.linuxPackages_latest.kernel.src;
 
           nativeBuildInputs = [ pkgs.git ];
@@ -180,7 +180,7 @@
         pkgs:
         pkgs.stdenv.mkDerivation {
           pname = "thunderbolt-ibverbs-proto-smoke";
-          version = "0.3.0";
+          version = "0.3.1";
           src = ./.;
 
           dontConfigure = true;
@@ -282,7 +282,7 @@
         pkgs:
         pkgs.stdenv.mkDerivation {
           pname = "thunderbolt-ibverbs-verbs-smoke-build";
-          version = "0.3.0";
+          version = "0.3.1";
           src = ./.;
 
           nativeBuildInputs = [ pkgs.pkg-config ];

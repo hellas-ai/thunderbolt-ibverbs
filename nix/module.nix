@@ -11,7 +11,7 @@ let
 in
 stdenv.mkDerivation {
   pname = "thunderbolt-ibverbs";
-  version = "0.3.0";
+  version = "0.3.1";
 
   src = lib.cleanSourceWith {
     src = root;

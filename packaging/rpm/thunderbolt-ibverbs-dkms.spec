@@ -51,6 +51,10 @@ fi
 /usr/src/%{modname}-%{version}/*
 
 %changelog
+* Tue Jun 16 2026 George Whewell <george@hellas.ai> - 0.3.1-1
+- v0.3.1: Apple-compatible ThunderboltIP wakeup retry hardening,
+  conservative macOS TX backpressure defaults, and reload/stress tooling.
+
 * Fri Jun 12 2026 George Whewell <george@hellas.ai> - 0.3.0-1
 - v0.3.0: correctness release with the reliability engine spine,
   configfs link model, portable Thunderbolt patch stack, and Apple-compatible
