@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "proto/apple_tx.h"
 #include "proto/native_data.h"
 #include "proto/tbnet.h"
 
@@ -258,6 +259,51 @@ static int test_apple_raw_crc_model(void)
 	return 0;
 }
 
+static int test_apple_tx_window_policy(void)
+{
+	tbv_apple_tx_u32 single_charge = tbv_apple_tx_frame_charge(1, 4);
+	tbv_apple_tx_u32 multi_charge = tbv_apple_tx_frame_charge(17, 4);
+
+	if (tbv_apple_tx_requires_exclusive_window(0))
+		return 1;
+	if (!tbv_apple_tx_requires_exclusive_window(1))
+		return 2;
+	if (!tbv_apple_tx_requires_exclusive_window(17))
+		return 3;
+
+	if (single_charge != 1)
+		return 4;
+	if (multi_charge != 4)
+		return 5;
+	if (tbv_apple_tx_frame_charge(17, 0) != 0)
+		return 6;
+
+	if (!tbv_apple_tx_window_ok(0, 0, true, 4, 4, single_charge))
+		return 7;
+	if (tbv_apple_tx_window_ok(1, 0, true, 4, 4, single_charge))
+		return 8;
+	if (tbv_apple_tx_window_ok(0, 1, true, 4, 4, single_charge))
+		return 9;
+	if (!tbv_apple_tx_window_ok(0, 0, true, 0, 0, 0))
+		return 10;
+
+	if (!tbv_apple_tx_window_ok(0, 0, true, 4, 4, multi_charge))
+		return 11;
+	if (tbv_apple_tx_window_ok(0, 1, true, 4, 4, multi_charge))
+		return 12;
+
+	if (!tbv_apple_tx_window_ok(3, 0, false, 4, 4, 0))
+		return 13;
+	if (tbv_apple_tx_window_ok(4, 0, false, 4, 4, 0))
+		return 14;
+	if (tbv_apple_tx_window_ok(-1, 0, true, 4, 4, single_charge))
+		return 15;
+	if (tbv_apple_tx_window_ok(0, -1, true, 4, 4, single_charge))
+		return 16;
+
+	return 0;
+}
+
 int main(void)
 {
 	unsigned char hello_buf[TBV_NATIVE_WIRE_HELLO_MSG_SIZE];
@@ -347,6 +393,8 @@ int main(void)
 		return 16;
 	if (test_apple_raw_crc_model())
 		return 17;
+	if (test_apple_tx_window_policy())
+		return 18;
 
 	puts("protocol header smoke OK");
 	return 0;

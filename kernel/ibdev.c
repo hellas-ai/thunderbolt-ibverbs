@@ -32,6 +32,7 @@
 #include <rdma/ib_user_verbs.h>
 #include <rdma/ib_verbs.h>
 
+#include "../proto/apple_tx.h"
 #include "../proto/native_data.h"
 #include "../proto/reliability.h"
 #include "tbv.h"
@@ -101,14 +102,10 @@ MODULE_PARM_DESC(qp_timeout_ms,
 		 "Fallback milliseconds for pending native/Apple WRs and partial native receives "
 		 "when a QP has no verbs ACK timeout; 0 disables fallback timeout work");
 
-/*
- * Single-frame SENDs are self-delimiting and can safely fill the existing
- * frame window. Multi-frame SENDs still take an exclusive window below.
- */
 static uint apple_tx_max_inflight_wr = TBV_APPLE_TX_MAX_INFLIGHT_FRAMES_DEFAULT;
 module_param(apple_tx_max_inflight_wr, uint, 0644);
 MODULE_PARM_DESC(apple_tx_max_inflight_wr,
-		 "Maximum Apple-compatible single-frame UC SEND work requests in flight per QP; multi-frame SENDs are serialized by protocol");
+		 "Deprecated: Apple-compatible UC SENDs are serialized per QP; retained for compatibility");
 
 static uint apple_tx_max_inflight_frames =
 	TBV_APPLE_TX_MAX_INFLIGHT_FRAMES_DEFAULT;
@@ -6160,24 +6157,6 @@ static void tbv_qp_return_remote_recv_credit(struct tbv_qp *tqp)
 	wake_up_all(&tqp->credit_wait);
 }
 
-static u32 tbv_apple_tx_frame_charge(u32 frames, unsigned int max_frames)
-{
-	if (!max_frames)
-		return 0;
-	return min_t(u32, frames, max_frames);
-}
-
-static bool tbv_apple_tx_requires_exclusive_window(u32 frames)
-{
-	/*
-	 * Apple FA57 RX frames carry SOF/EOF but no message sequence. Multiple
-	 * multi-frame SENDs in flight can therefore interleave at the peer and
-	 * produce partial or misassembled WQEs. Single-frame SENDs are self
-	 * delimiting and may still use the normal software window.
-	 */
-	return frames > 1;
-}
-
 static bool tbv_qp_apple_tx_window_ok_locked(struct tbv_qp *tqp,
 					     bool exclusive,
 					     unsigned int max_wr,
@@ -6187,9 +6166,8 @@ static bool tbv_qp_apple_tx_window_ok_locked(struct tbv_qp *tqp,
 	int cur_wr = atomic_read(&tqp->apple_tx_inflight);
 	int cur_frames = atomic_read(&tqp->apple_tx_inflight_frames);
 
-	return (exclusive ? !cur_wr : (!max_wr || cur_wr < max_wr)) &&
-	       (!exclusive || !cur_frames) &&
-	       (!max_frames || cur_frames + frame_charge <= max_frames);
+	return tbv_apple_tx_window_ok(cur_wr, cur_frames, exclusive, max_wr,
+				      max_frames, frame_charge);
 }
 
 static bool tbv_qp_try_acquire_apple_tx_window(struct tbv_qp *tqp, u32 frames,
