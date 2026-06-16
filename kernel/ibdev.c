@@ -5639,9 +5639,15 @@ static int tbv_apple_rx_copy_piece_to_buf(struct tbv_qp *tqp,
 	return 0;
 }
 
+static bool tbv_apple_rx_raw_crc_trailer(u8 eof)
+{
+	return eof == 2 || eof == 3;
+}
+
 static int tbv_apple_rx_wire_user_len(u32 len, u8 eof, u32 *user_len)
 {
-	if (tbv_path_apple_rx_raw_mode() && (eof == 2 || eof == 3)) {
+	if (tbv_path_apple_rx_raw_mode() &&
+	    tbv_apple_rx_raw_crc_trailer(eof)) {
 		if (len < sizeof(__le32))
 			return -EINVAL;
 		*user_len = len - sizeof(__le32);
@@ -5649,6 +5655,32 @@ static int tbv_apple_rx_wire_user_len(u32 len, u8 eof, u32 *user_len)
 		*user_len = len;
 	}
 	return 0;
+}
+
+static int tbv_apple_rx_verify_raw_crc(struct tbv_apple_pending_rx *p,
+				       const void *payload, u32 len, u8 eof)
+{
+	const u8 *chunk;
+	__le32 expected_le;
+	u32 expected;
+	u32 actual;
+
+	if (!tbv_path_apple_rx_raw_mode() ||
+	    !tbv_apple_rx_raw_crc_trailer(eof))
+		return 0;
+	if (len < sizeof(expected_le) || !p->buf)
+		return -EINVAL;
+	if (p->delivered < TBV_APPLE_FRAME_SIZE ||
+	    p->delivered % TBV_APPLE_FRAME_SIZE)
+		return -EPROTO;
+
+	memcpy(&expected_le, (const u8 *)payload + len - sizeof(expected_le),
+	       sizeof(expected_le));
+	expected = le32_to_cpu(expected_le);
+	chunk = (const u8 *)p->buf + p->delivered - TBV_APPLE_FRAME_SIZE;
+	actual = crc32c(~0u, chunk, TBV_APPLE_FRAME_SIZE) ^ ~0u;
+
+	return actual == expected ? 0 : -EBADMSG;
 }
 
 static int tbv_apple_rx_copy_frame_to_buf(struct tbv_qp *tqp,
@@ -5666,6 +5698,9 @@ static int tbv_apple_rx_copy_frame_to_buf(struct tbv_qp *tqp,
 
 	ret = tbv_apple_rx_copy_piece_to_buf(tqp, p, payload, copy_len,
 					     &user_len);
+	if (ret)
+		return ret;
+	ret = tbv_apple_rx_verify_raw_crc(p, payload, len, eof);
 	if (ret)
 		return ret;
 	*out_user_len = user_len;
@@ -5782,6 +5817,9 @@ void tbv_ibdev_rx_apple_frame(struct tbv_state *state,
 					     &user_len);
 	if (ret) {
 		atomic64_inc(&state->data_rx_bad_frame);
+		if (tbv_path_apple_rx_raw_mode() &&
+		    tbv_apple_rx_raw_crc_trailer(eof))
+			atomic64_inc(&state->apple_rx_raw_crc_error);
 		pending->status = (ret == -EMSGSIZE || ret == -ENOSPC) ?
 			IB_WC_LOC_LEN_ERR : IB_WC_LOC_PROT_ERR;
 	}

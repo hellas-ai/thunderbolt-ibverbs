@@ -1,9 +1,66 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "proto/native_data.h"
 #include "proto/tbnet.h"
+
+#define APPLE_RAW_CHUNK_SIZE 4096u
+#define APPLE_RAW_TAIL_USER_SIZE 240u
+#define APPLE_RAW_TAIL_WIRE_SIZE (APPLE_RAW_TAIL_USER_SIZE + sizeof(uint32_t))
+
+static uint32_t smoke_crc32c(uint32_t seed, const void *data, size_t len)
+{
+	const unsigned char *p = data;
+	uint32_t crc = seed;
+	size_t i;
+
+	while (len--) {
+		crc ^= *p++;
+		for (i = 0; i < 8; i++)
+			crc = (crc >> 1) ^ (0x82f63b78u & -(crc & 1u));
+	}
+
+	return crc;
+}
+
+static void put_le32(unsigned char *dst, uint32_t value)
+{
+	dst[0] = (unsigned char)value;
+	dst[1] = (unsigned char)(value >> 8);
+	dst[2] = (unsigned char)(value >> 16);
+	dst[3] = (unsigned char)(value >> 24);
+}
+
+static uint32_t get_le32(const unsigned char *src)
+{
+	return (uint32_t)src[0] |
+	       ((uint32_t)src[1] << 8) |
+	       ((uint32_t)src[2] << 16) |
+	       ((uint32_t)src[3] << 24);
+}
+
+static int apple_raw_verify_crc_model(const unsigned char *assembled,
+				      unsigned int delivered,
+				      const unsigned char *tail_wire,
+				      unsigned int tail_wire_len)
+{
+	uint32_t expected;
+	uint32_t actual;
+
+	if (tail_wire_len < sizeof(expected) ||
+	    delivered < APPLE_RAW_CHUNK_SIZE ||
+	    delivered % APPLE_RAW_CHUNK_SIZE)
+		return -1;
+
+	expected = get_le32(tail_wire + tail_wire_len - sizeof(expected));
+	actual = smoke_crc32c(~0u, assembled + delivered -
+			      APPLE_RAW_CHUNK_SIZE,
+			      APPLE_RAW_CHUNK_SIZE) ^ ~0u;
+
+	return actual == expected ? 0 : -1;
+}
 
 static int hello_equal(const struct tbv_native_wire_hello *a,
 		       const struct tbv_native_wire_hello *b)
@@ -160,6 +217,47 @@ static int test_minimal_tbnet_e2e_policy(void)
 	return 0;
 }
 
+static int test_apple_raw_crc_model(void)
+{
+	unsigned char assembled[APPLE_RAW_CHUNK_SIZE * 2];
+	unsigned char tail[APPLE_RAW_TAIL_WIRE_SIZE];
+	uint32_t crc;
+	unsigned int i;
+
+	for (i = 0; i < sizeof(assembled); i++)
+		assembled[i] = (unsigned char)((i * 17u + 3u) & 0xffu);
+	memcpy(tail, assembled + APPLE_RAW_CHUNK_SIZE -
+	       APPLE_RAW_TAIL_USER_SIZE, APPLE_RAW_TAIL_USER_SIZE);
+	crc = smoke_crc32c(~0u, assembled, APPLE_RAW_CHUNK_SIZE) ^ ~0u;
+	put_le32(tail + APPLE_RAW_TAIL_USER_SIZE, crc);
+
+	if (apple_raw_verify_crc_model(assembled, APPLE_RAW_CHUNK_SIZE, tail,
+				       sizeof(tail)))
+		return 1;
+
+	tail[APPLE_RAW_TAIL_USER_SIZE] ^= 0x01;
+	if (!apple_raw_verify_crc_model(assembled, APPLE_RAW_CHUNK_SIZE, tail,
+					sizeof(tail)))
+		return 2;
+	tail[APPLE_RAW_TAIL_USER_SIZE] ^= 0x01;
+
+	if (!apple_raw_verify_crc_model(assembled, APPLE_RAW_CHUNK_SIZE - 1,
+					tail, sizeof(tail)))
+		return 3;
+	if (!apple_raw_verify_crc_model(assembled, APPLE_RAW_CHUNK_SIZE, tail,
+					sizeof(uint32_t) - 1))
+		return 4;
+
+	crc = smoke_crc32c(~0u, assembled + APPLE_RAW_CHUNK_SIZE,
+			   APPLE_RAW_CHUNK_SIZE) ^ ~0u;
+	put_le32(tail + APPLE_RAW_TAIL_USER_SIZE, crc);
+	if (apple_raw_verify_crc_model(assembled, APPLE_RAW_CHUNK_SIZE * 2,
+				       tail, sizeof(tail)))
+		return 5;
+
+	return 0;
+}
+
 int main(void)
 {
 	unsigned char hello_buf[TBV_NATIVE_WIRE_HELLO_MSG_SIZE];
@@ -247,6 +345,8 @@ int main(void)
 		return 15;
 	if (test_minimal_tbnet_e2e_policy())
 		return 16;
+	if (test_apple_raw_crc_model())
+		return 17;
 
 	puts("protocol header smoke OK");
 	return 0;
