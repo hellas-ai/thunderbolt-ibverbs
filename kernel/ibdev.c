@@ -101,7 +101,11 @@ MODULE_PARM_DESC(qp_timeout_ms,
 		 "Fallback milliseconds for pending native/Apple WRs and partial native receives "
 		 "when a QP has no verbs ACK timeout; 0 disables fallback timeout work");
 
-static uint apple_tx_max_inflight_wr = 1;
+/*
+ * Single-frame SENDs are self-delimiting and can safely fill the existing
+ * frame window. Multi-frame SENDs still take an exclusive window below.
+ */
+static uint apple_tx_max_inflight_wr = TBV_APPLE_TX_MAX_INFLIGHT_FRAMES_DEFAULT;
 module_param(apple_tx_max_inflight_wr, uint, 0644);
 MODULE_PARM_DESC(apple_tx_max_inflight_wr,
 		 "Maximum Apple-compatible single-frame UC SEND work requests in flight per QP; multi-frame SENDs are serialized by protocol");
