@@ -108,7 +108,7 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "apple_rails_wait_tbnet: %u\n",
 		   state->apple_rails_wait_tbnet);
 	seq_printf(s, "apple_rails_pending: %u\n",
-		   state->apple_rails_pending);
+		   READ_ONCE(state->apple_rails_pending));
 	seq_printf(s, "native_data: %u\n", state->native_data);
 	seq_printf(s, "apple_data: %u\n", state->apple_data);
 	seq_printf(s, "native_fragment_striping: %u\n",

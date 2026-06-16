@@ -462,7 +462,7 @@ struct tbv_state {
 	bool native_legacy_multicable_warned;
 	bool apple_rails_wait_tbnet;
 	bool apple_rails_pending;
-	struct work_struct apple_rail_work;
+	struct delayed_work apple_rail_work;
 	struct workqueue_struct *workqueue;
 	struct notifier_block ibdev_netdev_nb;
 	atomic_t verbs_ucontexts;
