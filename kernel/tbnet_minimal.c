@@ -72,7 +72,7 @@ struct tbv_tbnet_minimal_session {
 	struct mutex lock;
 	spinlock_t tx_lock;
 	struct delayed_work login_work;
-	struct work_struct connected_work;
+	struct delayed_work connected_work;
 	struct work_struct disconnect_work;
 	struct work_struct rx_work;
 	struct delayed_work tx_poll_work;
@@ -88,6 +88,7 @@ struct tbv_tbnet_minimal_session {
 	int local_transmit_path;
 	int remote_transmit_path;
 	int login_retries;
+	int path_retries;
 	bool rings_started;
 	bool path_enabled;
 	bool login_sent;
@@ -145,6 +146,13 @@ tbv_tbnet_minimal_send_logout_request(struct tbv_tbnet_minimal_session *session,
 				      u8 sequence);
 static __be32
 tbv_tbnet_minimal_lookup_proxy_ipv4(struct tbv_tbnet_identity *identity);
+
+static void
+tbv_tbnet_minimal_queue_connected(struct tbv_tbnet_minimal_session *session,
+				  unsigned long delay)
+{
+	queue_delayed_work(system_long_wq, &session->connected_work, delay);
+}
 
 static void
 tbv_tbnet_minimal_fill_reply_ctrl(struct tbv_tbnet_minimal_session *session,
@@ -585,10 +593,11 @@ void tbv_tbnet_minimal_debugfs_show(struct seq_file *s,
 			   session->tx_ring ? session->tx_ring->hop : -1,
 			   session->rx_ring ? session->rx_ring->hop : -1);
 		seq_printf(s,
-			   "tbnet_minimal_session%u_login: rx=%lld tx=%lld retries=%d\n",
+			   "tbnet_minimal_session%u_login: rx=%lld tx=%lld retries=%d path_retries=%d\n",
 			   idx, atomic64_read(&session->login_rx),
 			   atomic64_read(&session->login_tx),
-			   READ_ONCE(session->login_retries));
+			   READ_ONCE(session->login_retries),
+			   READ_ONCE(session->path_retries));
 		seq_printf(s,
 			   "tbnet_minimal_session%u_control: logout_rx=%lld logout_tx=%lld status_rx=%lld status_tx=%lld\n",
 			   idx, atomic64_read(&session->logout_rx),
@@ -940,16 +949,46 @@ static void tbv_tbnet_minimal_teardown_path(struct tbv_tbnet_minimal_session *s)
 	s->login_sent = false;
 	s->login_received = false;
 	s->login_retries = 0;
+	s->path_retries = 0;
 	mutex_unlock(&s->lock);
 
 	tbv_tbnet_minimal_recompute_state(s->identity);
 }
 
+static void
+tbv_tbnet_minimal_retry_connected(struct tbv_tbnet_minimal_session *session,
+				  const char *stage, int ret)
+{
+	bool retry = false;
+	int attempt = 0;
+
+	mutex_lock(&session->lock);
+	if (!session->removing && !session->path_enabled &&
+	    session->login_sent && session->login_received) {
+		if (session->path_retries++ < TBV_TBNET_MIN_LOGIN_RETRIES) {
+			attempt = session->path_retries;
+			retry = true;
+		} else {
+			pr_info("minimal TBnet packet path setup timed out route=0x%llx stage=%s ret=%d\n",
+				session->xd->route, stage, ret);
+		}
+	}
+	mutex_unlock(&session->lock);
+
+	if (!retry)
+		return;
+
+	pr_debug("minimal TBnet retrying packet path route=0x%llx stage=%s ret=%d attempt=%d\n",
+		 session->xd->route, stage, ret, attempt);
+	tbv_tbnet_minimal_queue_connected(
+		session, msecs_to_jiffies(TBV_TBNET_MIN_LOGIN_DELAY_MS));
+}
+
 static void tbv_tbnet_minimal_connected_work(struct work_struct *work)
 {
 	struct tbv_tbnet_minimal_session *session =
-		container_of(work, struct tbv_tbnet_minimal_session,
-			     connected_work);
+		container_of(to_delayed_work(work),
+			     struct tbv_tbnet_minimal_session, connected_work);
 	int remote_transmit_path;
 	bool connected;
 	int ret;
@@ -974,6 +1013,7 @@ static void tbv_tbnet_minimal_connected_work(struct work_struct *work)
 			tb_xdomain_release_in_hopid(session->xd, ret);
 		pr_warn("minimal TBnet failed to allocate Rx HopID %d: %d\n",
 			remote_transmit_path, ret);
+		tbv_tbnet_minimal_retry_connected(session, "alloc-hopid", ret);
 		return;
 	}
 
@@ -998,6 +1038,7 @@ static void tbv_tbnet_minimal_connected_work(struct work_struct *work)
 	mutex_lock(&session->lock);
 	session->rings_started = true;
 	session->path_enabled = true;
+	session->path_retries = 0;
 	mutex_unlock(&session->lock);
 	tbv_tbnet_minimal_recompute_state(session->identity);
 	pr_info("minimal TBnet packet path active route=0x%llx tx_path=%d rx_path=%d tx_hop=%d rx_hop=%d\n",
@@ -1010,6 +1051,7 @@ err_stop:
 	tb_ring_stop(session->rx_ring);
 	tb_ring_stop(session->tx_ring);
 	tb_xdomain_release_in_hopid(session->xd, remote_transmit_path);
+	tbv_tbnet_minimal_retry_connected(session, "enable-path", ret);
 }
 
 static void tbv_tbnet_minimal_disconnect_work(struct work_struct *work)
@@ -1120,7 +1162,7 @@ static void tbv_tbnet_minimal_login_work(struct work_struct *work)
 	}
 	mutex_unlock(&session->lock);
 	tbv_services_tbnet_identity_ready(session->identity);
-	queue_work(system_long_wq, &session->connected_work);
+	tbv_tbnet_minimal_queue_connected(session, 0);
 	if (retry_later)
 		queue_delayed_work(system_long_wq, &session->login_work,
 				   msecs_to_jiffies(TBV_TBNET_MIN_LOGIN_DELAY_MS));
@@ -1278,7 +1320,7 @@ static int tbv_tbnet_minimal_handle_packet_common(
 		}
 		mutex_unlock(&session->lock);
 		tbv_services_tbnet_identity_ready(session->identity);
-		queue_work(system_long_wq, &session->connected_work);
+		tbv_tbnet_minimal_queue_connected(session, 0);
 		return 1;
 
 	case TBV_TBIP_LOGOUT:
@@ -1403,7 +1445,8 @@ static int tbv_tbnet_minimal_probe(struct tb_service *svc,
 	spin_lock_init(&session->tx_lock);
 	INIT_LIST_HEAD(&session->tx_free);
 	INIT_DELAYED_WORK(&session->login_work, tbv_tbnet_minimal_login_work);
-	INIT_WORK(&session->connected_work, tbv_tbnet_minimal_connected_work);
+	INIT_DELAYED_WORK(&session->connected_work,
+			  tbv_tbnet_minimal_connected_work);
 	INIT_WORK(&session->disconnect_work, tbv_tbnet_minimal_disconnect_work);
 	INIT_WORK(&session->rx_work, tbv_tbnet_minimal_rx_work);
 	INIT_DELAYED_WORK(&session->tx_poll_work,
@@ -1491,7 +1534,7 @@ tbv_tbnet_minimal_destroy_session(struct tbv_tbnet_minimal_session *session)
 		session->handler_registered = false;
 	}
 	cancel_delayed_work_sync(&session->login_work);
-	cancel_work_sync(&session->connected_work);
+	cancel_delayed_work_sync(&session->connected_work);
 	cancel_work_sync(&session->disconnect_work);
 	cancel_work_sync(&session->rx_work);
 	cancel_delayed_work_sync(&session->tx_poll_work);
