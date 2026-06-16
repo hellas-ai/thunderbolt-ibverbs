@@ -122,9 +122,11 @@ def apple_rdma_pair(receiver_dev: str, sender_dev: str) -> bool:
     )
 
 
-def apple_queue_depth(value: int, receiver_dev: str, sender_dev: str) -> int:
-    if apple_rdma_pair(receiver_dev, sender_dev):
-        return min(value, APPLE_UC_QUEUE_DEPTH)
+def apple_queue_depth(
+    value: int, receiver_dev: str, sender_dev: str, apple_limit: int
+) -> int:
+    if apple_limit and apple_rdma_pair(receiver_dev, sender_dev):
+        return min(value, apple_limit)
     return value
 
 
@@ -294,11 +296,19 @@ def run_case(
     else:
         connect_host = receiver
     hold_ms = hold_before_destroy_ms(args, receiver_dev, sender_dev)
-    recv_depth = apple_queue_depth(args.recv_depth, receiver_dev, sender_dev)
-    recv_posts = apple_queue_depth(args.recv_posts, receiver_dev, sender_dev)
-    send_depth = apple_queue_depth(send_depth, receiver_dev, sender_dev)
+    recv_depth = apple_queue_depth(
+        args.recv_depth, receiver_dev, sender_dev, args.apple_queue_depth
+    )
+    recv_posts = apple_queue_depth(
+        args.recv_posts, receiver_dev, sender_dev, args.apple_queue_depth
+    )
+    send_depth = apple_queue_depth(
+        send_depth, receiver_dev, sender_dev, args.apple_queue_depth
+    )
     send_slots = args.send_slots or send_depth
-    send_slots = apple_queue_depth(send_slots, receiver_dev, sender_dev)
+    send_slots = apple_queue_depth(
+        send_slots, receiver_dev, sender_dev, args.apple_queue_depth
+    )
     if args.check and send_slots < send_depth:
         send_slots = send_depth
     log_prefix = f"{safe_name(args.tag)}-" if args.tag else ""
@@ -478,6 +488,24 @@ def main() -> int:
     parser.add_argument("--mtus", type=parse_csv_ints, default=parse_csv_ints("4096"))
     parser.add_argument("--count", type=int, default=100000)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--apple-queue-depth",
+        type=int,
+        default=APPLE_UC_QUEUE_DEPTH,
+        help=(
+            "Maximum requested depth for cases involving macOS rdma_* devices; "
+            "0 disables this software cap."
+        ),
+    )
+    parser.add_argument(
+        "--apple-gate",
+        action="store_true",
+        help=(
+            "Run the Apple compatibility merge-gate matrix: both directions, "
+            "4 KiB and 64 KiB checked SENDs, depth/count 256, strict order, "
+            "and fail-fast."
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--receiver-drain-timeout", type=float, default=10.0)
     parser.add_argument("--start-delay", type=float, default=1.0)
@@ -498,6 +526,32 @@ def main() -> int:
     parser.set_defaults(check=True, check_any_order=True)
     args = parser.parse_args()
 
+    if args.apple_gate:
+        args.directions = "both"
+        args.sizes = [4096, 65536]
+        args.send_depths = [256]
+        args.send_slots = 256
+        args.recv_depth = 256
+        args.recv_posts = 256
+        args.mtus = [4096]
+        args.count = 256
+        args.repeats = 1
+        args.apple_queue_depth = 256
+        args.timeout = max(args.timeout, 120.0)
+        args.receiver_drain_timeout = max(args.receiver_drain_timeout, 30.0)
+        args.hold_before_destroy_ms = max(args.hold_before_destroy_ms, 1500)
+        args.stop_on_fail = True
+        args.check = True
+        args.check_any_order = False
+        if not args.tag:
+            args.tag = "apple-gate"
+        print(
+            "tbv-uc-stress: apple gate preset active "
+            "(both directions, sizes=4096,65536, depth=256, count=256, "
+            "strict-order)",
+            flush=True,
+        )
+
     if args.count <= 0:
         die("--count must be positive")
     if args.repeats <= 0:
@@ -508,6 +562,8 @@ def main() -> int:
         die("--send-depths must be positive")
     if args.send_slots < 0:
         die("--send-slots must be non-negative")
+    if args.apple_queue_depth < 0:
+        die("--apple-queue-depth must be non-negative")
     if args.hold_before_destroy_ms < -1:
         die("--hold-before-destroy-ms must be -1 or non-negative")
 
@@ -581,10 +637,16 @@ def main() -> int:
                             run_index += 1
                             port = args.base_port + run_index
                             effective_send_depth = apple_queue_depth(
-                                send_depth, receiver_dev, sender_dev
+                                send_depth,
+                                receiver_dev,
+                                sender_dev,
+                                args.apple_queue_depth,
                             )
                             effective_recv_posts = apple_queue_depth(
-                                args.recv_posts, receiver_dev, sender_dev
+                                args.recv_posts,
+                                receiver_dev,
+                                sender_dev,
+                                args.apple_queue_depth,
                             )
                             print(
                                 "tbv-uc-stress: "

@@ -100,7 +100,10 @@
           version = "0.3.4";
           src = ./.;
 
-          nativeBuildInputs = [ pkgs.bash ];
+          nativeBuildInputs = [
+            pkgs.bash
+            pkgs.python3
+          ];
 
           dontConfigure = true;
 
@@ -118,6 +121,10 @@
               tools/ci/vm-guest-smoke.sh \
               tools/ci/vm-smoke.sh \
               userspace/bench/tbv_vllm_smoke.sh
+            python -m py_compile \
+              userspace/bench/tbv_perftest_runner.py \
+              userspace/bench/tbv_rdma_sweep.py \
+              userspace/bench/tbv_uc_stress.py
             runHook postBuild
           '';
 
