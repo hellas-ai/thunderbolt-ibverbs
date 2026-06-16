@@ -6178,6 +6178,20 @@ static bool tbv_apple_tx_requires_exclusive_window(u32 frames)
 	return frames > 1;
 }
 
+static bool tbv_qp_apple_tx_window_ok_locked(struct tbv_qp *tqp,
+					     bool exclusive,
+					     unsigned int max_wr,
+					     unsigned int max_frames,
+					     u32 frame_charge)
+{
+	int cur_wr = atomic_read(&tqp->apple_tx_inflight);
+	int cur_frames = atomic_read(&tqp->apple_tx_inflight_frames);
+
+	return (exclusive ? !cur_wr : (!max_wr || cur_wr < max_wr)) &&
+	       (!exclusive || !cur_frames) &&
+	       (!max_frames || cur_frames + frame_charge <= max_frames);
+}
+
 static bool tbv_qp_try_acquire_apple_tx_window(struct tbv_qp *tqp, u32 frames,
 					       bool *wr_acquired,
 					       u32 *frames_acquired,
@@ -6202,13 +6216,8 @@ static bool tbv_qp_try_acquire_apple_tx_window(struct tbv_qp *tqp, u32 frames,
 		*ret = -ECANCELED;
 		acquired = true;
 	} else {
-		int cur_wr = atomic_read(&tqp->apple_tx_inflight);
-		int cur_frames = atomic_read(&tqp->apple_tx_inflight_frames);
-		bool wr_ok = exclusive ? !cur_wr : (!max_wr || cur_wr < max_wr);
-		bool frames_ok = !max_frames ||
-			cur_frames + frame_charge <= max_frames;
-
-		if (wr_ok && frames_ok && (!exclusive || !cur_frames)) {
+		if (tbv_qp_apple_tx_window_ok_locked(tqp, exclusive, max_wr,
+						     max_frames, frame_charge)) {
 			if (max_wr || exclusive)
 				atomic_inc(&tqp->apple_tx_inflight);
 			if (frame_charge)
@@ -6240,13 +6249,8 @@ static bool tbv_qp_apple_tx_window_available(struct tbv_qp *tqp, u32 frames)
 	if (tqp->closing || !tbv_qp_state_uses_transport(tqp->state)) {
 		available = true;
 	} else {
-		int cur_wr = atomic_read(&tqp->apple_tx_inflight);
-		int cur_frames = atomic_read(&tqp->apple_tx_inflight_frames);
-
-		available = (exclusive ? !cur_wr : (!max_wr || cur_wr < max_wr)) &&
-			    (!exclusive || !cur_frames) &&
-			    (!max_frames ||
-			     cur_frames + frame_charge <= max_frames);
+		available = tbv_qp_apple_tx_window_ok_locked(
+			tqp, exclusive, max_wr, max_frames, frame_charge);
 	}
 	spin_unlock_irqrestore(&tqp->lock, flags);
 	return available;
