@@ -4,6 +4,7 @@
 
 #include <linux/err.h>
 #include <linux/errno.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -44,6 +45,8 @@ static const char * const tbv_native_protocol_keys[TBV_NATIVE_MAX_LANES] = {
 	"tbverb2",
 	"tbverb3",
 };
+
+#define TBV_APPLE_RAIL_RETRY_MS 250
 
 struct tbv_service_binding {
 	struct tbv_peer *peer;
@@ -177,9 +180,18 @@ static bool tbv_service_has_pending_apple_rail_locked(struct tbv_state *state)
 static void tbv_service_refresh_apple_rails_pending(struct tbv_state *state)
 {
 	mutex_lock(&state->lock);
-	state->apple_rails_pending =
-		tbv_service_has_pending_apple_rail_locked(state);
+	WRITE_ONCE(state->apple_rails_pending,
+		   tbv_service_has_pending_apple_rail_locked(state));
 	mutex_unlock(&state->lock);
+}
+
+static void tbv_service_queue_apple_rail_work(struct tbv_state *state,
+					      unsigned long delay)
+{
+	if (!state->enable_tunnels)
+		return;
+
+	queue_delayed_work(system_long_wq, &state->apple_rail_work, delay);
 }
 
 static int tbv_service_enable_apple_rail_tunnel(struct tbv_rail *rail)
@@ -263,7 +275,7 @@ tbv_service_next_pending_apple_rail(struct tbv_state *state)
 			return rail;
 		}
 	}
-	state->apple_rails_pending = pending;
+	WRITE_ONCE(state->apple_rails_pending, pending);
 	mutex_unlock(&state->lock);
 	return NULL;
 }
@@ -271,7 +283,8 @@ tbv_service_next_pending_apple_rail(struct tbv_state *state)
 static void tbv_service_apple_rail_work(struct work_struct *work)
 {
 	struct tbv_state *state =
-		container_of(work, struct tbv_state, apple_rail_work);
+		container_of(to_delayed_work(work), struct tbv_state,
+			     apple_rail_work);
 
 	if (!state->services_registered || !state->enable_tunnels)
 		return;
@@ -290,11 +303,17 @@ static void tbv_service_apple_rail_work(struct work_struct *work)
 		if (ret) {
 			struct tbv_peer *peer = rail->peer;
 
-			pr_warn("failed to publish deferred Apple data service peer=%u route=0x%llx rail=0x%x state=%s ret=%d\n",
-				peer->peer_id, peer->xd->route,
-				rail->rail_id,
-				tbv_path_state_name(rail->path.state), ret);
+			tbv_service_refresh_apple_rails_pending(state);
+			pr_warn_ratelimited("failed to publish Apple data service peer=%u route=0x%llx rail=0x%x state=%s ret=%d; retrying\n",
+					    peer->peer_id, peer->xd->route,
+					    rail->rail_id,
+					    tbv_path_state_name(rail->path.state),
+					    ret);
 			tbv_rail_put(rail);
+			if (READ_ONCE(state->apple_rails_pending))
+				tbv_service_queue_apple_rail_work(
+					state,
+					msecs_to_jiffies(TBV_APPLE_RAIL_RETRY_MS));
 			return;
 		}
 
@@ -313,7 +332,7 @@ void tbv_services_tbnet_identity_ready(struct tbv_tbnet_identity *identity)
 	if (!tbv_service_tbnet_path_ready(state, NULL))
 		return;
 
-	queue_work(system_long_wq, &state->apple_rail_work);
+	tbv_service_queue_apple_rail_work(state, 0);
 }
 
 static bool tbv_service_apple_xdomain_allowed(const struct tb_xdomain *xd)
@@ -450,14 +469,21 @@ static int tbv_service_probe(struct tb_service *svc,
 							      rail);
 			} else if (backend == TBV_BACKEND_APPLE &&
 				   tbv_service_state->enable_tunnels) {
+				/*
+				 * Apple rail publication is worker-owned. The
+				 * worker gates on TBnet readiness, enables the
+				 * FA57 data tunnel, publishes verbs, and retries
+				 * transient tunnel setup failures.
+				 */
+				WRITE_ONCE(tbv_service_state->apple_rails_pending,
+					   true);
 				if (tbv_service_should_defer_apple_rail(tbv_service_state, xd)) {
-					tbv_service_state->apple_rails_pending = true;
 					pr_info("deferring Apple data service id=%d route=0x%llx until ThunderboltIP packet path is active\n",
 						svc->id, xd->route);
 				} else {
-					ret = tbv_service_publish_apple_rail(rail);
-					if (ret)
-						goto err_remove_rail;
+					pr_info("queueing Apple data service id=%d route=0x%llx for publication\n",
+						svc->id, xd->route);
+					tbv_service_queue_apple_rail_work(tbv_service_state, 0);
 				}
 			}
 		}
@@ -654,8 +680,8 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 	 */
 	state->apple_rails_wait_tbnet =
 		state->cfg.tbnet_identity == TBV_TBNET_ID_MINIMAL_PACKET;
-	state->apple_rails_pending = false;
-	INIT_WORK(&state->apple_rail_work, tbv_service_apple_rail_work);
+	WRITE_ONCE(state->apple_rails_pending, false);
+	INIT_DELAYED_WORK(&state->apple_rail_work, tbv_service_apple_rail_work);
 
 	if (!bind_services) {
 		pr_info("Thunderbolt service binding disabled\n");
@@ -691,6 +717,8 @@ int tbv_services_start(struct tbv_state *state, bool bind_services,
 
 	state->services_registered = true;
 	pr_info("Thunderbolt service binding enabled\n");
+	if (READ_ONCE(state->apple_rails_pending))
+		tbv_service_queue_apple_rail_work(state, 0);
 	tbv_services_tbnet_identity_ready(&state->tbnet_identity);
 	return 0;
 
@@ -716,8 +744,8 @@ void tbv_services_stop(struct tbv_state *state)
 		tb_unregister_service_driver(&tbv_service_driver);
 		state->services_registered = false;
 	}
-	cancel_work_sync(&state->apple_rail_work);
-	state->apple_rails_pending = false;
+	cancel_delayed_work_sync(&state->apple_rail_work);
+	WRITE_ONCE(state->apple_rails_pending, false);
 
 	tbv_tbnet_minimal_stop(&state->tbnet_identity);
 	tbv_native_control_stop(state);
