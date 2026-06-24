@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: georgewhewell <georgerw@gmail.com>
+Date: Wed, 24 Jun 2026 00:00:00 +0200
+Subject: [PATCH] thunderbolt: xdomain: bound response copy size
+
+When copying an XDomain response into the waiting request buffer, use
+the smaller of the received frame size and the caller-provided response
+buffer size.
+
+This matches the Linux 7.1 xdomain.c baseline and keeps the integration
+patch stack aligned with the portable patch stack before the later
+identity-validation patch tightens payload handling further.
+
+Signed-off-by: georgewhewell <georgerw@gmail.com>
+---
+ drivers/thunderbolt/xdomain.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -122,7 +122,9 @@ static bool tb_xdomain_match(const struct tb_cfg_request *req,
+ static bool tb_xdomain_copy(struct tb_cfg_request *req,
+ 			    const struct ctl_pkg *pkg)
+ {
+-	memcpy(req->response, pkg->buffer, req->response_size);
++	size_t len = min_t(size_t, pkg->frame.size, req->response_size);
++
++	memcpy(req->response, pkg->buffer, len);
+ 	req->result.err = 0;
+ 	return true;
+ }
