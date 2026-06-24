@@ -9163,7 +9163,11 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+	mr->umem = ib_umem_get_va(pd->device, start, length, access);
+#else
 	mr->umem = ib_umem_get(pd->device, start, length, access);
+#endif
 	if (IS_ERR(mr->umem)) {
 		struct ib_umem *umem = mr->umem;
 
@@ -9309,9 +9313,10 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
 
 	/*
 	 * This is a software verbs provider. User MRs remain pinned by
-	 * ib_umem_get(), and kernel local-DMA SGEs must stay CPU-visible for
-	 * MAD/CM QP1 handling. Keep the Thunderbolt ring device as the parent,
-	 * but use RDMA-core virtual DMA for verbs buffer addresses.
+	 * the RDMA umem helpers, and kernel local-DMA SGEs must stay
+	 * CPU-visible for MAD/CM QP1 handling. Keep the Thunderbolt ring
+	 * device as the parent, but use RDMA-core virtual DMA for verbs
+	 * buffer addresses.
 	 */
 	ret = ib_register_device(&dev->base, name, NULL);
 	if (ret) {
