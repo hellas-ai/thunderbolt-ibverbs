@@ -6,6 +6,8 @@
 #include <linux/completion.h>
 #include <linux/crc32.h>
 #include <linux/crc32c.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-resv.h>
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/highmem.h>
@@ -850,6 +852,26 @@ out:
 	xas_unlock_irqrestore(&xas, flags);
 	return mr;
 }
+
+static void tbv_dmabuf_invalidate(struct dma_buf_attachment *attach)
+{
+	struct ib_umem_dmabuf *umem_dmabuf = attach->importer_priv;
+
+	if (!umem_dmabuf)
+		return;
+
+	ibdev_warn_ratelimited(umem_dmabuf->umem.ibdev,
+			       "dmabuf-backed MR was invalidated; revoke handling is not implemented yet\n");
+}
+
+static const struct dma_buf_attach_ops tbv_dmabuf_attach_ops = {
+	.allow_peer2peer = false,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+	.invalidate_mappings = tbv_dmabuf_invalidate,
+#else
+	.move_notify = tbv_dmabuf_invalidate,
+#endif
+};
 
 static void tbv_mr_free(struct tbv_mr *mr)
 {
@@ -9179,35 +9201,21 @@ static struct ib_mr *tbv_get_dma_mr(struct ib_pd *pd, int access)
 	return &mr->base;
 }
 
-static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
-				     u64 virt_addr, int access,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
-				     struct ib_dmah *dmah,
-#endif
-				     struct ib_udata *udata)
+static struct ib_mr *tbv_reg_mr_from_umem(struct ib_pd *pd,
+					  struct ib_umem *umem, u64 start,
+					  u64 length, u64 virt_addr,
+					  int access)
 {
 	struct tbv_mr *mr;
 	int ret;
 
-	if (!length)
-		return ERR_PTR(-EINVAL);
-
 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
-	if (!mr)
+	if (!mr) {
+		ib_umem_release(umem);
 		return ERR_PTR(-ENOMEM);
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
-	mr->umem = ib_umem_get_va(pd->device, start, length, access);
-#else
-	mr->umem = ib_umem_get(pd->device, start, length, access);
-#endif
-	if (IS_ERR(mr->umem)) {
-		struct ib_umem *umem = mr->umem;
-
-		kfree(mr);
-		return ERR_CAST(umem);
 	}
 
+	mr->umem = umem;
 	mr->base.type = IB_MR_TYPE_USER;
 	mr->base.iova = virt_addr;
 	mr->base.length = length;
@@ -9222,6 +9230,79 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 		return ERR_PTR(ret);
 	}
 	return &mr->base;
+}
+
+static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+				     u64 virt_addr, int access,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+				     struct ib_dmah *dmah,
+#endif
+				     struct ib_udata *udata)
+{
+	struct ib_umem *umem;
+
+	if (!length)
+		return ERR_PTR(-EINVAL);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+	umem = ib_umem_get_va(pd->device, start, length, access);
+#else
+	umem = ib_umem_get(pd->device, start, length, access);
+#endif
+	if (IS_ERR(umem))
+		return ERR_CAST(umem);
+
+	return tbv_reg_mr_from_umem(pd, umem, start, length, virt_addr,
+				    access);
+}
+
+static struct ib_mr *tbv_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset,
+					    u64 length, u64 virt_addr,
+					    int fd, int access,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+					    struct ib_dmah *dmah,
+#endif
+					    struct uverbs_attr_bundle *attrs)
+{
+	struct ib_umem_dmabuf *umem_dmabuf;
+	int ret;
+
+	if (!length)
+		return ERR_PTR(-EINVAL);
+
+	umem_dmabuf = ib_umem_dmabuf_get_pinned(pd->device, offset, length,
+						fd, access);
+	if (PTR_ERR_OR_ZERO(umem_dmabuf) == -EOPNOTSUPP) {
+		pr_info_ratelimited("dmabuf MR pinned import unsupported; trying dynamic import device=%s dma_device=%s fd=%d offset=%llu length=%llu\n",
+				    dev_name(&pd->device->dev),
+				    pd->device->dma_device ?
+				    dev_name(pd->device->dma_device) : "<none>",
+				    fd, (unsigned long long)offset,
+				    (unsigned long long)length);
+		umem_dmabuf = ib_umem_dmabuf_get(pd->device, offset, length,
+						 fd, access,
+						 &tbv_dmabuf_attach_ops);
+		if (IS_ERR(umem_dmabuf)) {
+			pr_info_ratelimited("dmabuf MR dynamic import failed err=%ld\n",
+					    PTR_ERR(umem_dmabuf));
+			return ERR_CAST(umem_dmabuf);
+		}
+
+		dma_resv_lock(umem_dmabuf->attach->dmabuf->resv, NULL);
+		ret = ib_umem_dmabuf_map_pages(umem_dmabuf);
+		dma_resv_unlock(umem_dmabuf->attach->dmabuf->resv);
+		if (ret) {
+			pr_info_ratelimited("dmabuf MR map_pages failed err=%d\n",
+					    ret);
+			ib_umem_release(&umem_dmabuf->umem);
+			return ERR_PTR(ret);
+		}
+	}
+	if (IS_ERR(umem_dmabuf))
+		return ERR_CAST(umem_dmabuf);
+
+	return tbv_reg_mr_from_umem(pd, &umem_dmabuf->umem, offset, length,
+				    virt_addr, access);
 }
 
 static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
@@ -9275,6 +9356,7 @@ static const struct ib_device_ops tbv_ibdev_ops = {
 	.poll_cq = tbv_poll_cq,
 	.req_notify_cq = tbv_req_notify_cq,
 	.reg_user_mr = tbv_reg_user_mr,
+	.reg_user_mr_dmabuf = tbv_reg_user_mr_dmabuf,
 	.dereg_mr = tbv_dereg_mr,
 
 	INIT_RDMA_OBJ_SIZE(ib_ucontext, tbv_ucontext, base),
