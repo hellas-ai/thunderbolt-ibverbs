@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 #define _POSIX_C_SOURCE 200112L
 /*
- * USB4 RDMA Direct Verbs (DV) QUERY_CAPS probe.
+ * USB4 RDMA Direct Verbs (DV) QUERY_CAPS and queue smoke probe.
  *
  * Opens a usb4_rdma* / usb4_apple* verbs device, issues the private
  * USB4_RDMA_DV_METHOD_QUERY_CAPS method via the raw RDMA_VERBS_IOCTL ABI,
- * and prints the reported capabilities and queue-memory layout.
+ * and prints the reported capabilities and queue-memory layout. With -q it
+ * also attaches a DV queue, KICKs signaled NOP WQEs, and checks CQEs.
  *
  * Uses the raw ioctl rather than rdma-core's private execute_ioctl() helper
  * so the probe can be built as an ordinary test binary outside the provider
@@ -151,6 +152,39 @@ static int destroy_queue(struct ibv_qp *qp)
 	return 0;
 }
 
+static int kick_queue(struct ibv_qp *qp, const struct usb4_rdma_dv_kick *req)
+{
+	struct {
+		struct ib_uverbs_ioctl_hdr hdr;
+		struct ib_uverbs_attr attrs[2];
+	} cmd = {
+		.hdr = {
+			.length = sizeof(cmd),
+			.object_id = USB4_RDMA_DV_OBJECT_DEVICE,
+			.method_id = USB4_RDMA_DV_METHOD_KICK,
+			.num_attrs = 2,
+			.driver_id = RDMA_DRIVER_UNKNOWN,
+		},
+		.attrs = {
+			{
+				.attr_id = USB4_RDMA_DV_ATTR_KICK_QP,
+				.flags = UVERBS_ATTR_F_MANDATORY,
+				.data = qp->handle,
+			},
+			{
+				.attr_id = USB4_RDMA_DV_ATTR_KICK_REQ,
+				.len = sizeof(*req),
+				.flags = UVERBS_ATTR_F_MANDATORY,
+				.data = (uintptr_t)req,
+			},
+		},
+	};
+
+	if (ioctl(qp->context->cmd_fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return errno;
+	return 0;
+}
+
 static int alloc_aligned(size_t alignment, size_t size, void **ptr)
 {
 	int ret;
@@ -160,6 +194,126 @@ static int alloc_aligned(size_t alignment, size_t size, void **ptr)
 	if (ret)
 		return ret;
 	memset(*ptr, 0, size);
+	return 0;
+}
+
+static void store_release_u32(uint32_t *ptr, uint32_t value)
+{
+	__atomic_store_n(ptr, value, __ATOMIC_RELEASE);
+}
+
+static uint32_t load_acquire_u32(uint32_t *ptr)
+{
+	return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+}
+
+static uint8_t next_generation(uint32_t generation)
+{
+	uint32_t mask = (1u << USB4_RDMA_DV_TAIL_GENERATION_BITS) - 1;
+	uint32_t next = (generation + 1) & mask;
+
+	return next ? next : 1;
+}
+
+static int expect_cqe(const char *label, struct usb4_rdma_dv_cqe *cqe,
+		      struct usb4_rdma_dv_doorbell *doorbell, uint32_t index,
+		      uint32_t generation, uint64_t wr_id, uint32_t status,
+		      uint32_t opcode)
+{
+	uint32_t cq_tail = load_acquire_u32(&doorbell->consumer.cq_tail);
+	uint32_t sq_head = load_acquire_u32(&doorbell->consumer.sq_head);
+
+	printf("%s wr_id=0x%016" PRIx64 " status=%u opcode=%u sq_head=%u cq_tail=%u qp_state=%u\n",
+	       label, (uint64_t)cqe->wr_id, cqe->status, cqe->opcode,
+	       usb4_rdma_dv_tail_index(sq_head),
+	       usb4_rdma_dv_tail_index(cq_tail),
+	       load_acquire_u32(&doorbell->consumer.qp_state));
+
+	if (usb4_rdma_dv_tail_generation(cq_tail) != generation ||
+	    usb4_rdma_dv_tail_index(cq_tail) != index + 1) {
+		fprintf(stderr, "%s: unexpected cq_tail=0x%08x\n", label,
+			cq_tail);
+		return 1;
+	}
+	if (usb4_rdma_dv_tail_generation(sq_head) != generation ||
+	    usb4_rdma_dv_tail_index(sq_head) != index + 1) {
+		fprintf(stderr, "%s: unexpected sq_head=0x%08x\n", label,
+			sq_head);
+		return 1;
+	}
+	if (cqe->wr_id != wr_id || cqe->status != status ||
+	    cqe->opcode != opcode) {
+		fprintf(stderr,
+			"%s: unexpected CQE wr_id=0x%016" PRIx64 " status=%u opcode=%u\n",
+			label, (uint64_t)cqe->wr_id, cqe->status, cqe->opcode);
+		return 1;
+	}
+
+	return 0;
+}
+
+static int run_kick_smoke(struct ibv_qp *qp,
+			  struct usb4_rdma_dv_wqe *sq,
+			  struct usb4_rdma_dv_cqe *cq,
+			  struct usb4_rdma_dv_doorbell *doorbell,
+			  uint32_t generation)
+{
+	struct usb4_rdma_dv_kick kick = {};
+	uint32_t tail;
+	int err;
+
+	store_release_u32(&doorbell->producer.generation, generation);
+	store_release_u32(&doorbell->producer.cq_head,
+			  usb4_rdma_dv_tail_pack(0, generation));
+	store_release_u32(&doorbell->producer.sq_tail,
+			  usb4_rdma_dv_tail_pack(0, generation));
+
+	memset(&sq[0], 0, sizeof(sq[0]));
+	sq[0].opcode = USB4_RDMA_DV_WQE_NOP;
+	sq[0].flags = USB4_RDMA_DV_WQE_F_SIGNALED;
+	sq[0].wr_id = 0x4b49434b4e4f5031ULL;
+	sq[0].generation = generation;
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	tail = usb4_rdma_dv_tail_pack(1, generation);
+	store_release_u32(&doorbell->producer.sq_tail, tail);
+	kick.sq_tail = tail;
+
+	err = kick_queue(qp, &kick);
+	if (err) {
+		fprintf(stderr, "KICK nop failed: %s (%d)\n", strerror(err),
+			err);
+		return 1;
+	}
+	if (expect_cqe("kick_nop", &cq[0], doorbell, 0, generation,
+		       sq[0].wr_id, USB4_RDMA_DV_CQE_SUCCESS,
+		       USB4_RDMA_DV_WQE_NOP))
+		return 1;
+	store_release_u32(&doorbell->producer.cq_head,
+			  usb4_rdma_dv_tail_pack(1, generation));
+
+	memset(&sq[1], 0, sizeof(sq[1]));
+	sq[1].opcode = USB4_RDMA_DV_WQE_NOP;
+	sq[1].flags = USB4_RDMA_DV_WQE_F_SIGNALED;
+	sq[1].wr_id = 0x4b49434b5354414cULL;
+	sq[1].generation = next_generation(generation);
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	tail = usb4_rdma_dv_tail_pack(2, generation);
+	store_release_u32(&doorbell->producer.sq_tail, tail);
+	kick.sq_tail = tail;
+
+	err = kick_queue(qp, &kick);
+	if (err) {
+		fprintf(stderr, "KICK stale-gen failed: %s (%d)\n",
+			strerror(err), err);
+		return 1;
+	}
+	if (expect_cqe("kick_stale_gen", &cq[1], doorbell, 1, generation,
+		       sq[1].wr_id, USB4_RDMA_DV_CQE_STALE_GEN,
+		       USB4_RDMA_DV_WQE_NOP))
+		return 1;
+	store_release_u32(&doorbell->producer.cq_head,
+			  usb4_rdma_dv_tail_pack(2, generation));
+
 	return 0;
 }
 
@@ -394,6 +548,12 @@ static int run_queue_test(struct ibv_context *ctx,
 			(void)destroy_queue(qp);
 			goto out;
 		}
+	}
+
+	err = run_kick_smoke(qp, sq_buf, cq_buf, doorbell, resp.generation);
+	if (err) {
+		(void)destroy_queue(qp);
+		goto out;
 	}
 
 	/* Second CREATE_QUEUE must be rejected with -EBUSY while the

@@ -675,8 +675,8 @@ struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev);
  * Each QP owns one of these. CREATE_QUEUE attaches userspace-provided
  * SQ/CQ/doorbell memory; DESTROY_QUEUE (or QP destroy) bumps the
  * generation and releases it. mutex serializes attach/detach against
- * each other and against QP teardown; nothing in here is on the WQE
- * fast path yet — that lives in subsequent commits.
+ * each other and against QP teardown; KICK drains only NOP smoke-test WQEs
+ * until the transport consumer lands.
  */
 struct tbv_dv_qp_state {
 	struct mutex mutex;
@@ -684,6 +684,8 @@ struct tbv_dv_qp_state {
 	u8 generation;
 	u32 sq_entries;
 	u32 cq_entries;
+	u32 sq_head;
+	u32 cq_tail;
 	u64 sq_addr;
 	u64 cq_addr;
 	u64 doorbell_addr;

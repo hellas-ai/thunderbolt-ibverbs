@@ -37,9 +37,9 @@
  * for the full design, including memory-ordering rules and the generation
  * protocol.
  *
- * Methods wired so far: QUERY_CAPS, CREATE_QUEUE, DESTROY_QUEUE. KICK and
- * the actual WQE consumer follow in subsequent commits; until they land,
- * caps stays 0 to advertise that no transport opcodes are processed.
+ * Methods wired so far: QUERY_CAPS, CREATE_QUEUE, DESTROY_QUEUE, and KICK
+ * for NOP smoke tests. Transport opcodes still follow in subsequent commits;
+ * caps stays 0 to advertise that no SEND/WRITE/READ/ATOMIC WQEs are processed.
  */
 
 /* ----- per-QP lifecycle helpers (called from ibdev.c) ----------------- */
@@ -51,6 +51,8 @@ void tbv_dv_qp_state_init(struct tbv_dv_qp_state *dv)
 	dv->generation = 0;
 	dv->sq_entries = 0;
 	dv->cq_entries = 0;
+	dv->sq_head = 0;
+	dv->cq_tail = 0;
 	dv->sq_addr = 0;
 	dv->cq_addr = 0;
 	dv->doorbell_addr = 0;
@@ -91,6 +93,8 @@ static void tbv_dv_state_release_locked(struct tbv_dv_qp_state *dv)
 	dv->doorbell_umem = NULL;
 	dv->sq_entries = 0;
 	dv->cq_entries = 0;
+	dv->sq_head = 0;
+	dv->cq_tail = 0;
 	dv->sq_addr = 0;
 	dv->cq_addr = 0;
 	dv->doorbell_addr = 0;
@@ -120,11 +124,21 @@ static bool tbv_dv_reserved_zero(const u32 *reserved, size_t count)
 	return true;
 }
 
+static bool tbv_dv_ranges_overlap(u64 a_start, u64 a_len,
+				  u64 b_start, u64 b_len)
+{
+	u64 a_end = a_start + a_len;
+	u64 b_end = b_start + b_len;
+
+	return a_start < b_end && b_start < a_end;
+}
+
 static int tbv_dv_validate_queue_create(
 	const struct usb4_rdma_dv_queue_create *req)
 {
 	u64 sq_bytes;
 	u64 cq_bytes;
+	u64 db_bytes = USB4_RDMA_DV_DOORBELL_PAGE_SIZE;
 	u64 end;
 
 	if (req->abi_version != USB4_RDMA_DV_ABI_VERSION)
@@ -155,8 +169,14 @@ static int tbv_dv_validate_queue_create(
 			       &cq_bytes) ||
 	    check_add_overflow(req->cq_addr, cq_bytes, &end))
 		return -EINVAL;
-	if (check_add_overflow(req->doorbell_addr,
-			       (u64)USB4_RDMA_DV_DOORBELL_PAGE_SIZE, &end))
+	if (check_add_overflow(req->doorbell_addr, db_bytes, &end))
+		return -EINVAL;
+	if (tbv_dv_ranges_overlap(req->sq_addr, sq_bytes, req->cq_addr,
+				  cq_bytes) ||
+	    tbv_dv_ranges_overlap(req->sq_addr, sq_bytes, req->doorbell_addr,
+				  db_bytes) ||
+	    tbv_dv_ranges_overlap(req->cq_addr, cq_bytes, req->doorbell_addr,
+				  db_bytes))
 		return -EINVAL;
 	return 0;
 }
@@ -178,6 +198,29 @@ static void tbv_dv_pin_release(struct tbv_dv_pin_result *res)
 	memset(res, 0, sizeof(*res));
 }
 
+static int tbv_dv_validate_cpu_visible_umem(struct ib_umem *umem)
+{
+	struct sg_table *sgt = &umem->sgt_append.sgt;
+	struct scatterlist *sg;
+	unsigned int i;
+
+	for_each_sgtable_sg(sgt, sg, i) {
+		unsigned int pages;
+		unsigned int j;
+
+		pages = DIV_ROUND_UP(sg->offset + sg->length, PAGE_SIZE);
+		for (j = 0; j < pages; j++) {
+			struct page *page =
+				pfn_to_page(page_to_pfn(sg_page(sg)) + j);
+
+			if (is_zone_device_page(page))
+				return -EOPNOTSUPP;
+		}
+	}
+
+	return 0;
+}
+
 static int tbv_dv_pin_queue(struct ib_device *dev,
 			    const struct usb4_rdma_dv_queue_create *req,
 			    struct tbv_dv_pin_result *res)
@@ -185,6 +228,7 @@ static int tbv_dv_pin_queue(struct ib_device *dev,
 	u64 sq_bytes = (u64)req->sq_entries * req->sq_stride;
 	u64 cq_bytes = (u64)req->cq_entries * req->cq_stride;
 	int access = IB_ACCESS_LOCAL_WRITE;
+	int ret;
 
 	memset(res, 0, sizeof(*res));
 
@@ -193,6 +237,11 @@ static int tbv_dv_pin_queue(struct ib_device *dev,
 		int ret = PTR_ERR(res->sq_umem);
 
 		res->sq_umem = NULL;
+		return ret;
+	}
+	ret = tbv_dv_validate_cpu_visible_umem(res->sq_umem);
+	if (ret) {
+		tbv_dv_pin_release(res);
 		return ret;
 	}
 
@@ -204,6 +253,11 @@ static int tbv_dv_pin_queue(struct ib_device *dev,
 		tbv_dv_pin_release(res);
 		return ret;
 	}
+	ret = tbv_dv_validate_cpu_visible_umem(res->cq_umem);
+	if (ret) {
+		tbv_dv_pin_release(res);
+		return ret;
+	}
 
 	res->doorbell_umem = ib_umem_get(dev, req->doorbell_addr,
 					 USB4_RDMA_DV_DOORBELL_PAGE_SIZE,
@@ -212,6 +266,11 @@ static int tbv_dv_pin_queue(struct ib_device *dev,
 		int ret = PTR_ERR(res->doorbell_umem);
 
 		res->doorbell_umem = NULL;
+		tbv_dv_pin_release(res);
+		return ret;
+	}
+	ret = tbv_dv_validate_cpu_visible_umem(res->doorbell_umem);
+	if (ret) {
 		tbv_dv_pin_release(res);
 		return ret;
 	}
@@ -244,7 +303,7 @@ static int tbv_dv_umem_write(struct ib_umem *umem, size_t offset,
 		return -EFAULT;
 
 	skip = ib_umem_offset(umem) + offset;
-	for_each_sg(sgt->sgl, sg, sgt->nents, i) {
+	for_each_sgtable_sg(sgt, sg, i) {
 		size_t seg_len = sg->length;
 		size_t seg_off;
 
@@ -286,6 +345,64 @@ static int tbv_dv_umem_write(struct ib_umem *umem, size_t offset,
 	return copied == len ? 0 : -EFAULT;
 }
 
+static int tbv_dv_umem_read(struct ib_umem *umem, size_t offset,
+			    void *dst, size_t len)
+{
+	struct sg_table *sgt = &umem->sgt_append.sgt;
+	struct scatterlist *sg;
+	size_t copied = 0;
+	size_t skip;
+	unsigned int i;
+
+	if (!len)
+		return 0;
+	if (offset + len < offset)
+		return -EINVAL;
+	if (offset + len > umem->length)
+		return -EFAULT;
+
+	skip = ib_umem_offset(umem) + offset;
+	for_each_sgtable_sg(sgt, sg, i) {
+		size_t seg_len = sg->length;
+		size_t seg_off;
+
+		if (skip >= seg_len) {
+			skip -= seg_len;
+			continue;
+		}
+
+		seg_off = sg->offset + skip;
+		seg_len -= skip;
+		skip = 0;
+
+		while (seg_len && copied < len) {
+			struct page *page;
+			size_t page_off = offset_in_page(seg_off);
+			size_t chunk = min_t(size_t, PAGE_SIZE - page_off,
+					     seg_len);
+			void *kaddr;
+
+			chunk = min_t(size_t, chunk, len - copied);
+
+			page = pfn_to_page(page_to_pfn(sg_page(sg)) +
+					   (seg_off >> PAGE_SHIFT));
+			kaddr = kmap_local_page(page);
+			memcpy((u8 *)dst + copied, (const u8 *)kaddr + page_off,
+			       chunk);
+			kunmap_local(kaddr);
+
+			copied += chunk;
+			seg_off += chunk;
+			seg_len -= chunk;
+		}
+
+		if (copied == len)
+			break;
+	}
+
+	return copied == len ? 0 : -EFAULT;
+}
+
 /*
  * Write the consumer cacheline of the doorbell page so the GPU side sees
  * a known initial (or terminal) state. Used after CREATE_QUEUE to publish
@@ -310,6 +427,128 @@ static int tbv_dv_write_consumer_line(struct ib_umem *umem,
 	return tbv_dv_umem_write(
 		umem, offsetof(struct usb4_rdma_dv_doorbell, consumer),
 		&line, sizeof(line));
+}
+
+static u32 tbv_dv_index_delta(u32 from, u32 to)
+{
+	return (to - from) & USB4_RDMA_DV_TAIL_INDEX_MASK;
+}
+
+static int tbv_dv_read_producer_line(
+	struct tbv_dv_qp_state *dv,
+	struct usb4_rdma_dv_doorbell_producer_line *line)
+{
+	return tbv_dv_umem_read(
+		dv->doorbell_umem,
+		offsetof(struct usb4_rdma_dv_doorbell, producer),
+		line, sizeof(*line));
+}
+
+static int tbv_dv_read_wqe(struct tbv_dv_qp_state *dv, u32 sq_index,
+			   struct usb4_rdma_dv_wqe *wqe)
+{
+	u32 slot = sq_index % dv->sq_entries;
+	size_t offset = (size_t)slot * USB4_RDMA_DV_WQE_SIZE;
+
+	return tbv_dv_umem_read(dv->sq_umem, offset, wqe, sizeof(*wqe));
+}
+
+static int tbv_dv_write_cqe(struct tbv_dv_qp_state *dv, u32 cq_index,
+			    const struct usb4_rdma_dv_cqe *cqe)
+{
+	u32 slot = cq_index % dv->cq_entries;
+	size_t offset = (size_t)slot * USB4_RDMA_DV_CQE_SIZE;
+
+	return tbv_dv_umem_write(dv->cq_umem, offset, cqe, sizeof(*cqe));
+}
+
+static int tbv_dv_emit_cqe_locked(struct tbv_dv_qp_state *dv,
+				  const struct usb4_rdma_dv_wqe *wqe,
+				  u32 status, u32 opcode)
+{
+	struct usb4_rdma_dv_doorbell_producer_line producer = {};
+	struct usb4_rdma_dv_cqe cqe = {
+		.wr_id = wqe->wr_id,
+		.status = status,
+		.opcode = opcode,
+		.byte_len = status == USB4_RDMA_DV_CQE_SUCCESS ?
+			wqe->length : 0,
+		.imm_data = wqe->imm_data,
+		.qp_state = USB4_RDMA_DV_QP_LIVE,
+	};
+	u32 cq_head;
+	u32 cq_tail;
+	int ret;
+
+	ret = tbv_dv_read_producer_line(dv, &producer);
+	if (ret)
+		return ret;
+
+	if (producer.generation &&
+	    producer.generation != dv->generation)
+		return -ESTALE;
+	if (producer.cq_head &&
+	    usb4_rdma_dv_tail_generation(producer.cq_head) != dv->generation)
+		return -ESTALE;
+
+	cq_head = usb4_rdma_dv_tail_index(producer.cq_head);
+	cq_tail = usb4_rdma_dv_tail_index(dv->cq_tail);
+	if (tbv_dv_index_delta(cq_head, cq_tail) >= dv->cq_entries)
+		return -ENOSPC;
+
+	ret = tbv_dv_write_cqe(dv, cq_tail, &cqe);
+	if (ret)
+		return ret;
+
+	dv->cq_tail = usb4_rdma_dv_tail_pack(cq_tail + 1, dv->generation);
+	return 0;
+}
+
+static int tbv_dv_drain_nop_locked(struct tbv_dv_qp_state *dv, u32 sq_tail)
+{
+	u32 tail_generation = usb4_rdma_dv_tail_generation(sq_tail);
+	u32 head = usb4_rdma_dv_tail_index(dv->sq_head);
+	u32 tail = usb4_rdma_dv_tail_index(sq_tail);
+	u32 pending;
+	int ret;
+
+	if (!dv->active)
+		return -ENOENT;
+	if (tail_generation != dv->generation)
+		return -ESTALE;
+	pending = tbv_dv_index_delta(head, tail);
+	if (pending > dv->sq_entries)
+		return -EINVAL;
+
+	while (head != tail) {
+		struct usb4_rdma_dv_wqe wqe = {};
+		u32 status = USB4_RDMA_DV_CQE_SUCCESS;
+		bool signal;
+
+		ret = tbv_dv_read_wqe(dv, head, &wqe);
+		if (ret)
+			return ret;
+
+		signal = wqe.flags & USB4_RDMA_DV_WQE_F_SIGNALED;
+		if (wqe.generation != dv->generation)
+			status = USB4_RDMA_DV_CQE_STALE_GEN;
+		else if (wqe.opcode != USB4_RDMA_DV_WQE_NOP)
+			status = USB4_RDMA_DV_CQE_GENERAL_ERR;
+
+		if (signal || status != USB4_RDMA_DV_CQE_SUCCESS) {
+			ret = tbv_dv_emit_cqe_locked(dv, &wqe, status,
+						     wqe.opcode);
+			if (ret)
+				return ret;
+		}
+
+		head = (head + 1) & USB4_RDMA_DV_TAIL_INDEX_MASK;
+		dv->sq_head = usb4_rdma_dv_tail_pack(head, dv->generation);
+	}
+
+	return tbv_dv_write_consumer_line(dv->doorbell_umem, dv->sq_head,
+					  dv->cq_tail, USB4_RDMA_DV_QP_LIVE,
+					  dv->generation);
 }
 
 /* ----- uverbs methods ------------------------------------------------- */
@@ -412,6 +651,8 @@ static int UVERBS_HANDLER(USB4_RDMA_DV_METHOD_CREATE_QUEUE)(
 	dv->generation = generation;
 	dv->sq_entries = req.sq_entries;
 	dv->cq_entries = req.cq_entries;
+	dv->sq_head = usb4_rdma_dv_tail_pack(0, generation);
+	dv->cq_tail = usb4_rdma_dv_tail_pack(0, generation);
 	dv->sq_addr = req.sq_addr;
 	dv->cq_addr = req.cq_addr;
 	dv->doorbell_addr = req.doorbell_addr;
@@ -427,9 +668,7 @@ static int UVERBS_HANDLER(USB4_RDMA_DV_METHOD_CREATE_QUEUE)(
 	 * generation into its own line before issuing the first WQE.
 	 */
 	ret = tbv_dv_write_consumer_line(
-		dv->doorbell_umem,
-		usb4_rdma_dv_tail_pack(0, generation),
-		usb4_rdma_dv_tail_pack(0, generation),
+		dv->doorbell_umem, dv->sq_head, dv->cq_tail,
 		USB4_RDMA_DV_QP_LIVE, generation);
 	if (ret)
 		goto err_release_locked;
@@ -514,6 +753,35 @@ static int UVERBS_HANDLER(USB4_RDMA_DV_METHOD_DESTROY_QUEUE)(
 	return ret;
 }
 
+static int UVERBS_HANDLER(USB4_RDMA_DV_METHOD_KICK)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct usb4_rdma_dv_kick req = {};
+	struct tbv_dv_qp_state *dv;
+	struct ib_qp *ibqp;
+	struct tbv_qp *tqp;
+	int ret;
+
+	ibqp = uverbs_attr_get_obj(attrs, USB4_RDMA_DV_ATTR_KICK_QP);
+	if (IS_ERR(ibqp))
+		return PTR_ERR(ibqp);
+
+	ret = uverbs_copy_from(&req, attrs, USB4_RDMA_DV_ATTR_KICK_REQ);
+	if (ret)
+		return ret;
+	if (req.flags ||
+	    !tbv_dv_reserved_zero(req.reserved, ARRAY_SIZE(req.reserved)))
+		return -EINVAL;
+
+	tqp = tbv_qp_from_ibqp(ibqp);
+	dv = tbv_qp_dv_state(tqp);
+
+	mutex_lock(&dv->mutex);
+	ret = tbv_dv_drain_nop_locked(dv, req.sq_tail);
+	mutex_unlock(&dv->mutex);
+	return ret;
+}
+
 DECLARE_UVERBS_NAMED_METHOD(
 	USB4_RDMA_DV_METHOD_QUERY_CAPS,
 	UVERBS_ATTR_PTR_OUT(
@@ -544,11 +812,23 @@ DECLARE_UVERBS_NAMED_METHOD(
 			UVERBS_ACCESS_READ,
 			UA_MANDATORY));
 
+DECLARE_UVERBS_NAMED_METHOD(
+	USB4_RDMA_DV_METHOD_KICK,
+	UVERBS_ATTR_IDR(USB4_RDMA_DV_ATTR_KICK_QP,
+			UVERBS_OBJECT_QP,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(
+		USB4_RDMA_DV_ATTR_KICK_REQ,
+		UVERBS_ATTR_STRUCT(struct usb4_rdma_dv_kick, reserved),
+		UA_MANDATORY));
+
 DECLARE_UVERBS_GLOBAL_METHODS(
 	USB4_RDMA_DV_OBJECT_DEVICE,
 	&UVERBS_METHOD(USB4_RDMA_DV_METHOD_QUERY_CAPS),
 	&UVERBS_METHOD(USB4_RDMA_DV_METHOD_CREATE_QUEUE),
-	&UVERBS_METHOD(USB4_RDMA_DV_METHOD_DESTROY_QUEUE));
+	&UVERBS_METHOD(USB4_RDMA_DV_METHOD_DESTROY_QUEUE),
+	&UVERBS_METHOD(USB4_RDMA_DV_METHOD_KICK));
 
 const struct uapi_definition tbv_uapi_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(USB4_RDMA_DV_OBJECT_DEVICE),
