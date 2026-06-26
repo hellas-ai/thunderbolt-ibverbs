@@ -54,6 +54,11 @@ enum source_reg {
 	SOURCE_REG_DMABUF = 1,
 };
 
+enum recv_reg {
+	RECV_REG_MR = 0,
+	RECV_REG_DMABUF = 1,
+};
+
 struct opts {
 	const char *role;
 	const char *dev;
@@ -63,6 +68,7 @@ struct opts {
 	const char *source_kind;
 	const char *source_fill_name;
 	const char *source_reg_name;
+	const char *recv_reg_name;
 	int port;
 	int gid_index;
 	int ib_port;
@@ -73,6 +79,7 @@ struct opts {
 	enum load_mode mode;
 	enum source_fill source_fill;
 	enum source_reg source_reg;
+	enum recv_reg recv_reg;
 };
 
 struct peer_info {
@@ -107,6 +114,8 @@ struct HipRegion {
 	ProbeState *state;
 	size_t signal_offset;
 	size_t state_offset;
+	bool hip_alloc;
+	bool host_alloc;
 };
 
 struct alignas(64) SourceFillState {
@@ -139,6 +148,14 @@ struct SenderSource {
 	struct ibv_mr *signal_mr;
 	SourceFillState *fill_state;
 	uint32_t *hdp_flush_ptr;
+};
+
+struct ReceiverMr {
+	const char *reg_name;
+	struct ibv_mr *mr;
+	int dmabuf_fd = -1;
+	uint64_t dmabuf_offset;
+	size_t length;
 };
 
 static uint64_t now_ns(void)
@@ -414,11 +431,23 @@ static int parse_source_reg(const char *s, enum source_reg *reg)
 	return 0;
 }
 
+static int parse_recv_reg(const char *s, enum recv_reg *reg)
+{
+	if (!strcmp(s, "reg_mr"))
+		*reg = RECV_REG_MR;
+	else if (!strcmp(s, "dmabuf"))
+		*reg = RECV_REG_DMABUF;
+	else
+		return -1;
+	return 0;
+}
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
 		"usage: %s --role recv|send --dev DEV --gid-index N --port P\n"
-		"          [--connect HOST] [--kind host-coherent|host-uncached|host|managed]\n"
+		"          [--connect HOST] [--kind device|host-coherent|host-uncached|host|managed]\n"
+		"          [--recv-reg reg_mr|dmabuf]\n"
 		"          [--mode normal|atomic]\n"
 		"          [--source-kind malloc|device|managed|host|host-coherent|host-uncached|\n"
 		"                         vmm-device-pinned|vmm-device-uncached|vmm-host-pinned|vmm-host-uncached|\n"
@@ -438,9 +467,11 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	o->source_kind = "malloc";
 	o->source_fill_name = "cpu";
 	o->source_reg_name = "reg_mr";
+	o->recv_reg_name = "reg_mr";
 	o->mode = LOAD_NORMAL;
 	o->source_fill = SOURCE_FILL_CPU;
 	o->source_reg = SOURCE_REG_MR;
+	o->recv_reg = RECV_REG_MR;
 	o->port = 18518;
 	o->gid_index = 1;
 	o->ib_port = 1;
@@ -473,6 +504,10 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 			o->source_reg_name = argv[++i];
 			if (parse_source_reg(o->source_reg_name,
 					     &o->source_reg))
+				return -1;
+		} else if (!strcmp(argv[i], "--recv-reg") && i + 1 < argc) {
+			o->recv_reg_name = argv[++i];
+			if (parse_recv_reg(o->recv_reg_name, &o->recv_reg))
 				return -1;
 		} else if (!strcmp(argv[i], "--port") && i + 1 < argc) {
 			o->port = atoi(argv[++i]);
@@ -542,21 +577,27 @@ static hipError_t alloc_region(const char *kind, size_t payload_size,
 	region->bytes = bytes;
 	if (!strcmp(kind, "managed")) {
 		ret = hipMallocManaged(&base, bytes);
+		region->hip_alloc = true;
+	} else if (!strcmp(kind, "device")) {
+		ret = hipMalloc(&base, bytes);
+		region->hip_alloc = true;
 	} else if (!strcmp(kind, "host")) {
 		ret = hipHostMalloc(&base, bytes, flags);
+		region->host_alloc = true;
 	} else if (!strcmp(kind, "host-coherent")) {
 		ret = hipHostMalloc(&base, bytes,
 				    flags | hipHostMallocCoherent);
+		region->host_alloc = true;
 	} else if (!strcmp(kind, "host-uncached")) {
 		ret = hipHostMalloc(&base, bytes,
 				    flags | hipHostMallocUncached);
+		region->host_alloc = true;
 	} else {
 		return hipErrorInvalidValue;
 	}
 	if (ret != hipSuccess)
 		return ret;
 
-	memset(base, 0, bytes);
 	cursor = align_up((uintptr_t)base, 64);
 	region->payload = (uint8_t *)cursor;
 	cursor += align_up(payload_size, 64);
@@ -567,6 +608,18 @@ static hipError_t alloc_region(const char *kind, size_t payload_size,
 	region->state_offset = cursor - (uintptr_t)region->payload;
 	region->state = (ProbeState *)cursor;
 	region->base = base;
+	if (!strcmp(kind, "device")) {
+		ret = hipMemset(base, 0, bytes);
+		if (ret == hipSuccess)
+			ret = hipDeviceSynchronize();
+		if (ret != hipSuccess) {
+			(void)hipFree(base);
+			memset(region, 0, sizeof(*region));
+			return ret;
+		}
+	} else {
+		memset(base, 0, bytes);
+	}
 	return hipSuccess;
 }
 
@@ -574,10 +627,11 @@ static void free_region(HipRegion *region)
 {
 	if (!region->base)
 		return;
-	if (!strcmp(region->kind, "managed"))
+	if (region->hip_alloc)
 		(void)hipFree(region->base);
-	else
+	else if (region->host_alloc)
 		(void)hipHostFree(region->base);
+	memset(region, 0, sizeof(*region));
 }
 
 __device__ static inline uint32_t gpu_atomic_load_u32(const uint32_t *ptr)
@@ -1251,6 +1305,60 @@ static void cleanup_sender_source(SenderSource *src)
 	free(src->signal_base);
 }
 
+static int init_receiver_mr(struct opts *o, struct ibv_pd *pd,
+			    HipRegion *region, ReceiverMr *recv)
+{
+	int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+
+	memset(recv, 0, sizeof(*recv));
+	recv->reg_name = o->recv_reg_name;
+	recv->dmabuf_fd = -1;
+	recv->length = region->state_offset + sizeof(*region->state);
+
+	if (o->recv_reg == RECV_REG_DMABUF) {
+		hsa_status_t hsa_ret;
+
+		hsa_ret = hsa_amd_portable_export_dmabuf(
+			region->payload, recv->length, &recv->dmabuf_fd,
+			&recv->dmabuf_offset);
+		if (hsa_ret != HSA_STATUS_SUCCESS) {
+			fprintf(stderr,
+				"receiver dmabuf export kind=%s failed hsa_status=%d\n",
+				o->kind, hsa_ret);
+			return -1;
+		}
+		recv->mr = ibv_reg_dmabuf_mr(
+			pd, recv->dmabuf_offset, recv->length,
+			(uintptr_t)region->payload, recv->dmabuf_fd, access);
+	} else {
+		recv->mr = ibv_reg_mr(pd, region->payload, recv->length,
+				      access);
+	}
+	if (!recv->mr) {
+		fprintf(stderr, "receiver reg kind=%s method=%s: %s\n",
+			o->kind, o->recv_reg_name, strerror(errno));
+		if (recv->dmabuf_fd >= 0) {
+			(void)hsa_amd_portable_close_dmabuf(recv->dmabuf_fd);
+			recv->dmabuf_fd = -1;
+		}
+		return -1;
+	}
+
+	printf("recv_mr kind=%s reg=%s length=%zu rkey=0x%x dmabuf_fd=%d dmabuf_offset=%" PRIu64 "\n",
+	       o->kind, recv->reg_name, recv->length, recv->mr->rkey,
+	       recv->dmabuf_fd, recv->dmabuf_offset);
+	return 0;
+}
+
+static void cleanup_receiver_mr(ReceiverMr *recv)
+{
+	if (recv->mr && ibv_dereg_mr(recv->mr))
+		fprintf(stderr, "receiver ibv_dereg_mr: %s\n",
+			strerror(errno));
+	if (recv->dmabuf_fd >= 0)
+		(void)hsa_amd_portable_close_dmabuf(recv->dmabuf_fd);
+}
+
 static int wait_source_ready(SenderSource *src, uint32_t seq, int timeout_ms)
 {
 	uint64_t deadline = now_ns() + (uint64_t)timeout_ms * 1000000ull;
@@ -1495,7 +1603,7 @@ int main(int argc, char **argv)
 	struct ibv_cq *cq = NULL;
 	struct ibv_qp *qp = NULL;
 	struct ibv_qp_init_attr qp_attr;
-	struct ibv_mr *recv_mr = NULL;
+	ReceiverMr recv_mr = {};
 	HipRegion recv_region = {};
 	bool recv_region_allocated = false;
 	union ibv_gid local_gid, remote_gid;
@@ -1574,27 +1682,19 @@ int main(int argc, char **argv)
 			goto out;
 		}
 		recv_region_allocated = true;
-		recv_mr = ibv_reg_mr(pd, recv_region.payload,
-				     recv_region.state_offset +
-					     sizeof(*recv_region.state),
-				     IBV_ACCESS_LOCAL_WRITE |
-					     IBV_ACCESS_REMOTE_WRITE);
-		if (!recv_mr) {
-			fprintf(stderr, "receiver ibv_reg_mr: %s\n",
-				strerror(errno));
+		if (init_receiver_mr(&o, pd, &recv_region, &recv_mr))
 			goto out;
-		}
 		local.addr = (uintptr_t)recv_region.payload;
-		local.rkey = recv_mr->rkey;
+		local.rkey = recv_mr.mr->rkey;
 
 		listen_fd = tcp_listen(o.port);
 		if (listen_fd < 0) {
 			perror("tcp_listen");
 			goto out;
 		}
-		printf("recv_listen port=%d kind=%s mode=%s size=%zu count=%u qpn=%u\n",
-		       o.port, o.kind, o.mode_name, o.size, o.count,
-		       local.qpn);
+		printf("recv_listen port=%d kind=%s reg=%s mode=%s size=%zu count=%u qpn=%u\n",
+		       o.port, o.kind, o.recv_reg_name, o.mode_name, o.size,
+		       o.count, local.qpn);
 		sock = accept(listen_fd, NULL, NULL);
 		if (sock < 0) {
 			perror("accept");
@@ -1619,14 +1719,13 @@ int main(int argc, char **argv)
 		goto out;
 
 	if (!strcmp(o.role, "recv"))
-		ret = run_receiver(&o, sock, &recv_region, recv_mr->rkey,
+		ret = run_receiver(&o, sock, &recv_region, recv_mr.mr->rkey,
 				   qp->qp_num);
 	else
 		ret = run_sender(&o, sock, pd, qp, cq, &remote);
 
 out:
-	if (recv_mr && ibv_dereg_mr(recv_mr))
-		fprintf(stderr, "receiver ibv_dereg_mr: %s\n", strerror(errno));
+	cleanup_receiver_mr(&recv_mr);
 	if (recv_region_allocated)
 		free_region(&recv_region);
 	if (sock >= 0)
