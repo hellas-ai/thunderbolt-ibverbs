@@ -645,6 +645,9 @@ typedef int (*tbv_path_next_page_fn)(void *ctx, struct page **page,
 				     u32 *page_off, u32 *length,
 				     tbv_path_tx_done_fn *done,
 				     void **done_ctx);
+typedef int (*tbv_path_next_dma_fn)(void *ctx, dma_addr_t *dma, u32 *length,
+				    tbv_path_tx_done_fn *done,
+				    void **done_ctx);
 #define TBV_PATH_SEND_CONTROL	BIT(0)
 #define TBV_PATH_SEND_DEFER	BIT(1)
 extern const uuid_t tbv_native_service_uuid;
@@ -855,6 +858,12 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 			      tbv_path_tx_done_fn meta_done,
 			      void *meta_done_ctx,
 			      tbv_path_next_page_fn next, void *next_ctx);
+int tbv_path_send_dma_stream(struct tbv_path *path,
+			     const struct tbv_native_data_header *hdr,
+			     u32 total_length, unsigned int flags,
+			     tbv_path_tx_done_fn meta_done,
+			     void *meta_done_ctx,
+			     tbv_path_next_dma_fn next, void *next_ctx);
 void tbv_path_kick_tx(struct tbv_path *path);
 void tbv_path_cancel_data_done_ctx(struct tbv_path *path,
 				   tbv_path_tx_done_fn done, void *done_ctx);

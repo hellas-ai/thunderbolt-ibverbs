@@ -105,6 +105,10 @@ static uint zcopy_min_bytes;
 module_param(zcopy_min_bytes, uint, 0644);
 MODULE_PARM_DESC(zcopy_min_bytes,
 		 "Minimum native bytes before raw zero-copy streaming is requested; retryable native RC WRITE falls back to framed copies");
+static bool native_p2p_zcopy;
+module_param(native_p2p_zcopy, bool, 0644);
+MODULE_PARM_DESC(native_p2p_zcopy,
+		 "Experimental: allow native RDMA WRITE raw zcopy from dma-buf MRs using pre-mapped DMA addresses");
 
 static uint qp_timeout_ms = TBV_QP_TIMEOUT_DEFAULT_MS;
 module_param(qp_timeout_ms, uint, 0644);
@@ -652,6 +656,8 @@ static int tbv_send_read_response_ctx(struct tbv_read_resp_ctx *ctx);
 static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
 				   struct page **page_out,
 				   u32 *page_off_out, u32 *len_out);
+static int tbv_umem_dma_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
+				  dma_addr_t *dma_out, u32 *len_out);
 static int tbv_rx_copy_to_wqe(struct tbv_state *state,
 			      const struct tbv_recv_wqe *wqe, u32 offset,
 			      const void *payload, u32 len, u32 *delivered);
@@ -4353,6 +4359,47 @@ static int tbv_send_page_stream_next(void *ctx, struct page **page,
 	return -EFAULT;
 }
 
+static int tbv_send_dma_stream_next(void *ctx, dma_addr_t *dma, u32 *length,
+				    tbv_path_tx_done_fn *done,
+				    void **done_ctx)
+{
+	struct tbv_send_page_stream *stream = ctx;
+	u32 skipped = 0;
+	int i;
+
+	for (i = 0; i < stream->nsegs; i++) {
+		struct tbv_send_segment *seg = &stream->segs[i];
+		u32 seg_off = 0;
+		u32 remaining;
+		int ret;
+
+		if (stream->offset >= skipped + seg->length) {
+			skipped += seg->length;
+			continue;
+		}
+		if (stream->offset > skipped)
+			seg_off = stream->offset - skipped;
+
+		remaining = min_t(u32, seg->length - seg_off,
+				  stream->total_len - stream->offset);
+		remaining = min_t(u32, remaining, stream->max_chunk);
+		ret = tbv_umem_dma_from_addr(seg->mr, seg->addr + seg_off,
+					     remaining, dma, length);
+		if (ret)
+			return ret;
+
+		stream->offset += *length;
+		refcount_inc(&stream->refs);
+		atomic_inc(&stream->send->tx_pending);
+		tbv_send_ctx_get(stream->send);
+		*done = tbv_send_page_stream_done;
+		*done_ctx = stream;
+		return 0;
+	}
+
+	return -EFAULT;
+}
+
 static bool tbv_should_zcopy_payload(u32 len)
 {
 	return len && zcopy_min_bytes && len >= zcopy_min_bytes;
@@ -4414,6 +4461,51 @@ static bool tbv_send_segments_zcopy_safe(struct tbv_send_segment *segs,
 			if (ret || !len)
 				return false;
 			if (!tbv_page_zcopy_safe(page))
+				return false;
+
+			offset += len;
+			found = true;
+			break;
+		}
+
+		if (!found)
+			return false;
+	}
+
+	return true;
+}
+
+static bool tbv_send_segments_dma_mapped(struct tbv_send_segment *segs,
+					 int nsegs, u32 total_len)
+{
+	u32 offset = 0;
+
+	while (offset < total_len) {
+		u32 skipped = 0;
+		bool found = false;
+		int i;
+
+		for (i = 0; i < nsegs; i++) {
+			struct tbv_send_segment *seg = &segs[i];
+			dma_addr_t dma;
+			u32 len;
+			u32 seg_off = 0;
+			u32 remaining;
+			int ret;
+
+			if (offset >= skipped + seg->length) {
+				skipped += seg->length;
+				continue;
+			}
+			if (offset > skipped)
+				seg_off = offset - skipped;
+
+			remaining = min_t(u32, seg->length - seg_off,
+					  total_len - offset);
+			ret = tbv_umem_dma_from_addr(seg->mr,
+						     seg->addr + seg_off,
+						     remaining, &dma, &len);
+			if (ret || !len)
 				return false;
 
 			offset += len;
@@ -4501,6 +4593,8 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 	bool zcopy_requested;
 	bool raw_zcopy_allowed = false;
 	bool zcopy_safe = false;
+	bool dma_zcopy_allowed = false;
+	bool dma_zcopy_safe = false;
 	bool sent_any = false;
 	int ret = 0;
 
@@ -4533,10 +4627,17 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 		if (raw_zcopy_allowed)
 			zcopy_safe = tbv_send_segments_zcopy_safe(
 				ctx->segs, ctx->nsegs, ctx->total_len);
+		dma_zcopy_allowed = READ_ONCE(native_p2p_zcopy);
+		if (dma_zcopy_allowed)
+			dma_zcopy_safe = tbv_send_segments_dma_mapped(
+				ctx->segs, ctx->nsegs, ctx->total_len);
 	}
 
-	if (zcopy_requested && raw_zcopy_allowed && zcopy_safe) {
+	if (zcopy_requested &&
+	    ((raw_zcopy_allowed && zcopy_safe) ||
+	     (dma_zcopy_allowed && dma_zcopy_safe))) {
 		struct tbv_send_page_stream *stream;
+		bool use_dma_stream = dma_zcopy_allowed && dma_zcopy_safe;
 
 		if (reason == TBV_SEND_POST_INITIAL)
 			atomic64_inc(&tqp->owner->data_wr_zcopy);
@@ -4567,10 +4668,16 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 		tbv_send_ctx_get(ctx);
 		atomic_inc(&ctx->tx_pending);
 		atomic64_inc(&tqp->owner->data_wr_path_send);
-		ret = tbv_path_send_page_stream(path, &hdr, ctx->total_len, 0,
-						tbv_send_tx_done, ctx,
-						tbv_send_page_stream_next,
-						stream);
+		if (use_dma_stream)
+			ret = tbv_path_send_dma_stream(
+				path, &hdr, ctx->total_len, 0,
+				tbv_send_tx_done, ctx, tbv_send_dma_stream_next,
+				stream);
+		else
+			ret = tbv_path_send_page_stream(
+				path, &hdr, ctx->total_len, 0,
+				tbv_send_tx_done, ctx,
+				tbv_send_page_stream_next, stream);
 		tbv_release_path_refs(&path, 1);
 		tbv_send_page_stream_put(stream);
 		if (ret) {
@@ -4585,7 +4692,8 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 	if (reason == TBV_SEND_POST_INITIAL) {
 		if (zcopy_requested) {
 			atomic64_inc(&tqp->owner->data_wr_zcopy_fallback);
-			if (raw_zcopy_allowed && !zcopy_safe)
+			if ((raw_zcopy_allowed && !zcopy_safe) ||
+			    (dma_zcopy_allowed && !dma_zcopy_safe))
 				atomic64_inc(
 					&tqp->owner->data_wr_zcopy_fallback_unsafe_sge);
 		}
@@ -6738,6 +6846,53 @@ static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
 		*page_out = pfn_to_page(page_to_pfn(sg_page(sg)) +
 					(seg_off >> PAGE_SHIFT));
 		*page_off_out = page_off;
+		*len_out = chunk;
+		return 0;
+	}
+
+	return -EFAULT;
+}
+
+static int tbv_umem_dma_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
+				  dma_addr_t *dma_out, u32 *len_out)
+{
+	struct sg_table *sgt = &mr->umem->sgt_append.sgt;
+	struct scatterlist *sg;
+	size_t offset;
+	u64 end;
+	u64 mr_end;
+	unsigned int i;
+
+	if (!max_len)
+		return -EINVAL;
+	if (mr->dma_mr)
+		return -EOPNOTSUPP;
+	if (!mr->umem || !mr->umem->is_dmabuf)
+		return -EOPNOTSUPP;
+	if (check_add_overflow(addr, (u64)max_len, &end))
+		return -EINVAL;
+	if (check_add_overflow(mr->start, mr->length, &mr_end))
+		return -EINVAL;
+	if (addr < mr->start || end > mr_end)
+		return -EFAULT;
+
+	offset = ib_umem_offset(mr->umem) + addr - mr->start;
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		size_t seg_len = sg_dma_len(sg);
+		size_t chunk;
+
+		if (!seg_len)
+			continue;
+		if (offset >= seg_len) {
+			offset -= seg_len;
+			continue;
+		}
+
+		chunk = min_t(size_t, seg_len - offset, max_len);
+		if (!chunk)
+			return -EFAULT;
+
+		*dma_out = sg_dma_address(sg) + offset;
 		*len_out = chunk;
 		return 0;
 	}
@@ -9270,39 +9425,29 @@ static struct ib_mr *tbv_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset,
 	if (!length)
 		return ERR_PTR(-EINVAL);
 
-	umem_dmabuf = ib_umem_dmabuf_get_pinned(pd->device, offset, length,
-						fd, access);
-	if (PTR_ERR_OR_ZERO(umem_dmabuf) == -EOPNOTSUPP) {
-		pr_info_ratelimited("dmabuf MR pinned import unsupported; trying dynamic import device=%s dma_device=%s fd=%d offset=%llu length=%llu\n",
-				    dev_name(&pd->device->dev),
-				    pd->device->dma_device ?
-				    dev_name(pd->device->dma_device) : "<none>",
-				    fd, (unsigned long long)offset,
-				    (unsigned long long)length);
-		umem_dmabuf = ib_umem_dmabuf_get(pd->device, offset, length,
-						 fd, access,
-						 &tbv_dmabuf_attach_ops);
-		if (IS_ERR(umem_dmabuf)) {
-			pr_info_ratelimited("dmabuf MR dynamic import failed err=%ld\n",
-					    PTR_ERR(umem_dmabuf));
-			return ERR_CAST(umem_dmabuf);
-		}
-
-		dma_resv_lock(umem_dmabuf->attach->dmabuf->resv, NULL);
-		ret = ib_umem_dmabuf_map_pages(umem_dmabuf);
-		dma_resv_unlock(umem_dmabuf->attach->dmabuf->resv);
-		if (ret) {
-			pr_info_ratelimited("dmabuf MR map_pages failed err=%d\n",
-					    ret);
-			ib_umem_release(&umem_dmabuf->umem);
-			return ERR_PTR(ret);
-		}
-	}
+	pr_info_ratelimited("dmabuf MR dynamic import device=%s dma_device=%s fd=%d offset=%llu length=%llu\n",
+			    dev_name(&pd->device->dev),
+			    pd->device->dma_device ?
+			    dev_name(pd->device->dma_device) : "<none>",
+			    fd, (unsigned long long)offset,
+			    (unsigned long long)length);
+	umem_dmabuf = ib_umem_dmabuf_get(pd->device, offset, length, fd,
+					 access, &tbv_dmabuf_attach_ops);
 	if (IS_ERR(umem_dmabuf))
 		return ERR_CAST(umem_dmabuf);
 
-	return tbv_reg_mr_from_umem(pd, &umem_dmabuf->umem, offset, length,
-				    virt_addr, access);
+	dma_resv_lock(umem_dmabuf->attach->dmabuf->resv, NULL);
+	ret = ib_umem_dmabuf_map_pages(umem_dmabuf);
+	dma_resv_unlock(umem_dmabuf->attach->dmabuf->resv);
+	if (ret) {
+		pr_info_ratelimited("dmabuf MR map_pages failed err=%d\n",
+				    ret);
+		ib_umem_release(&umem_dmabuf->umem);
+		return ERR_PTR(ret);
+	}
+
+	return tbv_reg_mr_from_umem(pd, &umem_dmabuf->umem, virt_addr,
+				    length, virt_addr, access);
 }
 
 static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
@@ -9429,13 +9574,11 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
 	}
 
 	/*
-	 * This is a software verbs provider. User MRs remain pinned by
-	 * the RDMA umem helpers, and kernel local-DMA SGEs must stay
-	 * CPU-visible for MAD/CM QP1 handling. Keep the Thunderbolt ring
-	 * device as the parent, but use RDMA-core virtual DMA for verbs
-	 * buffer addresses.
+	 * This is still a software verbs provider for ordinary MRs, but the
+	 * experimental dma-buf path needs RDMA core to attach imports against
+	 * the actual Thunderbolt ring DMA device instead of virtual DMA.
 	 */
-	ret = ib_register_device(&dev->base, name, NULL);
+	ret = ib_register_device(&dev->base, name, dma_device);
 	if (ret) {
 		tbv_ibdev_detach_netdev(dev);
 		put_device(dma_device);

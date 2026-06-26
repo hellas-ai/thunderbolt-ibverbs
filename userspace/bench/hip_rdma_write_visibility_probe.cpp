@@ -328,10 +328,12 @@ static int qp_to_rts(struct ibv_qp *qp, int port, int sgid_index,
 	a.ah_attr.sl = 0;
 	a.ah_attr.src_path_bits = 0;
 	a.ah_attr.port_num = (uint8_t)port;
-	a.ah_attr.is_global = 1;
-	a.ah_attr.grh.dgid = *dgid;
-	a.ah_attr.grh.sgid_index = sgid_index;
-	a.ah_attr.grh.hop_limit = 1;
+	if (dgid->global.interface_id) {
+		a.ah_attr.is_global = 1;
+		a.ah_attr.grh.dgid = *dgid;
+		a.ah_attr.grh.sgid_index = sgid_index;
+		a.ah_attr.grh.hop_limit = 1;
+	}
 	ret = ibv_modify_qp(qp, &a, IBV_QP_STATE | IBV_QP_AV |
 			    IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
 			    IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
