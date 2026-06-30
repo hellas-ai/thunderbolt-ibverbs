@@ -6,6 +6,8 @@
 #include <linux/completion.h>
 #include <linux/crc32.h>
 #include <linux/crc32c.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-resv.h>
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/highmem.h>
@@ -31,11 +33,19 @@
 #include <rdma/ib_umem.h>
 #include <rdma/ib_user_verbs.h>
 #include <rdma/ib_verbs.h>
+#include <rdma/uverbs_ioctl.h>
 
 #include "../proto/apple_tx.h"
 #include "../proto/native_data.h"
 #include "../proto/reliability.h"
 #include "tbv.h"
+
+/*
+ * Defined in kernel/dv.c. The DV uapi definition table is wired into the
+ * ib_device at register time so userspace can issue the USB4_RDMA_DV_*
+ * private uverbs methods. See userspace/usb4_rdma/usb4_rdma_dv.h.
+ */
+extern const struct uapi_definition tbv_uapi_defs[];
 
 #define TBV_IBDEV_ABI_VERSION 1
 #define TBV_IBDEV_PORTS 1
@@ -95,6 +105,10 @@ static uint zcopy_min_bytes;
 module_param(zcopy_min_bytes, uint, 0644);
 MODULE_PARM_DESC(zcopy_min_bytes,
 		 "Minimum native bytes before raw zero-copy streaming is requested; retryable native RC WRITE falls back to framed copies");
+static bool native_p2p_zcopy;
+module_param(native_p2p_zcopy, bool, 0644);
+MODULE_PARM_DESC(native_p2p_zcopy,
+		 "Experimental: allow native RDMA WRITE raw zcopy from dma-buf MRs using pre-mapped DMA addresses");
 
 static uint qp_timeout_ms = TBV_QP_TIMEOUT_DEFAULT_MS;
 module_param(qp_timeout_ms, uint, 0644);
@@ -463,7 +477,18 @@ struct tbv_qp {
 	 * message and must not seed a new reassembly. Protected by rx_lock.
 	 */
 	bool apple_rx_discard;
+	struct tbv_dv_qp_state dv;
 };
+
+struct tbv_qp *tbv_qp_from_ibqp(struct ib_qp *ibqp)
+{
+	return container_of(ibqp, struct tbv_qp, base);
+}
+
+struct tbv_dv_qp_state *tbv_qp_dv_state(struct tbv_qp *tqp)
+{
+	return &tqp->dv;
+}
 
 struct tbv_mr {
 	struct ib_mr base;
@@ -631,6 +656,8 @@ static int tbv_send_read_response_ctx(struct tbv_read_resp_ctx *ctx);
 static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
 				   struct page **page_out,
 				   u32 *page_off_out, u32 *len_out);
+static int tbv_umem_dma_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
+				  dma_addr_t *dma_out, u32 *len_out);
 static int tbv_rx_copy_to_wqe(struct tbv_state *state,
 			      const struct tbv_recv_wqe *wqe, u32 offset,
 			      const void *payload, u32 len, u32 *delivered);
@@ -804,7 +831,7 @@ static struct tbv_ibdev *tbv_to_ibdev(struct ib_device *ibdev)
 	return container_of(ibdev, struct tbv_ibdev, base);
 }
 
-static struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev)
+struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev)
 {
 	struct tbv_ibdev *dev = tbv_to_ibdev(ibdev);
 
@@ -831,6 +858,26 @@ out:
 	xas_unlock_irqrestore(&xas, flags);
 	return mr;
 }
+
+static void tbv_dmabuf_invalidate(struct dma_buf_attachment *attach)
+{
+	struct ib_umem_dmabuf *umem_dmabuf = attach->importer_priv;
+
+	if (!umem_dmabuf)
+		return;
+
+	ibdev_warn_ratelimited(umem_dmabuf->umem.ibdev,
+			       "dmabuf-backed MR was invalidated; revoke handling is not implemented yet\n");
+}
+
+static const struct dma_buf_attach_ops tbv_dmabuf_attach_ops = {
+	.allow_peer2peer = false,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+	.invalidate_mappings = tbv_dmabuf_invalidate,
+#else
+	.move_notify = tbv_dmabuf_invalidate,
+#endif
+};
 
 static void tbv_mr_free(struct tbv_mr *mr)
 {
@@ -2577,6 +2624,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	tqp->owner = state;
 	spin_lock_init(&tqp->lock);
 	mutex_init(&tqp->rx_lock);
+	tbv_dv_qp_state_init(&tqp->dv);
 	init_waitqueue_head(&tqp->credit_wait);
 	init_waitqueue_head(&tqp->apple_tx_wait);
 	init_waitqueue_head(&tqp->refs_wait);
@@ -2649,6 +2697,7 @@ static int tbv_destroy_qp(struct ib_qp *qp, struct ib_udata *udata)
 		mutex_unlock(&tqp->owner->lock);
 	}
 
+	tbv_dv_qp_state_teardown(&tqp->dv);
 	wake_up_all(&tqp->credit_wait);
 	wake_up_all(&tqp->apple_tx_wait);
 	cancel_work_sync(&tqp->apple_sq_work);
@@ -4310,6 +4359,47 @@ static int tbv_send_page_stream_next(void *ctx, struct page **page,
 	return -EFAULT;
 }
 
+static int tbv_send_dma_stream_next(void *ctx, dma_addr_t *dma, u32 *length,
+				    tbv_path_tx_done_fn *done,
+				    void **done_ctx)
+{
+	struct tbv_send_page_stream *stream = ctx;
+	u32 skipped = 0;
+	int i;
+
+	for (i = 0; i < stream->nsegs; i++) {
+		struct tbv_send_segment *seg = &stream->segs[i];
+		u32 seg_off = 0;
+		u32 remaining;
+		int ret;
+
+		if (stream->offset >= skipped + seg->length) {
+			skipped += seg->length;
+			continue;
+		}
+		if (stream->offset > skipped)
+			seg_off = stream->offset - skipped;
+
+		remaining = min_t(u32, seg->length - seg_off,
+				  stream->total_len - stream->offset);
+		remaining = min_t(u32, remaining, stream->max_chunk);
+		ret = tbv_umem_dma_from_addr(seg->mr, seg->addr + seg_off,
+					     remaining, dma, length);
+		if (ret)
+			return ret;
+
+		stream->offset += *length;
+		refcount_inc(&stream->refs);
+		atomic_inc(&stream->send->tx_pending);
+		tbv_send_ctx_get(stream->send);
+		*done = tbv_send_page_stream_done;
+		*done_ctx = stream;
+		return 0;
+	}
+
+	return -EFAULT;
+}
+
 static bool tbv_should_zcopy_payload(u32 len)
 {
 	return len && zcopy_min_bytes && len >= zcopy_min_bytes;
@@ -4371,6 +4461,51 @@ static bool tbv_send_segments_zcopy_safe(struct tbv_send_segment *segs,
 			if (ret || !len)
 				return false;
 			if (!tbv_page_zcopy_safe(page))
+				return false;
+
+			offset += len;
+			found = true;
+			break;
+		}
+
+		if (!found)
+			return false;
+	}
+
+	return true;
+}
+
+static bool tbv_send_segments_dma_mapped(struct tbv_send_segment *segs,
+					 int nsegs, u32 total_len)
+{
+	u32 offset = 0;
+
+	while (offset < total_len) {
+		u32 skipped = 0;
+		bool found = false;
+		int i;
+
+		for (i = 0; i < nsegs; i++) {
+			struct tbv_send_segment *seg = &segs[i];
+			dma_addr_t dma;
+			u32 len;
+			u32 seg_off = 0;
+			u32 remaining;
+			int ret;
+
+			if (offset >= skipped + seg->length) {
+				skipped += seg->length;
+				continue;
+			}
+			if (offset > skipped)
+				seg_off = offset - skipped;
+
+			remaining = min_t(u32, seg->length - seg_off,
+					  total_len - offset);
+			ret = tbv_umem_dma_from_addr(seg->mr,
+						     seg->addr + seg_off,
+						     remaining, &dma, &len);
+			if (ret || !len)
 				return false;
 
 			offset += len;
@@ -4458,6 +4593,8 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 	bool zcopy_requested;
 	bool raw_zcopy_allowed = false;
 	bool zcopy_safe = false;
+	bool dma_zcopy_allowed = false;
+	bool dma_zcopy_safe = false;
 	bool sent_any = false;
 	int ret = 0;
 
@@ -4490,10 +4627,17 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 		if (raw_zcopy_allowed)
 			zcopy_safe = tbv_send_segments_zcopy_safe(
 				ctx->segs, ctx->nsegs, ctx->total_len);
+		dma_zcopy_allowed = READ_ONCE(native_p2p_zcopy);
+		if (dma_zcopy_allowed)
+			dma_zcopy_safe = tbv_send_segments_dma_mapped(
+				ctx->segs, ctx->nsegs, ctx->total_len);
 	}
 
-	if (zcopy_requested && raw_zcopy_allowed && zcopy_safe) {
+	if (zcopy_requested &&
+	    ((raw_zcopy_allowed && zcopy_safe) ||
+	     (dma_zcopy_allowed && dma_zcopy_safe))) {
 		struct tbv_send_page_stream *stream;
+		bool use_dma_stream = dma_zcopy_allowed && dma_zcopy_safe;
 
 		if (reason == TBV_SEND_POST_INITIAL)
 			atomic64_inc(&tqp->owner->data_wr_zcopy);
@@ -4524,10 +4668,16 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 		tbv_send_ctx_get(ctx);
 		atomic_inc(&ctx->tx_pending);
 		atomic64_inc(&tqp->owner->data_wr_path_send);
-		ret = tbv_path_send_page_stream(path, &hdr, ctx->total_len, 0,
-						tbv_send_tx_done, ctx,
-						tbv_send_page_stream_next,
-						stream);
+		if (use_dma_stream)
+			ret = tbv_path_send_dma_stream(
+				path, &hdr, ctx->total_len, 0,
+				tbv_send_tx_done, ctx, tbv_send_dma_stream_next,
+				stream);
+		else
+			ret = tbv_path_send_page_stream(
+				path, &hdr, ctx->total_len, 0,
+				tbv_send_tx_done, ctx,
+				tbv_send_page_stream_next, stream);
 		tbv_release_path_refs(&path, 1);
 		tbv_send_page_stream_put(stream);
 		if (ret) {
@@ -4542,7 +4692,8 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 	if (reason == TBV_SEND_POST_INITIAL) {
 		if (zcopy_requested) {
 			atomic64_inc(&tqp->owner->data_wr_zcopy_fallback);
-			if (raw_zcopy_allowed && !zcopy_safe)
+			if ((raw_zcopy_allowed && !zcopy_safe) ||
+			    (dma_zcopy_allowed && !dma_zcopy_safe))
 				atomic64_inc(
 					&tqp->owner->data_wr_zcopy_fallback_unsafe_sge);
 		}
@@ -5235,6 +5386,18 @@ static int tbv_post_send(struct ib_qp *qp, const struct ib_send_wr *wr,
 	struct tbv_qp *tqp = container_of(qp, struct tbv_qp, base);
 	const struct ib_send_wr *cur;
 	int ret;
+
+	/*
+	 * GDA-exclusive QP semantics: once a DV queue is attached, the
+	 * GPU owns the send queue and standard ibv_post_send is rejected.
+	 * post_recv is intentionally unaffected — the receive queue stays
+	 * kernel-owned in v1.
+	 */
+	if (tbv_dv_qp_state_active(&tqp->dv)) {
+		if (bad_wr)
+			*bad_wr = wr;
+		return -EBUSY;
+	}
 
 	for (cur = wr; cur; cur = cur->next) {
 		ret = tbv_post_send_one(tqp, cur);
@@ -6683,6 +6846,53 @@ static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
 		*page_out = pfn_to_page(page_to_pfn(sg_page(sg)) +
 					(seg_off >> PAGE_SHIFT));
 		*page_off_out = page_off;
+		*len_out = chunk;
+		return 0;
+	}
+
+	return -EFAULT;
+}
+
+static int tbv_umem_dma_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
+				  dma_addr_t *dma_out, u32 *len_out)
+{
+	struct sg_table *sgt = &mr->umem->sgt_append.sgt;
+	struct scatterlist *sg;
+	size_t offset;
+	u64 end;
+	u64 mr_end;
+	unsigned int i;
+
+	if (!max_len)
+		return -EINVAL;
+	if (mr->dma_mr)
+		return -EOPNOTSUPP;
+	if (!mr->umem || !mr->umem->is_dmabuf)
+		return -EOPNOTSUPP;
+	if (check_add_overflow(addr, (u64)max_len, &end))
+		return -EINVAL;
+	if (check_add_overflow(mr->start, mr->length, &mr_end))
+		return -EINVAL;
+	if (addr < mr->start || end > mr_end)
+		return -EFAULT;
+
+	offset = ib_umem_offset(mr->umem) + addr - mr->start;
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		size_t seg_len = sg_dma_len(sg);
+		size_t chunk;
+
+		if (!seg_len)
+			continue;
+		if (offset >= seg_len) {
+			offset -= seg_len;
+			continue;
+		}
+
+		chunk = min_t(size_t, seg_len - offset, max_len);
+		if (!chunk)
+			return -EFAULT;
+
+		*dma_out = sg_dma_address(sg) + offset;
 		*len_out = chunk;
 		return 0;
 	}
@@ -9146,35 +9356,21 @@ static struct ib_mr *tbv_get_dma_mr(struct ib_pd *pd, int access)
 	return &mr->base;
 }
 
-static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
-				     u64 virt_addr, int access,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
-				     struct ib_dmah *dmah,
-#endif
-				     struct ib_udata *udata)
+static struct ib_mr *tbv_reg_mr_from_umem(struct ib_pd *pd,
+					  struct ib_umem *umem, u64 start,
+					  u64 length, u64 virt_addr,
+					  int access)
 {
 	struct tbv_mr *mr;
 	int ret;
 
-	if (!length)
-		return ERR_PTR(-EINVAL);
-
 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
-	if (!mr)
+	if (!mr) {
+		ib_umem_release(umem);
 		return ERR_PTR(-ENOMEM);
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
-	mr->umem = ib_umem_get_va(pd->device, start, length, access);
-#else
-	mr->umem = ib_umem_get(pd->device, start, length, access);
-#endif
-	if (IS_ERR(mr->umem)) {
-		struct ib_umem *umem = mr->umem;
-
-		kfree(mr);
-		return ERR_CAST(umem);
 	}
 
+	mr->umem = umem;
 	mr->base.type = IB_MR_TYPE_USER;
 	mr->base.iova = virt_addr;
 	mr->base.length = length;
@@ -9189,6 +9385,69 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 		return ERR_PTR(ret);
 	}
 	return &mr->base;
+}
+
+static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+				     u64 virt_addr, int access,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+				     struct ib_dmah *dmah,
+#endif
+				     struct ib_udata *udata)
+{
+	struct ib_umem *umem;
+
+	if (!length)
+		return ERR_PTR(-EINVAL);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+	umem = ib_umem_get_va(pd->device, start, length, access);
+#else
+	umem = ib_umem_get(pd->device, start, length, access);
+#endif
+	if (IS_ERR(umem))
+		return ERR_CAST(umem);
+
+	return tbv_reg_mr_from_umem(pd, umem, start, length, virt_addr,
+				    access);
+}
+
+static struct ib_mr *tbv_reg_user_mr_dmabuf(struct ib_pd *pd, u64 offset,
+					    u64 length, u64 virt_addr,
+					    int fd, int access,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+					    struct ib_dmah *dmah,
+#endif
+					    struct uverbs_attr_bundle *attrs)
+{
+	struct ib_umem_dmabuf *umem_dmabuf;
+	int ret;
+
+	if (!length)
+		return ERR_PTR(-EINVAL);
+
+	pr_info_ratelimited("dmabuf MR dynamic import device=%s dma_device=%s fd=%d offset=%llu length=%llu\n",
+			    dev_name(&pd->device->dev),
+			    pd->device->dma_device ?
+			    dev_name(pd->device->dma_device) : "<none>",
+			    fd, (unsigned long long)offset,
+			    (unsigned long long)length);
+	umem_dmabuf = ib_umem_dmabuf_get(pd->device, offset, length, fd,
+					 access, &tbv_dmabuf_attach_ops);
+	if (IS_ERR(umem_dmabuf))
+		return ERR_CAST(umem_dmabuf);
+
+	dma_resv_lock(umem_dmabuf->attach->dmabuf->resv, NULL);
+	ret = ib_umem_dmabuf_map_pages(umem_dmabuf);
+	dma_resv_unlock(umem_dmabuf->attach->dmabuf->resv);
+	if (ret) {
+		pr_info_ratelimited("dmabuf MR map_pages failed err=%d\n",
+				    ret);
+		ib_umem_release(&umem_dmabuf->umem);
+		return ERR_PTR(ret);
+	}
+
+	return tbv_reg_mr_from_umem(pd, &umem_dmabuf->umem, virt_addr,
+				    length, virt_addr, access);
 }
 
 static int tbv_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
@@ -9242,6 +9501,7 @@ static const struct ib_device_ops tbv_ibdev_ops = {
 	.poll_cq = tbv_poll_cq,
 	.req_notify_cq = tbv_req_notify_cq,
 	.reg_user_mr = tbv_reg_user_mr,
+	.reg_user_mr_dmabuf = tbv_reg_user_mr_dmabuf,
 	.dereg_mr = tbv_dereg_mr,
 
 	INIT_RDMA_OBJ_SIZE(ib_ucontext, tbv_ucontext, base),
@@ -9289,6 +9549,8 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
 		BIT_ULL(IB_USER_VERBS_CMD_POST_RECV) |
 		BIT_ULL(IB_USER_VERBS_CMD_POLL_CQ) |
 		BIT_ULL(IB_USER_VERBS_CMD_REQ_NOTIFY_CQ);
+	if (IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS))
+		dev->base.driver_def = tbv_uapi_defs;
 
 	ib_set_device_ops(&dev->base, &tbv_ibdev_ops);
 
@@ -9312,13 +9574,11 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
 	}
 
 	/*
-	 * This is a software verbs provider. User MRs remain pinned by
-	 * the RDMA umem helpers, and kernel local-DMA SGEs must stay
-	 * CPU-visible for MAD/CM QP1 handling. Keep the Thunderbolt ring
-	 * device as the parent, but use RDMA-core virtual DMA for verbs
-	 * buffer addresses.
+	 * This is still a software verbs provider for ordinary MRs, but the
+	 * experimental dma-buf path needs RDMA core to attach imports against
+	 * the actual Thunderbolt ring DMA device instead of virtual DMA.
 	 */
-	ret = ib_register_device(&dev->base, name, NULL);
+	ret = ib_register_device(&dev->base, name, dma_device);
 	if (ret) {
 		tbv_ibdev_detach_netdev(dev);
 		put_device(dma_device);

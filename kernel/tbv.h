@@ -645,6 +645,9 @@ typedef int (*tbv_path_next_page_fn)(void *ctx, struct page **page,
 				     u32 *page_off, u32 *length,
 				     tbv_path_tx_done_fn *done,
 				     void **done_ctx);
+typedef int (*tbv_path_next_dma_fn)(void *ctx, dma_addr_t *dma, u32 *length,
+				    tbv_path_tx_done_fn *done,
+				    void **done_ctx);
 #define TBV_PATH_SEND_CONTROL	BIT(0)
 #define TBV_PATH_SEND_DEFER	BIT(1)
 extern const uuid_t tbv_native_service_uuid;
@@ -663,6 +666,45 @@ const char *tbv_backend_name(enum tbv_backend_type type);
 
 int tbv_ibdev_start(struct tbv_state *state, bool register_verbs);
 void tbv_ibdev_stop(struct tbv_state *state);
+struct ib_device;
+struct ib_qp;
+struct ib_umem;
+struct tbv_qp;
+struct tbv_state *tbv_ibdev_state(struct ib_device *ibdev);
+
+/*
+ * USB4 RDMA Direct Verbs (DV) per-QP state.
+ *
+ * Each QP owns one of these. CREATE_QUEUE attaches userspace-provided
+ * SQ/CQ/doorbell memory; DESTROY_QUEUE (or QP destroy) bumps the
+ * generation and releases it. mutex serializes attach/detach against
+ * each other and against QP teardown; KICK drains only NOP smoke-test WQEs
+ * until the transport consumer lands.
+ */
+struct tbv_dv_qp_state {
+	struct mutex mutex;
+	bool active;
+	u8 generation;
+	u32 sq_entries;
+	u32 cq_entries;
+	u32 sq_head;
+	u32 cq_tail;
+	u64 sq_addr;
+	u64 cq_addr;
+	u64 doorbell_addr;
+	struct ib_umem *sq_umem;
+	struct ib_umem *cq_umem;
+	struct ib_umem *doorbell_umem;
+};
+
+void tbv_dv_qp_state_init(struct tbv_dv_qp_state *dv);
+void tbv_dv_qp_state_teardown(struct tbv_dv_qp_state *dv);
+bool tbv_dv_qp_state_active(struct tbv_dv_qp_state *dv);
+
+/* Helpers used by dv.c to reach the per-QP state without exposing the
+ * full tbv_qp layout outside ibdev.c. */
+struct tbv_qp *tbv_qp_from_ibqp(struct ib_qp *ibqp);
+struct tbv_dv_qp_state *tbv_qp_dv_state(struct tbv_qp *tqp);
 const char *tbv_ibdev_roce_netdev_name(void);
 /*
  * Notify the verbs layer that rail's data path has come up (joined=true) or
@@ -816,6 +858,12 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 			      tbv_path_tx_done_fn meta_done,
 			      void *meta_done_ctx,
 			      tbv_path_next_page_fn next, void *next_ctx);
+int tbv_path_send_dma_stream(struct tbv_path *path,
+			     const struct tbv_native_data_header *hdr,
+			     u32 total_length, unsigned int flags,
+			     tbv_path_tx_done_fn meta_done,
+			     void *meta_done_ctx,
+			     tbv_path_next_dma_fn next, void *next_ctx);
 void tbv_path_kick_tx(struct tbv_path *path);
 void tbv_path_cancel_data_done_ctx(struct tbv_path *path,
 				   tbv_path_tx_done_fn done, void *done_ctx);
