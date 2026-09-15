@@ -120,11 +120,49 @@
               tools/ci/distro-package.sh \
               tools/ci/vm-guest-smoke.sh \
               tools/ci/vm-smoke.sh \
+              tools/ci/kernel-compat-probe-test.sh \
               userspace/bench/tbv_vllm_smoke.sh
             python -m py_compile \
               userspace/bench/tbv_perftest_runner.py \
               userspace/bench/tbv_rdma_sweep.py \
               userspace/bench/tbv_uc_stress.py
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out"
+            runHook postInstall
+          '';
+
+          meta = {
+            maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
+          };
+        };
+      # The kernel compat probe decides whether to compile code against a
+      # struct member only some kernels have. It once failed OPEN -- a missing
+      # header made it claim the member was present -- and broke the build on
+      # linux 6.18.37. This runs the probe against synthetic kernel trees so
+      # that regression cannot reach a builder again.
+      mkKernelCompatProbeCheck =
+        pkgs:
+        pkgs.stdenv.mkDerivation {
+          pname = "thunderbolt-ibverbs-kernel-compat-probe";
+          version = "0.3.4";
+          src = ./.;
+
+          nativeBuildInputs = [
+            pkgs.bash
+            pkgs.gnumake
+            pkgs.gnugrep
+            pkgs.gnused
+          ];
+
+          dontConfigure = true;
+
+          buildPhase = ''
+            runHook preBuild
+            bash tools/ci/kernel-compat-probe-test.sh "$PWD/kernel/Makefile"
             runHook postBuild
           '';
 
@@ -426,6 +464,7 @@
           thunderbolt-ibverbs = pkgsAt.thunderbolt-ibverbs;
           portable-kernel-patches = mkPortableKernelPatchCheck pkgs;
           script-syntax = mkScriptSyntaxCheck pkgs;
+          kernel-compat-probe = mkKernelCompatProbeCheck pkgs;
           proto-smoke = mkProtoSmoke pkgs;
           rdma-core-usb4 = pkgsAt.rdma-core-usb4;
           verbs-smoke-build = mkVerbsSmokeBuild pkgs;

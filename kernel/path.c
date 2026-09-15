@@ -4,6 +4,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/thunderbolt.h>
@@ -1288,6 +1289,52 @@ err_in_hop:
 	return ret;
 }
 
+/*
+ * Apple NHI interrupt throttle (0xd004c, 256 ns units).
+ *
+ * The stock/Intel register (0x38c00) is programmed through
+ * tb_ring_throttling(), and MUST NOT be written on an Apple NHI -- the register
+ * lives elsewhere there. On Apple hardware the kernel's own ring activation
+ * writes it: apple_nhi_ring_interrupt_active() programs
+ * APPLE_CIO_NHI_IRQ_THROTTLE from ring->interval_nsec, and SKIPS the write
+ * when that field is zero. A zero module parameter therefore proves nothing
+ * was written, and the register keeps whatever it held -- 255 * 256 ns =
+ * 65.28 us on the machine this was measured on, visible as a latency floor
+ * that does not move with message size (2 B through 4 KB all ~65.3 us,
+ * ib_send_lat across a USB4 link).
+ *
+ * This module never set ring->interval_nsec, so on an Apple NHI the throttle
+ * was silently skipped forever. This applies to every ring on an Apple NHI --
+ * including native-backend rings toward a Linux peer -- because the NHI is
+ * Apple's regardless of who is on the other end of the cable.
+ */
+static bool tbv_host_is_apple(void)
+{
+	return of_machine_is_compatible("apple,arm-platform");
+}
+
+static void tbv_path_apply_ring_interval(struct tbv_path *path)
+{
+#ifdef TBV_HAVE_RING_INTERVAL_NSEC
+	unsigned int interval = READ_ONCE(nhi_interrupt_throttle_ns);
+	u32 before, after;
+
+	if (!interval || !tbv_host_is_apple())
+		return;
+
+	if (!path->tx_ring || !path->rx_ring)
+		return;
+
+	before = path->tx_ring->interval_nsec;
+	WRITE_ONCE(path->tx_ring->interval_nsec, interval);
+	WRITE_ONCE(path->rx_ring->interval_nsec, interval);
+	after = path->tx_ring->interval_nsec;
+
+	pr_info("apple ring throttle: interval_nsec %u -> %u ns (kernel programs it at activation)\n",
+		before, after);
+#endif
+}
+
 int tbv_path_start_rings(struct tbv_path *path)
 {
 	u32 i;
@@ -1295,6 +1342,10 @@ int tbv_path_start_rings(struct tbv_path *path)
 
 	if (path->state != TBV_PATH_RING_ALLOCATED)
 		return -EINVAL;
+
+	/* Must be set before activation: the kernel reads ring->interval_nsec
+	 * when it programs the Apple NHI throttle register. */
+	tbv_path_apply_ring_interval(path);
 
 	tb_ring_start(path->tx_ring);
 	tb_ring_start(path->rx_ring);

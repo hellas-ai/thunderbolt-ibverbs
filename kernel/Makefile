@@ -11,7 +11,50 @@ thunderbolt_ibverbs-y := main.o profile.o backend.o configfs.o core.o debugfs.o 
 
 ccflags-y := -Wall -Wextra -Wno-unused-parameter -I$(src) -I$(src)/..
 
-.PHONY: all clean modules modules_install help
+# COMPAT PROBE. The Asahi USB4 tree carries struct tb_ring.interval_nsec, which
+# stock kernels do not. Probe for it rather than requiring a patched kernel, so
+# one source builds against either.
+#
+# Two properties this probe must have, both of them paid for by a CI failure:
+#
+#  1. Look under BOTH $(KDIR)/include and $(KDIR)/source/include. A kernel
+#     packaged as a SPLIT build/source tree keeps only generated headers under
+#     build/ and the real ones under source/ -- which is what nixpkgs ships and
+#     what the Hydra builders run. Those two are SIBLINGS
+#     (/lib/modules/$(KVER)/{build,source}), though some packagings nest
+#     source/ inside build/, so both spellings are tried.
+#
+#  2. FAIL CLOSED. The previous form was
+#         ifneq ($(shell grep -c interval_nsec $(TBV_TB_HDR) 2>/dev/null),0)
+#     and grep on a missing file prints NOTHING, so $(shell ...) expanded to the
+#     empty string, "" != "0" was true, and the flag was defined precisely when
+#     the probe could not check anything. Against linux 6.18.37 that produced
+#     "error: 'struct tb_ring' has no member named 'interval_nsec'" -- a probe
+#     whose failure mode was to assert the thing it exists to doubt.
+#     grep -l prints a filename on a match and nothing otherwise, so a missing
+#     or unreadable header can only ever yield "absent".
+#
+# The pattern matches a member DECLARATION (identifier followed by ; , or :)
+# rather than the bare string, so prose in a comment cannot enable the code.
+TBV_TB_HDR := $(firstword $(wildcard $(KDIR)/include/linux/thunderbolt.h \
+                                     $(KDIR)/source/include/linux/thunderbolt.h \
+                                     $(KDIR)/../source/include/linux/thunderbolt.h))
+tbv-kernel-has = $(if $(TBV_TB_HDR),$(shell grep -lE '$(1)[[:space:]]*[;,:]' $(TBV_TB_HDR) 2>/dev/null))
+
+ifneq ($(call tbv-kernel-has,interval_nsec),)
+ccflags-y += -DTBV_HAVE_RING_INTERVAL_NSEC
+endif
+
+.PHONY: all clean modules modules_install help compat-report
+
+# Report what the COMPAT PROBE above concluded, without building anything.
+# tools/ci/kernel-compat-probe-test.sh drives this against synthetic kernel
+# trees; it is also the fastest way for a human to answer "why did this build
+# think my kernel had that member?".
+compat-report:
+	@echo "TBV_TB_HDR=$(TBV_TB_HDR)"
+	@echo "interval_nsec=$(if $(findstring TBV_HAVE_RING_INTERVAL_NSEC,$(ccflags-y)),yes,no)"
+
 
 all: modules
 
