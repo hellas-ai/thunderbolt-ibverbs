@@ -1,0 +1,161 @@
+--- a/kernel/ibdev.c	2026-09-11 19:27:33
++++ b/kernel/ibdev.c	2026-09-11 19:12:38
+@@ -1081,7 +1081,17 @@
+ 	if (tqp->type != IB_QPT_RC && !retry_cnt)
+ 		retry_cnt = TBV_UC_WIRE_MAX_RETRIES;
+ 
+-	if (check_mul_overflow(tx_timeout, (unsigned long)retry_cnt + 1,
++	/* Two extra budget units of head-room beyond the sender's own
++	 * exhaustion. Each end quantizes on its own reap tick (one tx_timeout
++	 * apiece) and the sender's last retry is only DUE one budget unit
++	 * after post, so waiting exactly (retry_cnt + 1) leaves ZERO margin:
++	 * the receiver's cleanup and the sender's failure decision land in
++	 * the same tick. Measured 2026-09-11: the reorder drop then sent
++	 * ACK_ERROR, the sender turned that into -EIO and errored its QP
++	 * (perftest "Failed status 5" at 1 MiB), and the run died. With the
++	 * margin the failure decision is always the SENDER's, where the
++	 * application is waiting for it. */
++	if (check_mul_overflow(tx_timeout, (unsigned long)retry_cnt + 3,
+ 			       &rx_timeout))
+ 		return MAX_JIFFY_OFFSET;
+ 
+@@ -4448,7 +4458,7 @@
+ {
+ 	struct tbv_state *state = tqp->owner;
+ 	bool need_resched;
+-	bool timed_out = false;
++	bool fatal = false;
+ 
+ 	mutex_lock(&tqp->rx_lock);
+ 	if (tqp->rx_msg.active &&
+@@ -4467,7 +4477,7 @@
+ 				    tqp->rx_msg.last_route,
+ 				    tqp->rx_msg.last_path_id);
+ 		tbv_rx_fail_active_send(state, tqp, NULL, IB_WC_GENERAL_ERR);
+-		timed_out = true;
++		fatal = true;
+ 	}
+ 	if (tqp->rx_write.active &&
+ 	    tbv_qp_entry_expired(tqp->rx_write.started_jiffies, now, timeout)) {
+@@ -4480,54 +4490,64 @@
+ 				    tqp->rx_write.with_imm);
+ 		tbv_rx_fail_active_write_locked(state, tqp, NULL,
+ 						    IB_WC_GENERAL_ERR);
+-		timed_out = true;
++		fatal = true;
+ 	}
+ 
++	/* Reorder entries expire HEAD-ONLY and SILENTLY.
++	 *
++	 * Head-only: an entry behind the head blocks nothing -- it is delivered
++	 * the moment the head completes -- so expiring it on its own stale
++	 * first_jiffies dropped good data and was the cascade amplifier (one
++	 * hole expired every message queued behind it in a single reap pass,
++	 * each of them firing an error ACK).
++	 *
++	 * Silently: an ACK_ERROR meaning "I timed out waiting" is semantically
++	 * wrong and fatal at the sender (it becomes -EIO -> QP error -> WR
++	 * flush), so a slow-but-legal transfer killed the connection. The
++	 * sender's own retry budget is the only thing entitled to declare a
++	 * message dead; this cleanup runs two budget units later (see
++	 * tbv_qp_rx_timeout_jiffies_locked) and refuses a re-delivery through
++	 * the ack history rather than faking success with a duplicate ACK. */
+ 	for (;;) {
+-		struct tbv_rx_reorder_msg *msg;
++		struct tbv_rx_reorder_msg *msg = NULL, *cursor;
+ 		u32 src_qp;
+ 		u32 psn;
+ 		u32 total_len;
+ 		enum tbv_rx_reorder_kind kind;
+-		bool expected;
+-		bool found = false;
+ 
+-		list_for_each_entry(msg, &tqp->rx_reorder, node) {
+-			if (!tbv_qp_entry_expired(msg->first_jiffies, now,
+-						  timeout))
+-				continue;
+-			found = true;
+-			break;
++		list_for_each_entry(cursor, &tqp->rx_reorder, node) {
++			if (cursor->psn == tqp->rx_expected_psn) {
++				msg = cursor;
++				break;
++			}
+ 		}
+-		if (!found)
++		if (!msg ||
++		    !tbv_qp_entry_expired(msg->first_jiffies, now, timeout))
+ 			break;
+ 
+ 		src_qp = msg->src_qp;
+ 		psn = msg->psn;
+ 		total_len = msg->total_len;
+ 		kind = msg->kind;
+-		expected = psn == tqp->rx_expected_psn;
+ 		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
+ 		atomic64_inc(&state->data_rx_reorder_timeout);
+-		if (expected)
+-			tqp->rx_expected_psn = tbv_psn_next(psn);
++		tqp->rx_expected_psn = tbv_psn_next(psn);
++		/* A re-delivery of this PSN must be refused loudly, never
++		 * ACK_OK'd as a duplicate -- that would be silent data loss. */
++		tbv_qp_ack_history_store_locked(tqp, psn,
++						TBV_NATIVE_SEND_ACK_ERROR);
+ 		if (kind == TBV_RX_REORDER_READ_REQ)
+ 			tbv_send_read_status_on_path(tqp, NULL, src_qp,
+ 						     tqp->base.qp_num, psn,
+ 						     total_len, -ETIMEDOUT);
+-		else
+-			tbv_send_ack(tqp, src_qp, tqp->base.qp_num, psn,
+-				     TBV_NATIVE_SEND_ACK_ERROR);
+-		timed_out = true;
+-		if (expected)
+-			tbv_rx_drain_reorder_locked(state, tqp, NULL);
++		tbv_rx_drain_reorder_locked(state, tqp, NULL);
+ 	}
+ 
+ 	need_resched = tqp->rx_msg.active || tqp->rx_write.active ||
+ 		       !list_empty(&tqp->rx_reorder);
+ 	mutex_unlock(&tqp->rx_lock);
+ 
+-	if (timed_out)
++	if (fatal)
+ 		tbv_qp_mark_error(tqp);
+ 
+ 	return need_resched;
+@@ -6950,12 +6970,6 @@
+ 			atomic64_inc(&tqp->owner->data_tx_ack_ok);
+ 	}
+ 	return ret;
+-}
+-
+-static int tbv_send_ack(struct tbv_qp *tqp, u32 dest_qp, u32 src_qp,
+-			u32 psn, int status)
+-{
+-	return tbv_send_ack_on_path(tqp, NULL, dest_qp, src_qp, psn, status);
+ }
+ 
+ static void tbv_count_tx_read_ack(struct tbv_state *state, int status)
+@@ -8697,11 +8711,20 @@
+ 	ret = tbv_rx_reorder_store_fragment_locked(tqp, msg, offset, payload,
+ 						   hdr->length);
+ 	if (ret) {
++		/* Drop the message, but never as a protocol error: running out
++		 * of reorder memory means "this message cannot be held right
++		 * now", and the sender's retry re-delivers it once the cap has
++		 * drained. An error ACK here killed the QP instead (measured
++		 * 2026-09-11 at 1 MiB: reorder_window == the ACK_ERROR count).
++		 * If the cap stays full the sender exhausts its own budget and
++		 * reports the failure to its application, which is the only
++		 * party entitled to declare the message dead. */
+ 		if (ret == -ENOSPC)
+ 			atomic64_inc(&state->data_rx_reorder_window);
++		else
++			tbv_rx_send_error_ack(state, tqp, rx_path, hdr, psn,
++					      "reorder store failed", false);
+ 		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
+-		tbv_rx_send_error_ack(state, tqp, rx_path, hdr, psn,
+-				      "reorder store failed", false);
+ 		return;
+ 	}
+ 	set_bit(frag_idx, msg->frag_seen);

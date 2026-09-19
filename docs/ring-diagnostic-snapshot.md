@@ -1,0 +1,11 @@
+# PCI NHI ring snapshot diagnostic
+
+This additive debugfs instrumentation targets the existing Fedora 6.18 module snapshot. It changes no transport behavior and writes no MMIO or descriptor fields. Other kernel versions print `unsupported_kernel_abi=1`; even on 6.18, hardware reads require a PCI NHI (`pdev`), mapped registers and an in-range hop. Do not use this patch to infer the Apple NHI register layout.
+
+Each rail in `peers` reports TX and RX software head/tail, outstanding descriptors, queued/in-flight frames, IRQ/vector, ring flags, configured E2E hop, raw hardware indices/options and throttle, and oldest outstanding descriptor control/COMPLETED. `hw_valid`, `tail_valid` and `throttle_valid` explicitly qualify absent observations. RX hardware index is the upper halfword (producer), TX is the lower halfword (consumer). Throttle is a raw register value, not a claimed nanosecond measurement. The E2E hop field decoded from hardware options is meaningful for RX; TX also reports its raw options for diagnosis.
+
+The existing peers reader holds `state->lock`; rail teardown unlinks each rail under that lock before freeing rings (`kernel/peer.c`). Ring software state and descriptor/MMIO reads are copied under `ring->lock`, then formatted after unlocking. Hardware may advance during the sequence: this is not an atomic hardware transaction.
+
+Sources: the existing upstream workspace `kernel/path.c` implementation of `tbv_path_tx_ring_snapshot` supplied by the root agent, and Linux PCI NHI register definitions at https://codebrowser.dev/linux/linux/drivers/thunderbolt/nhi_regs.h.html . The adaptation deliberately omits modern `nhi->ring_layout`, unavailable in the Fedora 6.18 ABI; root verifies the target kernel header/build before loading.
+
+Test red: `cc -std=c11 -Wall -Wextra -Werror tests/ring_diag_test.c -o /private/tmp/tbv-ring-diag-test` failed before the helper existed (`ring_diag.h` not found). Green: the same command followed by `/private/tmp/tbv-ring-diag-test` passed all six assertions for producer/consumer decoding, descriptor flag shift and E2E hop masking. `BUILD_BUG_ON` enforces the mirrored descriptor's 16-byte size during kernel compilation. Target kernel compilation and hardware acceptance belong to the root agent; neither is claimed by this local decoder test.

@@ -72,6 +72,8 @@
 #define TBV_APPLE_TX_MAX_INFLIGHT_FRAMES_DEFAULT 4
 #define TBV_QP_TIMEOUT_DEFAULT_MS 5000
 #define TBV_QP_TIMEOUT_WORK_INTERVAL_MS 1000
+#define TBV_UC_WIRE_MAX_RETRIES 7
+#define TBV_UC_RNR_MAX_RETRIES 7
 #define TBV_SEND_MAX_RETRIES 7
 #define TBV_SEND_RNR_RETRIES_INFINITE ((u8)~0u)
 #define TBV_READ_RESP_RETRY_MS 100
@@ -529,6 +531,12 @@ struct tbv_send_ctx {
 	bool ready;
 	bool pending;
 	bool retryable;
+	bool wire_acked; /* native UC hybrid (2026-09-11): the verbs WC
+			    * completes at local TX drain, but the ctx stays on
+			    * the wire list until the peer ACK -- a missing ACK
+			    * (the FA57 vanish) is recovered by the reap retransmit
+			    * below, which the pre-fix ACK-gated design did
+			    * implicitly. */
 	bool retrying;
 	bool rnr_waiting;
 	bool recv_credit_required;
@@ -939,8 +947,27 @@ tbv_qp_rx_timeout_jiffies_locked(const struct tbv_qp *tqp,
 		return 0;
 
 	retry_cnt = tqp->attr.retry_cnt & 0x7;
+	/* UC QPs carry retry_cnt=0; their wire budget is the module policy
+	 * TBV_UC_WIRE_MAX_RETRIES. The RX active-message watchdog must
+	 * out-wait the sender's whole retransmit window, or it races the
+	 * retransmit and errors first: measured 2026-09-11, the receiver
+	 * errored a half-received fragmented reply at 5.00 s while the
+	 * sender's retransmit was due at 5.09 s -- the receiver's ACK_ERROR
+	 * then errored the sender's QP too, killing both ends. */
+	if (tqp->type != IB_QPT_RC && !retry_cnt)
+		retry_cnt = TBV_UC_WIRE_MAX_RETRIES;
 
-	if (check_mul_overflow(tx_timeout, (unsigned long)retry_cnt + 1,
+	/* Two extra budget units of head-room beyond the sender's own
+	 * exhaustion. Each end quantizes on its own reap tick (one tx_timeout
+	 * apiece) and the sender's last retry is only DUE one budget unit
+	 * after post, so waiting exactly (retry_cnt + 1) leaves ZERO margin:
+	 * the receiver's cleanup and the sender's failure decision land in
+	 * the same tick. Measured 2026-09-11: the reorder drop then sent
+	 * ACK_ERROR, the sender turned that into -EIO and errored its QP
+	 * (perftest "Failed status 5" at 1 MiB), and the run died. With the
+	 * margin the failure decision is always the SENDER's, where the
+	 * application is waiting for it. */
+	if (check_mul_overflow(tx_timeout, (unsigned long)retry_cnt + 3,
 			       &rx_timeout))
 		return MAX_JIFFY_OFFSET;
 
@@ -1293,6 +1320,11 @@ static int tbv_qp_reserve_sendq(struct tbv_qp *tqp)
 		ret = -EINVAL;
 	} else if (tqp->sendq_count >= max_wr) {
 		ret = -ENOMEM;
+		/* PROBE (2026-09-11 sendq-leak RCA): name the cap if it ever
+		 * trips again, so the next leak is visible in dmesg instead of
+		 * surfacing as an app-side "Couldn't post send". */
+		pr_warn_ratelimited("PROBE sendq-full qpn=0x%x count=%u max_wr=%u\n",
+				    tqp->base.qp_num, tqp->sendq_count, max_wr);
 	} else {
 		tqp->sendq_count++;
 	}
@@ -3344,7 +3376,7 @@ static void tbv_send_tx_done(void *ctx, int status)
 	struct tbv_send_ctx *send = ctx;
 	struct tbv_qp *tqp = send->tqp;
 
-	if (send->retryable) {
+	{
 		unsigned long flags;
 		bool tx_drained;
 
@@ -3352,17 +3384,53 @@ static void tbv_send_tx_done(void *ctx, int status)
 		tx_drained = atomic_dec_and_test(&send->tx_pending);
 		if (tx_drained) {
 			send->retrying = false;
-			if (!status && send->pending && !send->rnr_waiting) {
+			if (send->retryable && !status && send->pending &&
+			    !send->rnr_waiting) {
 				tbv_send_mark_queued(send, jiffies);
 				tbv_qp_schedule_timeout_locked(tqp);
 			}
 		}
 		spin_unlock_irqrestore(&tqp->lock, flags);
-	}
 
-	if (!status) {
-		tbv_send_ctx_put(send);
-		return;
+		if (!status) {
+			/*
+			 * Non-retryable sends (UC, UC WRITE) complete when the
+			 * local TX drains: there is no peer ACK, and waiting for
+			 * one is the bug that let a UC WR sit pending until the
+			 * 5000 ms watchdog errored the QP and flushed everything
+			 * ("Work Request Flushed Error (5)" ~30-50k iterations,
+			 * 2026-09-11). Complete in PSN order through the
+			 * ready-drain path; earlier sends still transmitting stay
+			 * pending until their own drain.
+			 */
+			if (tx_drained && !send->retryable) {
+				/*
+				 * Hybrid completion: the verbs WC fires at local drain (UC
+				 * semantics), but the ctx STAYS on pending_sends until the
+				 * peer ACK. The FA57 TX engine loses ~1 frame per 50k with
+				 * clean counters on both ends (2026-09-11); the reap below
+				 * retransmits drained-but-unacked sends, which is the only
+				 * recovery that ever worked on this hardware. The list ref
+				 * is released by the ACK path\x27s ordered drain, exactly as
+				 * in the pre-fix design -- no refcount change.
+				 */
+				tbv_send_complete(send, 0);
+				/*
+				 * The sendq slot bounds the SEND QUEUE, which the local
+				 * drain just emptied; the ctx itself stays alive under
+				 * its own refs until the wire ACK. Releasing here, not
+				 * at ACK time, keeps depth-1 send queues working: the
+				 * app reposts as soon as the drain WC fires, ~70 us
+				 * before the peer's ACK can arrive (measured
+				 * 2026-09-11: server "Couldn't post send", PROBE
+				 * sendq-full count=1 max_wr=1). Idempotent via
+				 * sq_counted; the ACK path releases again harmlessly.
+				 */
+				tbv_qp_release_sendq_counted(tqp, &send->sq_counted);
+			}
+			tbv_send_ctx_put(send);
+			return;
+		}
 	}
 
 	{
@@ -3443,8 +3511,16 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 	spin_lock_irqsave(&tqp->lock, flags);
 	list_for_each_entry_safe(send, send_tmp, &tqp->pending_sends, node) {
 		u8 max_retries = send->max_retries;
+		/* UC QPs carry no RC retry_cnt: the app leaves it 0, which must
+		 * not mean "zero wire retries" — the wire reliability budget is a
+		 * module policy (TBV_UC_WIRE_MAX_RETRIES). Without this, the
+		 * retransmit condition below is never true for UC and every lost
+		 * frame ends in the 5 s hard timeout and a QP flush.
+		 */
+		if (!send->retryable && !max_retries)
+			max_retries = TBV_UC_WIRE_MAX_RETRIES;
 		unsigned long send_timeout =
-			(send->retryable && max_retries) ?
+			((send->retryable || !send->wire_acked) && max_retries) ?
 				tbv_send_retry_jiffies(timeout, max_retries) :
 				timeout;
 		unsigned long rnr_timeout =
@@ -3469,7 +3545,8 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 				need_resched = true;
 				continue;
 			}
-			if (send->retryable && !send->retrying &&
+			if ((send->retryable || !send->wire_acked) &&
+			    !send->retrying &&
 			    !atomic_read(&send->tx_pending) &&
 			    tbv_send_rnr_retry_allowed(send) &&
 			    !tqp->closing && tqp->state != IB_QPS_ERR) {
@@ -3508,7 +3585,8 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 				continue;
 			}
 		}
-		if (send->retryable && !send->retrying &&
+		if ((send->retryable || !send->wire_acked) &&
+		    !send->retrying &&
 		    !atomic_read(&send->tx_pending) &&
 		    send->retries < max_retries &&
 		    !tqp->closing && tqp->state != IB_QPS_ERR) {
@@ -3520,6 +3598,20 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 		}
 		if (send->retryable && send->retries >= max_retries)
 			atomic64_inc(&tqp->owner->data_wr_retry_exhausted);
+		/* PROBE (2026-09-11 UC freeze RCA): an expired non-retryable
+		 * send that reaches here failed every retransmit sub-condition;
+		 * log which one. Ratelimited so a dead QP cannot flood. */
+		if (!send->retryable && !send->wire_acked)
+			pr_info_ratelimited("PROBE reap-expired qpn=0x%x psn=%u queued=%lu now=%lu send_timeout=%lu wire_acked=%d retrying=%d tx_pending=%d retries=%u max_retries=%u ready=%d completed=%d pending=%d closing=%d state=%d\n",
+					    tqp->base.qp_num, send->psn,
+					    send->queued_jiffies, now,
+					    send_timeout, send->wire_acked,
+					    send->retrying,
+					    atomic_read(&send->tx_pending),
+					    send->retries, max_retries,
+					    send->ready, send->completed,
+					    send->pending, tqp->closing,
+					    tqp->state);
 		if (!send->ready) {
 			send->ready = true;
 			send->completion_status = -ETIMEDOUT;
@@ -3554,7 +3646,7 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 {
 	struct tbv_state *state = tqp->owner;
 	bool need_resched;
-	bool timed_out = false;
+	bool fatal = false;
 
 	mutex_lock(&tqp->rx_lock);
 	if (tqp->rx_msg.active &&
@@ -3573,7 +3665,7 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 				    tqp->rx_msg.last_route,
 				    tqp->rx_msg.last_path_id);
 		tbv_rx_fail_active_send(state, tqp, NULL, IB_WC_GENERAL_ERR);
-		timed_out = true;
+		fatal = true;
 	}
 	if (tqp->rx_write.active &&
 	    tbv_qp_entry_expired(tqp->rx_write.started_jiffies, now, timeout)) {
@@ -3586,54 +3678,64 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 				    tqp->rx_write.with_imm);
 		tbv_rx_fail_active_write_locked(state, tqp, NULL,
 						    IB_WC_GENERAL_ERR);
-		timed_out = true;
+		fatal = true;
 	}
 
+	/* Reorder entries expire HEAD-ONLY and SILENTLY.
+	 *
+	 * Head-only: an entry behind the head blocks nothing -- it is delivered
+	 * the moment the head completes -- so expiring it on its own stale
+	 * first_jiffies dropped good data and was the cascade amplifier (one
+	 * hole expired every message queued behind it in a single reap pass,
+	 * each of them firing an error ACK).
+	 *
+	 * Silently: an ACK_ERROR meaning "I timed out waiting" is semantically
+	 * wrong and fatal at the sender (it becomes -EIO -> QP error -> WR
+	 * flush), so a slow-but-legal transfer killed the connection. The
+	 * sender's own retry budget is the only thing entitled to declare a
+	 * message dead; this cleanup runs two budget units later (see
+	 * tbv_qp_rx_timeout_jiffies_locked) and refuses a re-delivery through
+	 * the ack history rather than faking success with a duplicate ACK. */
 	for (;;) {
-		struct tbv_rx_reorder_msg *msg;
+		struct tbv_rx_reorder_msg *msg = NULL, *cursor;
 		u32 src_qp;
 		u32 psn;
 		u32 total_len;
 		enum tbv_rx_reorder_kind kind;
-		bool expected;
-		bool found = false;
 
-		list_for_each_entry(msg, &tqp->rx_reorder, node) {
-			if (!tbv_qp_entry_expired(msg->first_jiffies, now,
-						  timeout))
-				continue;
-			found = true;
-			break;
+		list_for_each_entry(cursor, &tqp->rx_reorder, node) {
+			if (cursor->psn == tqp->rx_expected_psn) {
+				msg = cursor;
+				break;
+			}
 		}
-		if (!found)
+		if (!msg ||
+		    !tbv_qp_entry_expired(msg->first_jiffies, now, timeout))
 			break;
 
 		src_qp = msg->src_qp;
 		psn = msg->psn;
 		total_len = msg->total_len;
 		kind = msg->kind;
-		expected = psn == tqp->rx_expected_psn;
 		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
 		atomic64_inc(&state->data_rx_reorder_timeout);
-		if (expected)
-			tqp->rx_expected_psn = tbv_psn_next(psn);
+		tqp->rx_expected_psn = tbv_psn_next(psn);
+		/* A re-delivery of this PSN must be refused loudly, never
+		 * ACK_OK'd as a duplicate -- that would be silent data loss. */
+		tbv_qp_ack_history_store_locked(tqp, psn,
+						TBV_NATIVE_SEND_ACK_ERROR);
 		if (kind == TBV_RX_REORDER_READ_REQ)
 			tbv_send_read_status_on_path(tqp, NULL, src_qp,
 						     tqp->base.qp_num, psn,
 						     total_len, -ETIMEDOUT);
-		else
-			tbv_send_ack(tqp, src_qp, tqp->base.qp_num, psn,
-				     TBV_NATIVE_SEND_ACK_ERROR);
-		timed_out = true;
-		if (expected)
-			tbv_rx_drain_reorder_locked(state, tqp, NULL);
+		tbv_rx_drain_reorder_locked(state, tqp, NULL);
 	}
 
 	need_resched = tqp->rx_msg.active || tqp->rx_write.active ||
 		       !list_empty(&tqp->rx_reorder);
 	mutex_unlock(&tqp->rx_lock);
 
-	if (timed_out)
+	if (fatal)
 		tbv_qp_mark_error(tqp);
 
 	return need_resched;
@@ -3732,7 +3834,11 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 		int ret;
 
 			list_del_init(&send->retry_node);
-			if (tbv_send_is_completed(send) ||
+			/* The hybrid UC send is verbs-completed at local drain but
+			 * still needs the wire retransmit until the peer ACK. Skip
+			 * only sends whose wire lifecycle is done. */
+			if ((tbv_send_is_completed(send) &&
+			     (send->retryable || send->wire_acked)) ||
 			    !tbv_qp_send_retry_pending(tqp, send)) {
 				tbv_send_ctx_put(send);
 				continue;
@@ -3743,7 +3849,9 @@ static void tbv_qp_timeout_work(struct work_struct *work)
 			atomic64_inc(&tqp->owner->data_wr_retry_enqueue_error);
 
 		spin_lock_irqsave(&tqp->lock, flags);
-		pending = send->pending && !send->completed &&
+		pending = send->pending &&
+			  (send->retryable ? !send->completed :
+			   !send->wire_acked) &&
 			  !tqp->closing && tqp->state != IB_QPS_ERR;
 		if (pending && !ret) {
 			if (reason == TBV_SEND_POST_RETRY_RNR) {
@@ -5174,9 +5282,21 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	ctx->imm_data = (send_with_imm || write_with_imm) ?
 			be32_to_cpu(wr->ex.imm_data) : 0;
 	ctx->solicited = !!(wr->send_flags & IB_SEND_SOLICITED);
-	ctx->retryable = true;
+	/* The hybrid wire reliability (2026-09-11) needs an ACK for every UC
+	 * send: the receiver only ACKs solicited frames, and the FA57 vanish
+	 * (~1 frame per 50k, silent on all counters) is only recoverable via
+	 * the ACK-gated retransmit. Solicit UC sends unconditionally. */
+	if (!ctx->retryable)
+		ctx->solicited = true;
+	ctx->retryable = tqp->type == IB_QPT_RC;
 	ctx->max_retries = tbv_qp_send_max_retries(tqp);
 	ctx->max_rnr_retries = tbv_qp_send_max_rnr_retries(tqp);
+	/* UC QPs carry no RC rnr_retry: the app leaves it 0, which must not
+	 * mean "zero RNR retries" -- an RNR ack then dead-ends exactly like a
+	 * lost frame did before TBV_UC_WIRE_MAX_RETRIES. Same policy override.
+	 */
+	if (!ctx->retryable && !ctx->max_rnr_retries)
+		ctx->max_rnr_retries = TBV_UC_RNR_MAX_RETRIES;
 	ctx->recv_credit_required = recv_credit_required;
 	if (is_write) {
 		const struct ib_rdma_wr *rwr = rdma_wr(wr);
@@ -5197,6 +5317,8 @@ static int tbv_post_send_one(struct tbv_qp *tqp, const struct ib_send_wr *wr)
 	ctx->psn = psn;
 
 	tbv_qp_queue_send(tqp, ctx);
+	if (!ctx->retryable)
+		tbv_qp_arm_send_timeout(tqp, ctx);
 	tbv_send_ctx_get(ctx);
 	ret = tbv_native_send_ctx_post_frames(ctx, TBV_SEND_POST_INITIAL);
 	if (ret) {
@@ -5956,12 +6078,6 @@ static int tbv_send_ack_on_path(struct tbv_qp *tqp,
 			atomic64_inc(&tqp->owner->data_tx_ack_ok);
 	}
 	return ret;
-}
-
-static int tbv_send_ack(struct tbv_qp *tqp, u32 dest_qp, u32 src_qp,
-			u32 psn, int status)
-{
-	return tbv_send_ack_on_path(tqp, NULL, dest_qp, src_qp, psn, status);
 }
 
 static void tbv_count_tx_read_ack(struct tbv_state *state, int status)
@@ -7240,6 +7356,8 @@ static bool tbv_rx_deliver_reorder_msg_locked(struct tbv_state *state,
 
 	if (!tbv_qp_pop_recv(tqp, &wqe)) {
 		atomic64_inc(&state->data_rx_rnr);
+		pr_warn_ratelimited("PROBE rnr-no-recv qpn=0x%x psn=%u src_qp=0x%x\n",
+				    tqp->base.qp_num, msg->psn, msg->src_qp);
 		tbv_send_ack_on_path(tqp, rx_path, msg->src_qp,
 				     tqp->base.qp_num, msg->psn,
 				     TBV_NATIVE_SEND_ACK_RNR);
@@ -7306,6 +7424,8 @@ static bool tbv_rx_deliver_reorder_write_locked(struct tbv_state *state,
 
 	if (msg->with_imm && !tbv_qp_pop_recv(tqp, &tqp->rx_write.imm_wqe)) {
 		atomic64_inc(&state->data_rx_rnr);
+		pr_warn_ratelimited("PROBE rnr-no-recv qpn=0x%x psn=%u src_qp=0x%x\n",
+				    tqp->base.qp_num, msg->psn, msg->src_qp);
 		tbv_send_ack_on_path(tqp, rx_path, msg->src_qp,
 				     tqp->base.qp_num, msg->psn,
 				     TBV_NATIVE_SEND_ACK_RNR);
@@ -7676,11 +7796,20 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 	ret = tbv_rx_reorder_store_fragment_locked(tqp, msg, offset, payload,
 						   hdr->length);
 	if (ret) {
+		/* Drop the message, but never as a protocol error: running out
+		 * of reorder memory means "this message cannot be held right
+		 * now", and the sender's retry re-delivers it once the cap has
+		 * drained. An error ACK here killed the QP instead (measured
+		 * 2026-09-11 at 1 MiB: reorder_window == the ACK_ERROR count).
+		 * If the cap stays full the sender exhausts its own budget and
+		 * reports the failure to its application, which is the only
+		 * party entitled to declare the message dead. */
 		if (ret == -ENOSPC)
 			atomic64_inc(&state->data_rx_reorder_window);
+		else
+			tbv_rx_send_error_ack(state, tqp, rx_path, hdr, psn,
+					      "reorder store failed", false);
 		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
-		tbv_rx_send_error_ack(state, tqp, rx_path, hdr, psn,
-				      "reorder store failed", false);
 		return;
 	}
 	set_bit(frag_idx, msg->frag_seen);
@@ -7898,6 +8027,8 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 		} else {
 			if (!tbv_qp_pop_recv(tqp, &msg->wqe)) {
 				atomic64_inc(&state->data_rx_rnr);
+				pr_warn_ratelimited("PROBE rnr-no-recv qpn=0x%x psn=%u src_qp=0x%x\n",
+						    tqp->base.qp_num, psn, hdr->src_qp);
 				tbv_rx_mark_rnr_locked(tqp, hdr->src_qp, psn,
 						       hdr->remote_addr,
 						       hdr->frag_offset);
@@ -8012,13 +8143,26 @@ static void tbv_rx_handle_send_fragment(struct tbv_state *state,
 		return;
 	} else {
 		if (offset) {
+			/*
+			 * Tail-before-head for the EXPECTED psn: the first
+			 * fragment vanished on the wire. Buffer the orphan and
+			 * wait for the sender's retransmit (the send is
+			 * unacked until the whole message completes) instead
+			 * of erroring the connection -- the old behavior
+			 * killed both QPs via ACK_ERROR (measured 2026-09-11:
+			 * run died at 40484 with exactly this shape and clean
+			 * counters on both ends).
+			 */
+			tbv_rx_buffer_fragment_locked(state, tqp, rx_path, hdr,
+						      psn, total_len, offset,
+						      last, payload);
 			mutex_unlock(&tqp->rx_lock);
-			tbv_rx_send_error_ack(state, tqp, rx_path, hdr, psn,
-					      "idle nonzero offset", true);
 			return;
 		}
 		if (!tbv_qp_pop_recv(tqp, &msg->wqe)) {
 			atomic64_inc(&state->data_rx_rnr);
+			pr_warn_ratelimited("PROBE rnr-no-recv qpn=0x%x psn=%u src_qp=0x%x\n",
+					    tqp->base.qp_num, psn, hdr->src_qp);
 			tbv_rx_mark_rnr_locked(tqp, hdr->src_qp, psn,
 					       hdr->remote_addr,
 					       hdr->frag_offset);
@@ -8270,6 +8414,8 @@ static void tbv_rx_handle_rdma_write_fragment(struct tbv_state *state,
 		}
 		if (with_imm && !tbv_qp_pop_recv(tqp, &wrx->imm_wqe)) {
 			atomic64_inc(&state->data_rx_rnr);
+			pr_warn_ratelimited("PROBE rnr-no-recv qpn=0x%x psn=%u src_qp=0x%x\n",
+					    tqp->base.qp_num, psn, hdr->src_qp);
 			tbv_rx_mark_rnr_locked(tqp, hdr->src_qp, psn,
 					       hdr->remote_addr,
 					       hdr->frag_offset);
@@ -9005,6 +9151,15 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 						 node);
 
 			list_del_init(&send->node);
+			send->wire_acked = true;
+			/* The sendq slot was reserved at post and held through the
+			 * hybrid wire lifecycle. The ACK is where the ctx leaves
+			 * pending_sends on the success path, and nothing else on
+			 * that path releases it: without this, every UC send
+			 * leaks one slot and the QP stops accepting posts at
+			 * max_send_wr (measured 2026-09-11: "Couldn't post
+			 * send" at 179490 sends, zero counters, zero dmesg). */
+			tbv_qp_release_sendq_counted(tqp, &send->sq_counted);
 			completed_ack = true;
 			if (send->completion_status)
 				completed_error = true;

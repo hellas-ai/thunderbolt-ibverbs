@@ -1,0 +1,180 @@
+diff --git a/docs/ring-diagnostic-snapshot.md b/docs/ring-diagnostic-snapshot.md
+new file mode 100644
+index 0000000..217494d
+--- /dev/null
++++ b/docs/ring-diagnostic-snapshot.md
+@@ -0,0 +1,11 @@
++# PCI NHI ring snapshot diagnostic
++
++This additive debugfs instrumentation targets the existing Fedora 6.18 module snapshot. It changes no transport behavior and writes no MMIO or descriptor fields. Other kernel versions print `unsupported_kernel_abi=1`; even on 6.18, hardware reads require a PCI NHI (`pdev`), mapped registers and an in-range hop. Do not use this patch to infer the Apple NHI register layout.
++
++Each rail in `peers` reports TX and RX software head/tail, outstanding descriptors, queued/in-flight frames, IRQ/vector, ring flags, configured E2E hop, raw hardware indices/options and throttle, and oldest outstanding descriptor control/COMPLETED. `hw_valid`, `tail_valid` and `throttle_valid` explicitly qualify absent observations. RX hardware index is the upper halfword (producer), TX is the lower halfword (consumer). Throttle is a raw register value, not a claimed nanosecond measurement. The E2E hop field decoded from hardware options is meaningful for RX; TX also reports its raw options for diagnosis.
++
++The existing peers reader holds `state->lock`; rail teardown unlinks each rail under that lock before freeing rings (`kernel/peer.c`). Ring software state and descriptor/MMIO reads are copied under `ring->lock`, then formatted after unlocking. Hardware may advance during the sequence: this is not an atomic hardware transaction.
++
++Sources: the existing upstream workspace `kernel/path.c` implementation of `tbv_path_tx_ring_snapshot` supplied by the root agent, and Linux PCI NHI register definitions at https://codebrowser.dev/linux/linux/drivers/thunderbolt/nhi_regs.h.html . The adaptation deliberately omits modern `nhi->ring_layout`, unavailable in the Fedora 6.18 ABI; root verifies the target kernel header/build before loading.
++
++Test red: `cc -std=c11 -Wall -Wextra -Werror tests/ring_diag_test.c -o /private/tmp/tbv-ring-diag-test` failed before the helper existed (`ring_diag.h` not found). Green: the same command followed by `/private/tmp/tbv-ring-diag-test` passed all six assertions for producer/consumer decoding, descriptor flag shift and E2E hop masking. `BUILD_BUG_ON` enforces the mirrored descriptor's 16-byte size during kernel compilation. Target kernel compilation and hardware acceptance belong to the root agent; neither is claimed by this local decoder test.
+diff --git a/kernel/debugfs.c b/kernel/debugfs.c
+index cfcda3e..c035e09 100644
+--- a/kernel/debugfs.c
++++ b/kernel/debugfs.c
+@@ -1,11 +1,102 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+ #include <linux/debugfs.h>
++#include <linux/io.h>
+ #include <linux/seq_file.h>
+ #include <linux/thunderbolt.h>
++#include <linux/version.h>
+ 
+ #include "../proto/native_wire.h"
+ #include "tbv.h"
++#include "ring_diag.h"
++
++/* Read-only diagnostic for the Linux 6.18 PCI NHI ABI, never Apple NHI. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0) && \
++    LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0)
++struct tbv_diag_desc {
++	u64 phys;
++	u32 ctrl;
++	u32 time;
++} __packed;
++
++static void tbv_debugfs_ring_show(struct seq_file *s, struct tb_ring *ring,
++				const char *direction)
++{
++	struct {
++		bool running, hw_valid, tail_valid, throttle_valid;
++		int head, tail, size, hop, irq, e2e_tx_hop;
++		unsigned int vector, flags, queued, inflight, outstanding;
++		u32 index, options, options_e2e, tail_ctrl, throttle;
++	} snap = { 0 };
++	const struct tbv_diag_desc *descs;
++	struct list_head *pos;
++	unsigned long irqflags;
++	void __iomem *base;
++
++	BUILD_BUG_ON(sizeof(struct tbv_diag_desc) != 16);
++	if (!ring) {
++		seq_printf(s, "    ring_%s present=0\n", direction);
++		return;
++	}
++	/* Caller holds state->lock: rails unlink before freeing their rings. */
++	spin_lock_irqsave(&ring->lock, irqflags);
++	snap.running = ring->running;
++	snap.head = ring->head;
++	snap.tail = ring->tail;
++	snap.size = ring->size;
++	snap.hop = ring->hop;
++	snap.irq = ring->irq;
++	snap.vector = ring->vector;
++	snap.flags = ring->flags;
++	snap.e2e_tx_hop = ring->e2e_tx_hop;
++	list_for_each(pos, &ring->queue)
++		snap.queued++;
++	list_for_each(pos, &ring->in_flight)
++		snap.inflight++;
++	if (snap.size > 0 && snap.head >= 0 && snap.head < snap.size &&
++	    snap.tail >= 0 && snap.tail < snap.size) {
++		snap.outstanding = (snap.head - snap.tail + snap.size) % snap.size;
++		descs = (const struct tbv_diag_desc *)ring->descriptors;
++		if (descs && snap.outstanding) {
++			snap.tail_ctrl = READ_ONCE(descs[snap.tail].ctrl);
++			snap.tail_valid = true;
++		}
++	}
++	if (ring->nhi && ring->nhi->pdev && ring->nhi->iobase &&
++	    snap.hop >= 0 && snap.hop < ring->nhi->hop_count) {
++		base = ring->nhi->iobase;
++		snap.index = ioread32(base + (ring->is_tx ? 0 : 0x8000) +
++				     snap.hop * 16 + 8);
++		snap.options = ioread32(base + (ring->is_tx ? 0x19800 : 0x29800) +
++				       snap.hop * 32);
++		snap.options_e2e = ioread32(base + (ring->is_tx ? 0x19800 : 0x29800) +
++					   snap.hop * 32 + 4);
++		snap.hw_valid = true;
++		if (snap.vector < 16) {
++			snap.throttle = ioread32(base + 0x38c00 + snap.vector * 4);
++			snap.throttle_valid = true;
++		}
++	}
++	spin_unlock_irqrestore(&ring->lock, irqflags);
++	seq_printf(s, "    ring_%s present=1 running=%u head=%d tail=%d size=%d hop=%d irq=%d vector=%u flags=0x%x e2e_tx_hop=%d sw_queue=%u in_flight=%u outstanding=%u hw_valid=%u hw_index=%u hw_index_raw=0x%x hw_options=0x%x hw_options_next=0x%x hw_enabled=%u hw_e2e=%u hw_e2e_hop=%u tail_valid=%u tail_ctrl=0x%x tail_flags=0x%x tail_completed=%u throttle_valid=%u throttle_raw=%u\n",
++		   direction, snap.running, snap.head, snap.tail, snap.size,
++		   snap.hop, snap.irq, snap.vector, snap.flags, snap.e2e_tx_hop,
++		   snap.queued, snap.inflight, snap.outstanding, snap.hw_valid,
++		   tbv_diag_hw_index(snap.index, ring->is_tx), snap.index,
++		   snap.options, snap.options_e2e, !!(snap.options & BIT(31)),
++		   !!(snap.options & BIT(28)), tbv_diag_e2e_hop(snap.options),
++		   snap.tail_valid, snap.tail_ctrl, tbv_diag_desc_flags(snap.tail_ctrl),
++		   !!(tbv_diag_desc_flags(snap.tail_ctrl) & RING_DESC_COMPLETED),
++		   snap.throttle_valid, snap.throttle);
++}
++#else
++static void tbv_debugfs_ring_show(struct seq_file *s, struct tb_ring *ring,
++				const char *direction)
++{
++	seq_printf(s, "    ring_%s present=%u hw_valid=0 unsupported_kernel_abi=1\n",
++		   direction, !!ring);
++}
++#endif
+ 
+ static u32 tbv_debugfs_wire_path_flags(const struct tbv_path *path)
+ {
+@@ -470,6 +561,8 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
+ 				   rail->path.tx_poll_enabled,
+ 				   atomic64_read(&rail->path.tx_poll_calls),
+ 				   atomic64_read(&rail->path.tx_poll_completed));
++			tbv_debugfs_ring_show(s, rail->path.tx_ring, "tx");
++			tbv_debugfs_ring_show(s, rail->path.rx_ring, "rx");
+ 			seq_printf(s,
+ 				   "    rx_supp_poll enabled=%u calls=%lld completed=%lld\n",
+ 				   rail->path.rx_supp_poll_enabled,
+diff --git a/kernel/ring_diag.h b/kernel/ring_diag.h
+new file mode 100644
+index 0000000..f133a61
+--- /dev/null
++++ b/kernel/ring_diag.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef TBV_RING_DIAG_H
++#define TBV_RING_DIAG_H
++
++/* PCI NHI layout: Linux drivers/thunderbolt/nhi_regs.h. */
++static inline unsigned int tbv_diag_hw_index(unsigned int raw, int is_tx)
++{
++	return is_tx ? raw & 0xffffU : raw >> 16;
++}
++
++static inline unsigned int tbv_diag_desc_flags(unsigned int ctrl)
++{
++	return ctrl >> 20;
++}
++
++static inline unsigned int tbv_diag_e2e_hop(unsigned int options)
++{
++	return (options >> 12) & 0x7ffU;
++}
++
++#endif
+diff --git a/tests/ring_diag_test.c b/tests/ring_diag_test.c
+new file mode 100644
+index 0000000..6381888
+--- /dev/null
++++ b/tests/ring_diag_test.c
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#include <assert.h>
++#include "../kernel/ring_diag.h"
++
++int main(void)
++{
++	assert(tbv_diag_hw_index(0x1234abcdU, 1) == 0xabcdU);
++	assert(tbv_diag_hw_index(0x1234abcdU, 0) == 0x1234U);
++	assert(tbv_diag_desc_flags(0xabc12345U) == 0xabcU);
++	assert(tbv_diag_e2e_hop(0x10555000U) == 0x555U);
++	assert(tbv_diag_hw_index(0xffffffffU, 1) == 65535U);
++	assert(tbv_diag_hw_index(0, 0) == 0);
++	return 0;
++}

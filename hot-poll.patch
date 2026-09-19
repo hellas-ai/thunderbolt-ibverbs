@@ -1,0 +1,124 @@
+--- a/kernel/path.c	2026-09-11 19:27:33
++++ b/kernel/path.c	2026-09-11 19:24:42
+@@ -337,25 +337,22 @@
+ static int tx_progress_poll = -1;
+ module_param(tx_progress_poll, int, 0644);
+ MODULE_PARM_DESC(tx_progress_poll,
+-		 "Supplemental 1 ms TX completion polling: -1 auto (native only, default), 0 off, 1 on. Takes effect at the next path start; peers reports the resolved value as tx_poll enabled=");
++		 "Supplemental TX completion polling: -1 auto (native only, default), 0 off, 1 on (1 ms cadence), 2 HOT (delay-0 re-arm on the module's WQ_HIGHPRI workqueue while frames are in flight; bypasses the kernel kworker hop, burns a core while traffic flows). Takes effect at the next path start; peers reports the resolved value as tx_poll enabled=");
+ 
+ /*
+- * Supplemental RX completion polling. -1 = auto (default, unchanged for the
+- * Apple backend: native paths only), 0 = off everywhere, 1 = on everywhere.
++ * Supplemental RX completion polling. -1 = auto (default: native paths
++ * only), 0 = off, 1 = on (1 ms cadence), 2 = hot (see below).
+  * The RX ring is normally drained by the NHI interrupt; when that interrupt
+  * is lost, a completed frame strands in the ring -- the wire ACK is already
+- * out, so the sender never retransmits, and the receiver never delivers.
+- * Measured 2026-09-11: a UC pingpong froze permanently at exactly this shape
+- * (client send 13242 completed, server posted 13241 replies, no RNR, no dup,
+- * no error, both ends silent). The supp poll reaps such frames within
+- * TBV_RX_SUPP_POLL_DELAY_MS (1 ms) of the last TX post, for a 16 ms window.
+- * Apple stays off: its RX frames carry no per-message sequence and the verbs
+- * receive path there is order-sensitive (see the rx_supp_poll_enabled site).
++ * out, so the sender never retransmits and the receiver never delivers.
++ * The supp poll reaps such frames within TBV_RX_SUPP_POLL_DELAY_MS of the
++ * last TX post, for a 16 ms window. Apple stays off: its RX frames carry no
++ * per-message sequence and the verbs receive path there is order-sensitive.
+  */
+ static int rx_supp_poll = -1;
+ module_param(rx_supp_poll, int, 0644);
+ MODULE_PARM_DESC(rx_supp_poll,
+-		 "Supplemental RX completion polling: -1 auto (native only, default), 0 off, 1 on. Rescues RX frames whose completion interrupt was lost; takes effect at the next path start; peers reports the resolved value as rx_supp_poll enabled=");
++		 "Supplemental RX completion polling: -1 auto (native only, default), 0 off, 1 on (1 ms cadence), 2 HOT (delay-0 re-arm on the module's WQ_HIGHPRI workqueue, armed from both TX and RX; rescues lost completions AND bypasses the kernel kworker delivery hop, burns a core while traffic flows). Takes effect at the next path start; peers reports the resolved value as rx_supp_poll enabled=");
+ 
+ /*
+  * Placement of the TX post path.
+@@ -674,6 +671,28 @@
+ 	return path->rail->peer->backend == TBV_BACKEND_NATIVE;
+ }
+ 
++/*
++ * Mode 2 = HOT: re-arm with delay 0 so the poll runs continuously on the
++ * module's own WQ_HIGHPRI workqueue while traffic flows.
++ *
++ * This is the latency lever. Every received frame is normally delivered by
++ * the kernel's per-CPU "events" kworker (IRQ -> schedule_work -> ring_work),
++ * a NORMAL-priority hop that measures 9-13 us per delivery on this hardware
++ * -- measured 2026-09-11 as the dominant term in a ~13 us typical-vs-floor
++ * gap on ib_send_lat. A hot poller reaps completed descriptors from HIGHPRI
++ * context, bypassing that hop. It burns a core while traffic flows, is
++ * native-only by the same ordering argument as above, and is opt-in.
++ */
++static bool tbv_path_rx_supp_poll_hot(void)
++{
++	return READ_ONCE(rx_supp_poll) == 2;
++}
++
++static bool tbv_path_tx_poll_hot(void)
++{
++	return READ_ONCE(tx_progress_poll) == 2;
++}
++
+ static void tbv_path_queue_delayed_work(struct tbv_path *path,
+ 					struct delayed_work *work,
+ 					unsigned long delay)
+@@ -721,7 +740,8 @@
+ 
+ 	WRITE_ONCE(path->rx_supp_poll_until,
+ 		   jiffies + msecs_to_jiffies(TBV_RX_SUPP_POLL_WINDOW_MS));
+-	tbv_path_queue_delayed_work(path, &path->rx_supp_poll_work, delay);
++	tbv_path_queue_delayed_work(path, &path->rx_supp_poll_work,
++				    tbv_path_rx_supp_poll_hot() ? 0 : delay);
+ }
+ 
+ static void tbv_path_atomic64_max(atomic64_t *counter, u64 value)
+@@ -1378,6 +1398,7 @@
+ 
+ 	if (atomic_read(&path->tx_inflight) > 0 || completed)
+ 		tbv_path_queue_tx_poll(path,
++				       tbv_path_tx_poll_hot() ? 0 :
+ 				       msecs_to_jiffies(TBV_TX_POLL_DELAY_MS));
+ }
+ 
+@@ -1406,7 +1427,8 @@
+ 				     READ_ONCE(path->rx_supp_poll_until)))
+ 		tbv_path_queue_delayed_work(
+ 			path, &path->rx_supp_poll_work,
+-			msecs_to_jiffies(TBV_RX_SUPP_POLL_DELAY_MS));
++			tbv_path_rx_supp_poll_hot() ? 0 :
++				msecs_to_jiffies(TBV_RX_SUPP_POLL_DELAY_MS));
+ }
+ 
+ static int tbv_path_post_rx_frame(struct tbv_data_frame *f);
+@@ -1610,6 +1632,12 @@
+ 							       add_remote_credits);
+ 		}
+ 	}
++
++	/* Arm the hot poller from the RX path too: a receiver that never
++	 * transmits (a pure one-way stream) otherwise relies on the interrupt
++	 * path alone, because the poll is only armed after TX posts. */
++	if (tbv_path_rx_supp_poll_hot())
++		tbv_path_queue_rx_supp_poll(path, 0);
+ }
+ 
+ static int tbv_path_alloc_frames(struct tbv_path *path, bool tx)
+@@ -1937,11 +1965,12 @@
+ 
+ 	path->tx_poll_enabled = tbv_path_progress_poll_enabled(path);
+ 	/*
+-	 * RX completion source policy: see tbv_path_rx_supp_poll_enabled().
+-	 * Native-only auto by default; Apple stays single-sourced (its RX
+-	 * frames carry no per-message sequence number, so a second reaper
+-	 * could expose later frames to the Apple verbs receive queue before
+-	 * earlier ones).
++	 * RX frames for the Apple-compatible verbs path carry no per-message
++	 * sequence number. Processing the same RX ring from the normal
++	 * completion path and a supplemental poller can therefore expose later
++	 * frames to the verbs receive queue before earlier frames. Keep RX
++	 * completion single-sourced; TX polling is still used for timely send
++	 * completions.
+ 	 */
+ 	path->rx_supp_poll_enabled = tbv_path_rx_supp_poll_enabled(path);
+ 	path->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, rx_hop,

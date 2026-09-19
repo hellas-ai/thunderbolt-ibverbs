@@ -4,6 +4,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/thunderbolt.h>
@@ -11,7 +12,7 @@
 #include "../proto/native_data.h"
 #include "tbv.h"
 
-#define TBV_NATIVE_RING_SIZE 1024
+#define TBV_NATIVE_RING_SIZE 4096
 /* Apple-originated bursts can exhaust a 256-entry RX ring before credits
  * recycle. 1024 entries passed checked Mac-to-Linux UC bursts beyond one full
  * ring while keeping per-direction buffer cost modest.
@@ -41,6 +42,17 @@ extern int tb_ring_throttling(struct tb_ring *ring,
 			      unsigned int interval_nsec);
 
 static uint nhi_interrupt_throttle_ns;
+/*
+ * Native data credit-return batch. Upstream pins this policy constant in
+ * proto/native_data.h, which tools/ci/proto-smoke.c guards as wire contract;
+ * the measured fleet value (256) is +28-51% bandwidth at 64-256 KiB, but it
+ * is POLICY, not frame layout, so it lives here behind a param and the wire
+ * header keeps the upstream default. Takes effect at the next path start.
+ */
+static uint tbv_native_credit_batch = 32;
+module_param(tbv_native_credit_batch, uint, 0644);
+MODULE_PARM_DESC(tbv_native_credit_batch,
+		 "Native data credit return batch in frames; header default 32 keeps stock-peer compatibility (fleet runs 256, measured +28-51% at 64-256 KiB). Takes effect at the next path start");
 module_param(nhi_interrupt_throttle_ns, uint, 0644);
 MODULE_PARM_DESC(nhi_interrupt_throttle_ns,
 		 "NHI interrupt throttling interval for TBV data rings in ns; 0 disables ring throttling");
@@ -79,6 +91,93 @@ static bool apple_rx_raw_mode;
 module_param(apple_rx_raw_mode, bool, 0644);
 MODULE_PARM_DESC(apple_rx_raw_mode,
 		 "Compatibility no-op: Apple RAW RX is disabled because raw descriptor boundaries are not yet message-safe");
+
+static uint apple_tx_stall_fail_ms = 5000;
+module_param(apple_tx_stall_fail_ms, uint, 0644);
+MODULE_PARM_DESC(apple_tx_stall_fail_ms,
+		 "Apple-compatible TX path: no completion for this many ms with descriptors outstanding fails the connection (error CQEs, ring retirement barrier, rail quarantined); 0 warns only");
+
+/*
+ * Supplemental TX completion polling. -1 = auto (default, unchanged: native
+ * paths only, never Apple), 0 = off everywhere, 1 = on everywhere. The poll
+ * re-arms itself through a 1 ms jiffies delay, so it must never be the timely
+ * completion source on a path whose interrupts work; the lever exists so that
+ * claim can be settled by experiment without a rebuild.
+ */
+static int tx_progress_poll = -1;
+module_param(tx_progress_poll, int, 0644);
+MODULE_PARM_DESC(tx_progress_poll,
+		 "Supplemental TX completion polling: -1 auto (native only, default), 0 off, 1 on (1 ms cadence), 2 HOT (delay-0 re-arm on the module's WQ_HIGHPRI workqueue while frames are in flight; bypasses the kernel kworker hop, burns a core while traffic flows). Takes effect at the next path start; peers reports the resolved value as tx_poll enabled=");
+
+/*
+ * Supplemental RX completion polling. -1 = auto (default: native paths
+ * only), 0 = off, 1 = on (1 ms cadence), 2 = hot (see below).
+ * The RX ring is normally drained by the NHI interrupt; when that interrupt
+ * is lost, a completed frame strands in the ring -- the wire ACK is already
+ * out, so the sender never retransmits and the receiver never delivers.
+ * The supp poll reaps such frames within TBV_RX_SUPP_POLL_DELAY_MS of the
+ * last TX post, for a 16 ms window. Apple stays off: its RX frames carry no
+ * per-message sequence and the verbs receive path there is order-sensitive.
+ */
+static int rx_supp_poll = -1;
+module_param(rx_supp_poll, int, 0644);
+MODULE_PARM_DESC(rx_supp_poll,
+		 "Supplemental RX completion polling: -1 auto (native only, default), 0 off, 1 on (1 ms cadence), 2 HOT (delay-0 re-arm on the module's WQ_HIGHPRI workqueue, armed from both TX and RX; rescues lost completions AND bypasses the kernel kworker delivery hop, burns a core while traffic flows). Takes effect at the next path start; peers reports the resolved value as rx_supp_poll enabled=");
+
+/*
+ * Placement of the TX post path.
+ *
+ * What can be placed and what cannot, from the code:
+ *
+ *  - The REAP and CQ chain cannot be placed at all. The Apple NHI IRQ handler
+ *    (Asahi apple.c apple_cio_ring_irq) does schedule_work(&ring->work), so
+ *    ring_work() -- and therefore tbv_path_tx_complete() and the CQ push --
+ *    runs on system_percpu_wq on whatever CPU AIC2 delivered the interrupt to.
+ *    AIC2 has no per-IRQ steering: /proc/irq/N/smp_affinity_list is not
+ *    writable on this machine ("Operation not permitted"). Ring poll mode
+ *    (tb_ring's start_poll) would hand us the reap, but tb_ring_poll() never
+ *    calls ring_write_descriptors() -- only ring_work() and __tb_ring_enqueue()
+ *    do -- so a TX ring that filled would stall until the next enqueue. That is
+ *    not an acceptable data path, so poll mode is deliberately NOT used here.
+ *    peers reports tx_last_cb_cpu so where the interrupt lands is at least
+ *    observable.
+ *
+ *  - The POST path can be placed: tqp->apple_sq_work does the payload alloc,
+ *    the per-frame copy, the per-frame doorbell MMIO and the group waits.
+ *    Today it runs on state->workqueue, which is WQ_UNBOUND | WQ_HIGHPRI --
+ *    already high priority, so raising priority again would not be a change.
+ *    apply_workqueue_attrs() and alloc_workqueue_attrs() are not exported, so
+ *    an unbound workqueue cannot be pinned from a module; a BOUND (per-CPU)
+ *    WQ_HIGHPRI workqueue driven with queue_work_on() can.
+ *
+ * zeus topology for tx_worker_cpu: E-cores 0-3 and 12-15 (max 2.42 GHz),
+ * P-cores 4-11 and 16-23 (max 3.26 GHz, idle 702 MHz).
+ */
+static bool tx_worker_dedicated;
+module_param(tx_worker_dedicated, bool, 0644);
+MODULE_PARM_DESC(tx_worker_dedicated,
+		 "Run the Apple SQ post worker on a dedicated per-rail bounded WQ_HIGHPRI workqueue instead of the shared unbound device workqueue; default off (unchanged). Implied by tx_worker_cpu >= 0. Takes effect at the next path start");
+
+static int tx_worker_cpu = -1;
+module_param(tx_worker_cpu, int, 0644);
+MODULE_PARM_DESC(tx_worker_cpu,
+		 "Pin the dedicated Apple SQ post worker to this CPU; -1 = unset (default, unchanged). zeus: E-cores 0-3,12-15 (2.42 GHz max), P-cores 4-11,16-23 (3.26 GHz max, 702 MHz idle). This binds OUR worker only -- the ring interrupt and therefore the reap/CQ chain land wherever AIC2 puts them and cannot be steered");
+
+/*
+ * T2 of the stall ladder. Off by default: re-announcing the producer index is
+ * an experiment, not a documented recovery. It is admissible only because it
+ * is idempotent (see tbv_path_tx_rekick_producer), and it is counted so we can
+ * measure whether it ever precedes a real recovery instead of believing it.
+ */
+static bool apple_tx_stall_rekick;
+module_param(apple_tx_stall_rekick, bool, 0644);
+MODULE_PARM_DESC(apple_tx_stall_rekick,
+		 "Stall ladder T2 (EXPERIMENT, default off): once per stall episode, re-announce the TX ring producer index. Idempotent -- it re-writes the index the hardware should already hold, so it cannot post, reorder or duplicate a descriptor. peers reports tx_stall_recovered_by rekick=");
+
+static uint apple_tx_stall_rekick_ms = 2000;
+module_param(apple_tx_stall_rekick_ms, uint, 0644);
+MODULE_PARM_DESC(apple_tx_stall_rekick_ms,
+		 "Milliseconds without a TX retirement before the T2 producer re-kick fires; must sit between the 1000 ms warn and apple_tx_stall_fail_ms. 0 disables T2");
 
 static uint native_tx_max_inflight = TBV_DATA_TX_MAX_INFLIGHT;
 module_param(native_tx_max_inflight, uint, 0644);
@@ -272,6 +371,52 @@ static bool tbv_path_progress_poll_enabled(const struct tbv_path *path)
 	return path->rail->peer->backend == TBV_BACKEND_NATIVE;
 }
 
+static bool tbv_path_rx_supp_poll_enabled(const struct tbv_path *path)
+{
+	int mode = READ_ONCE(rx_supp_poll);
+
+	if (!path->rail || !path->rail->peer)
+		return false;
+
+	if (mode == 0)
+		return false;
+	if (mode > 0)
+		return true;
+
+	/*
+	 * Auto (default): Apple RX frames carry no per-message sequence number
+	 * and the Apple verbs receive path is order-sensitive, so the Apple
+	 * backend keeps RX completion single-sourced. Native frames carry PSNs
+	 * and the native receive path serializes on the QP rx_lock, so the
+	 * supplemental poll is safe there -- and it is the only recovery for a
+	 * frame the NHI completed but never signalled. peers reports the
+	 * resolved value as "rx_supp_poll enabled=".
+	 */
+	return path->rail->peer->backend == TBV_BACKEND_NATIVE;
+}
+
+/*
+ * Mode 2 = HOT: re-arm with delay 0 so the poll runs continuously on the
+ * module's own WQ_HIGHPRI workqueue while traffic flows.
+ *
+ * This is the latency lever. Every received frame is normally delivered by
+ * the kernel's per-CPU "events" kworker (IRQ -> schedule_work -> ring_work),
+ * a NORMAL-priority hop that measures 9-13 us per delivery on this hardware
+ * -- measured 2026-09-11 as the dominant term in a ~13 us typical-vs-floor
+ * gap on ib_send_lat. A hot poller reaps completed descriptors from HIGHPRI
+ * context, bypassing that hop. It burns a core while traffic flows, is
+ * native-only by the same ordering argument as above, and is opt-in.
+ */
+static bool tbv_path_rx_supp_poll_hot(void)
+{
+	return READ_ONCE(rx_supp_poll) == 2;
+}
+
+static bool tbv_path_tx_poll_hot(void)
+{
+	return READ_ONCE(tx_progress_poll) == 2;
+}
+
 static void tbv_path_queue_delayed_work(struct tbv_path *path,
 					struct delayed_work *work,
 					unsigned long delay)
@@ -300,7 +445,8 @@ static void tbv_path_queue_rx_supp_poll(struct tbv_path *path,
 
 	WRITE_ONCE(path->rx_supp_poll_until,
 		   jiffies + msecs_to_jiffies(TBV_RX_SUPP_POLL_WINDOW_MS));
-	tbv_path_queue_delayed_work(path, &path->rx_supp_poll_work, delay);
+	tbv_path_queue_delayed_work(path, &path->rx_supp_poll_work,
+				    tbv_path_rx_supp_poll_hot() ? 0 : delay);
 }
 
 static void tbv_path_atomic64_max_ms(atomic64_t *counter, u64 value)
@@ -331,12 +477,34 @@ static u32 tbv_path_data_credit_window(u32 rx_ring_size)
 	else
 		credits = rx_ring_size - TBV_DATA_CREDIT_CONTROL_RESERVE;
 
-	if (credits > TBV_NATIVE_DATA_CREDIT_BATCH)
-		credits -= credits % TBV_NATIVE_DATA_CREDIT_BATCH;
+	if (credits > tbv_native_credit_batch)
+		credits -= credits % tbv_native_credit_batch;
 	if (!credits)
 		credits = 1;
 
 	return credits;
+}
+
+/* path.c-local forms of the proto/native_data.h helpers, parametrized by
+ * tbv_native_credit_batch: the header's inline versions stay pinned to the
+ * upstream wire-contract constant for userspace (tools/ci/proto-smoke.c).
+ */
+static u32 tbv_path_credit_return_threshold(u32 credit_window)
+{
+	if (credit_window && credit_window < tbv_native_credit_batch)
+		return credit_window;
+	return tbv_native_credit_batch;
+}
+
+static u32 tbv_path_start_credit_required(u32 frames, u32 credit_window)
+{
+	u32 threshold;
+
+	if (!frames)
+		return 0;
+
+	threshold = tbv_path_credit_return_threshold(credit_window);
+	return frames < threshold ? frames : threshold;
 }
 
 void tbv_path_set_remote_rx_capacity(struct tbv_path *path, u32 rx_ring_size)
@@ -421,7 +589,7 @@ static void tbv_path_return_rx_data_credit(struct tbv_path *path, u32 credits)
 		return;
 
 	state = tbv_path_state(path);
-	threshold = tbv_native_data_credit_return_threshold(
+	threshold = tbv_path_credit_return_threshold(
 		tbv_path_data_credit_window(path->cfg.rx_ring_size));
 	spin_lock_irqsave(&path->tx_lock, flags);
 	pending = path->rx_data_credit_pending;
@@ -719,6 +887,7 @@ static void tbv_path_tx_poll_work(struct work_struct *work)
 
 	if (atomic_read(&path->tx_inflight) > 0 || completed)
 		tbv_path_queue_tx_poll(path,
+				       tbv_path_tx_poll_hot() ? 0 :
 				       msecs_to_jiffies(TBV_TX_POLL_DELAY_MS));
 }
 
@@ -747,7 +916,8 @@ static void tbv_path_rx_supp_poll_work(struct work_struct *work)
 				     READ_ONCE(path->rx_supp_poll_until)))
 		tbv_path_queue_delayed_work(
 			path, &path->rx_supp_poll_work,
-			msecs_to_jiffies(TBV_RX_SUPP_POLL_DELAY_MS));
+			tbv_path_rx_supp_poll_hot() ? 0 :
+				msecs_to_jiffies(TBV_RX_SUPP_POLL_DELAY_MS));
 }
 
 static int tbv_path_post_rx_frame(struct tbv_data_frame *f);
@@ -948,6 +1118,12 @@ static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 							       add_remote_credits);
 		}
 	}
+
+	/* Arm the hot poller from the RX path too: a receiver that never
+	 * transmits (a pure one-way stream) otherwise relies on the interrupt
+	 * path alone, because the poll is only armed after TX posts. */
+	if (tbv_path_rx_supp_poll_hot())
+		tbv_path_queue_rx_supp_poll(path, 0);
 }
 
 static int tbv_path_alloc_frames(struct tbv_path *path, bool tx)
@@ -1231,7 +1407,7 @@ int tbv_path_alloc_rings(struct tbv_path *path, struct tb_xdomain *xd,
 	 * completion single-sourced; TX polling is still used for timely send
 	 * completions.
 	 */
-	path->rx_supp_poll_enabled = false;
+	path->rx_supp_poll_enabled = tbv_path_rx_supp_poll_enabled(path);
 	path->rx_ring = tb_ring_alloc_rx(xd->tb->nhi, rx_hop,
 					 path->cfg.rx_ring_size,
 					 path->cfg.rx_flags, e2e_tx_hop,
@@ -1288,6 +1464,52 @@ err_in_hop:
 	return ret;
 }
 
+/*
+ * Apple NHI interrupt throttle (0xd004c, 256 ns units).
+ *
+ * The stock/Intel register (0x38c00) is programmed through
+ * tb_ring_throttling(), and MUST NOT be written on an Apple NHI -- the register
+ * lives elsewhere there. On Apple hardware the kernel's own ring activation
+ * writes it: apple_nhi_ring_interrupt_active() programs
+ * APPLE_CIO_NHI_IRQ_THROTTLE from ring->interval_nsec, and SKIPS the write
+ * when that field is zero. A zero module parameter therefore proves nothing
+ * was written, and the register keeps whatever it held -- 255 * 256 ns =
+ * 65.28 us on the machine this was measured on, visible as a latency floor
+ * that does not move with message size (2 B through 4 KB all ~65.3 us,
+ * ib_send_lat across a USB4 link).
+ *
+ * This module never set ring->interval_nsec, so on an Apple NHI the throttle
+ * was silently skipped forever. This applies to every ring on an Apple NHI --
+ * including native-backend rings toward a Linux peer -- because the NHI is
+ * Apple's regardless of who is on the other end of the cable.
+ */
+static bool tbv_host_is_apple(void)
+{
+	return of_machine_is_compatible("apple,arm-platform");
+}
+
+static void tbv_path_apply_ring_interval(struct tbv_path *path)
+{
+#ifdef TBV_HAVE_RING_INTERVAL_NSEC
+	unsigned int interval = READ_ONCE(nhi_interrupt_throttle_ns);
+	u32 before, after;
+
+	if (!interval || !tbv_host_is_apple())
+		return;
+
+	if (!path->tx_ring || !path->rx_ring)
+		return;
+
+	before = path->tx_ring->interval_nsec;
+	WRITE_ONCE(path->tx_ring->interval_nsec, interval);
+	WRITE_ONCE(path->rx_ring->interval_nsec, interval);
+	after = path->tx_ring->interval_nsec;
+
+	pr_info("apple ring throttle: interval_nsec %u -> %u ns (kernel programs it at activation)\n",
+		before, after);
+#endif
+}
+
 int tbv_path_start_rings(struct tbv_path *path)
 {
 	u32 i;
@@ -1295,6 +1517,10 @@ int tbv_path_start_rings(struct tbv_path *path)
 
 	if (path->state != TBV_PATH_RING_ALLOCATED)
 		return -EINVAL;
+
+	/* Must be set before activation: the kernel reads ring->interval_nsec
+	 * when it programs the Apple NHI throttle register. */
+	tbv_path_apply_ring_interval(path);
 
 	tb_ring_start(path->tx_ring);
 	tb_ring_start(path->rx_ring);
@@ -1779,7 +2005,7 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		old_start_credit_group_frames = packet->start_credit_group_frames;
 		if (!packet->control && path->tx_remote_data_credit_max) {
 			u32 start_credit_required =
-				tbv_native_data_start_credit_required(
+				tbv_path_start_credit_required(
 					packet->start_credit_group_frames,
 					path->tx_remote_data_credit_max);
 
