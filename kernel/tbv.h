@@ -220,6 +220,9 @@ struct tbv_path {
 	atomic64_t data_rx_credit_send_error;
 	atomic64_t data_rx_repost_failed;
 	atomic64_t data_rx_lost;
+	/* Frame bytes, headers included, of every frame this path moved. */
+	atomic64_t tx_bytes;
+	atomic64_t rx_bytes;
 	atomic64_t tx_poll_calls;
 	atomic64_t tx_poll_completed;
 	atomic64_t rx_supp_poll_calls;

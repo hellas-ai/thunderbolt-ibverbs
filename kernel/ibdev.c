@@ -2357,6 +2357,59 @@ static int tbv_query_device(struct ib_device *ibdev,
 	return 0;
 }
 
+/*
+ * Per-rail traffic as RDMA port counters, readable by anyone under
+ * /sys/class/infiniband/<dev>/ports/1/hw_counters/ and with rdma statistic.
+ */
+enum tbv_hw_stat {
+	TBV_HW_STAT_TX_BYTES,
+	TBV_HW_STAT_RX_BYTES,
+	TBV_HW_STAT_TX_FRAMES,
+	TBV_HW_STAT_RX_FRAMES,
+	TBV_HW_STAT_RX_LOST_FRAMES,
+};
+
+static const struct rdma_stat_desc tbv_hw_stat_descs[] = {
+	[TBV_HW_STAT_TX_BYTES] = { .name = "tx_bytes" },
+	[TBV_HW_STAT_RX_BYTES] = { .name = "rx_bytes" },
+	[TBV_HW_STAT_TX_FRAMES] = { .name = "tx_frames" },
+	[TBV_HW_STAT_RX_FRAMES] = { .name = "rx_frames" },
+	[TBV_HW_STAT_RX_LOST_FRAMES] = { .name = "rx_lost_frames" },
+};
+
+static struct rdma_hw_stats *tbv_alloc_hw_port_stats(struct ib_device *ibdev,
+						     u32 port_num)
+{
+	return rdma_alloc_hw_stats_struct(tbv_hw_stat_descs,
+					  ARRAY_SIZE(tbv_hw_stat_descs),
+					  RDMA_HW_STATS_DEFAULT_LIFESPAN);
+}
+
+static int tbv_get_hw_stats(struct ib_device *ibdev,
+			    struct rdma_hw_stats *stats, u32 port, int index)
+{
+	struct tbv_ibdev *dev = container_of(ibdev, struct tbv_ibdev, base);
+	struct tbv_rail *rail = READ_ONCE(dev->rail);
+	struct tbv_path *path;
+
+	if (!rail) {
+		memset(stats->value, 0,
+		       sizeof(stats->value[0]) * stats->num_counters);
+		return stats->num_counters;
+	}
+	path = &rail->path;
+	stats->value[TBV_HW_STAT_TX_BYTES] = atomic64_read(&path->tx_bytes);
+	stats->value[TBV_HW_STAT_RX_BYTES] = atomic64_read(&path->rx_bytes);
+	stats->value[TBV_HW_STAT_TX_FRAMES] =
+		atomic64_read(&path->data_tx_posted) +
+		atomic64_read(&path->control_tx_posted);
+	stats->value[TBV_HW_STAT_RX_FRAMES] =
+		atomic64_read(&path->data_rx_completed);
+	stats->value[TBV_HW_STAT_RX_LOST_FRAMES] =
+		atomic64_read(&path->data_rx_lost);
+	return stats->num_counters;
+}
+
 static int tbv_query_port(struct ib_device *ibdev, u32 port_num,
 			  struct ib_port_attr *attr)
 {
@@ -9903,6 +9956,8 @@ static const struct ib_device_ops tbv_ibdev_ops = {
 
 	.query_device = tbv_query_device,
 	.query_port = tbv_query_port,
+	.alloc_hw_port_stats = tbv_alloc_hw_port_stats,
+	.get_hw_stats = tbv_get_hw_stats,
 	.query_gid = tbv_query_gid,
 	.query_pkey = tbv_query_pkey,
 	.get_port_immutable = tbv_get_port_immutable,

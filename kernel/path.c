@@ -908,6 +908,7 @@ static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 	if (state)
 		atomic64_inc(&state->data_rx_completed);
 	atomic64_inc(&path->data_rx_completed);
+	atomic64_add(len, &path->rx_bytes);
 
 	dma_sync_single_for_cpu(tb_ring_dma_device(ring), f->dma,
 				TBV_DATA_FRAME_SIZE, DMA_FROM_DEVICE);
@@ -1744,6 +1745,8 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		u32 old_raw_stream_inflight;
 		bool charged_data_credit;
 		bool seq_assigned;
+		bool tx_control;
+		u32 tx_len;
 		bool from_control_queue;
 		u32 old_start_credit_group_frames;
 		int ret;
@@ -1879,11 +1882,14 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 			packet->inflight = true;
 			spin_unlock_irqrestore(&path->tx_lock, flags);
 
+			/* The completion may free the packet before we count it. */
+			tx_len = packet->len;
 			ret = tb_ring_tx(path->tx_ring, &packet->frame);
 			if (!ret) {
 				if (state)
 					atomic64_inc(&state->data_tx_posted);
 				atomic64_inc(&path->data_tx_posted);
+				atomic64_add(tx_len, &path->tx_bytes);
 				tbv_path_queue_tx_poll(path, 0);
 				tbv_path_queue_rx_supp_poll(
 					path,
@@ -1956,14 +1962,17 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 					   f->dma, TBV_DATA_FRAME_SIZE,
 					   DMA_TO_DEVICE);
 
+		tx_len = packet->len;
+		tx_control = packet->control;
 		ret = tb_ring_tx(path->tx_ring, &f->frame);
 		if (!ret) {
 			if (state)
 				atomic64_inc(&state->data_tx_posted);
-			if (packet->control)
+			if (tx_control)
 				atomic64_inc(&path->control_tx_posted);
 			else
 				atomic64_inc(&path->data_tx_posted);
+			atomic64_add(tx_len, &path->tx_bytes);
 			tbv_path_queue_tx_poll(path, 0);
 			tbv_path_queue_rx_supp_poll(
 				path,
