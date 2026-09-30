@@ -211,7 +211,7 @@ static int parse_opts(int argc, char **argv, struct opts *o)
 	if (!strcmp(o->role, "send") && !o->connect_host)
 		return -1;
 	if (!o->slots || !o->depth || o->depth > o->slots ||
-	    o->max_size < 4096 || o->max_size > (16u << 20))
+	    o->max_size < 4096 || o->max_size > (64u << 20))
 		return -1;
 	return 0;
 }
@@ -389,15 +389,17 @@ static int run_recv(const struct opts *o, int fd, struct ibv_qp *qp,
 			return -1;
 
 		n = ibv_poll_cq(cq, 1, &wc);
-		if (n < 0)
+		if (n < 0) {
+			fprintf(stderr, "ibv_poll_cq failed: %d\n", n);
 			return -1;
+		}
 		if (!n)
 			continue;
 		if (wc.status != IBV_WC_SUCCESS ||
 		    wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM ||
 		    !(wc.wc_flags & IBV_WC_WITH_IMM)) {
-			fprintf(stderr, "bad recv wc status=%d opcode=%d flags=0x%x\n",
-				wc.status, wc.opcode, wc.wc_flags);
+			fprintf(stderr, "bad recv wc status=%d opcode=%d flags=0x%x after %u messages\n",
+				wc.status, wc.opcode, wc.wc_flags, next);
 			return -1;
 		}
 
@@ -455,8 +457,11 @@ static int run_send(const struct opts *o, int fd, struct ibv_qp *qp,
 		int n;
 
 		while (poll(&pfd, 1, 0) > 0) {
-			if (recv_all(fd, &checked, sizeof(checked)))
+			if (recv_all(fd, &checked, sizeof(checked))) {
+				fprintf(stderr, "receiver closed the connection after %u checked, %u posted, %u completed\n",
+					checked, posted, completed);
 				return -1;
+			}
 		}
 		if (stop && completed == posted)
 			break;
@@ -492,8 +497,10 @@ static int run_send(const struct opts *o, int fd, struct ibv_qp *qp,
 		}
 
 		n = ibv_poll_cq(cq, 1, &wc);
-		if (n < 0)
+		if (n < 0) {
+			fprintf(stderr, "ibv_poll_cq failed: %d\n", n);
 			return -1;
+		}
 		if (!n)
 			continue;
 		if (wc.status != IBV_WC_SUCCESS || wc.wr_id != completed) {
