@@ -3122,7 +3122,17 @@ static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 	if (!complete)
 		return false;
 
-	tbv_cancel_send_ctx_packets(send);
+	/*
+	 * Error, timeout and flush paths cancel before completing. A native send
+	 * that succeeded without retransmission has no packet left in a path's
+	 * software queue: the peer acknowledged each fragment, so each was
+	 * dequeued and sent exactly once. Frames still on a ring hold their own
+	 * send reference. Skip the cancel walk then; it scans the whole path
+	 * queue and every ring slot under the path's TX lock.
+	 */
+	if (status || send->retries || send->rnr_retries ||
+	    tbv_qp_uses_apple_transport(tqp))
+		tbv_cancel_send_ctx_packets(send);
 	tbv_apple_sq_release_slot(send);
 
 	if (send->apple_window_acquired) {
