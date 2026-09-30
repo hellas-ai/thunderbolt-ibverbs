@@ -460,7 +460,7 @@ static int tbv_service_probe(struct tb_service *svc,
 			goto err_remove_rail;
 		}
 
-		pr_info("allocated rings service id=%d native_lane=%u tx_hop=%d rx_hop=%d out_hop=%d\n",
+		pr_debug("allocated rings service id=%d native_lane=%u tx_hop=%d rx_hop=%d out_hop=%d\n",
 			svc->id, backend == TBV_BACKEND_NATIVE ? native_lane : 0,
 			rail->path.tx_ring->hop,
 			rail->path.rx_ring->hop,
@@ -471,7 +471,7 @@ static int tbv_service_probe(struct tb_service *svc,
 			if (ret)
 				goto err_remove_rail;
 
-			pr_info("started rings service id=%d native_lane=%u tx_hop=%d rx_hop=%d\n",
+			pr_debug("started rings service id=%d native_lane=%u tx_hop=%d rx_hop=%d\n",
 				svc->id,
 				backend == TBV_BACKEND_NATIVE ? native_lane : 0,
 				rail->path.tx_ring->hop,

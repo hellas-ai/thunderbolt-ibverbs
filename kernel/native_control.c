@@ -424,7 +424,7 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 		ret = tbv_native_control_apply_ack(state, source_xd, &info,
 						   &remote);
 		if (!ret)
-			pr_info("native HELLO_ACK received route=0x%llx rail=0x%x remote_out=%u remote_tx=%u remote_rx=%u\n",
+			pr_debug("native HELLO_ACK received route=0x%llx rail=0x%x remote_out=%u remote_tx=%u remote_rx=%u\n",
 				info.route, remote.rail_id,
 				remote.transmit_path, remote.tx_hop,
 				remote.rx_hop);
@@ -469,7 +469,7 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 		ret = tbv_native_control_mark_remote_ready(state, source_xd,
 							  &info, &remote);
 		if (!ret)
-			pr_info("native READY received route=0x%llx rail=0x%x\n",
+			pr_debug("native READY received route=0x%llx rail=0x%x\n",
 				info.route, remote.rail_id);
 
 		ret = tbv_native_wire_build_hello(reply, sizeof(reply),
@@ -511,7 +511,7 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 	ret = tbv_native_control_apply_remote(state, source_xd, &info,
 					      &remote, true);
 	if (!ret)
-		pr_info("native HELLO received route=0x%llx rail=0x%x remote_out=%u remote_tx=%u remote_rx=%u\n",
+		pr_debug("native HELLO received route=0x%llx rail=0x%x remote_out=%u remote_tx=%u remote_rx=%u\n",
 			info.route, remote.rail_id, remote.transmit_path,
 			remote.tx_hop, remote.rx_hop);
 
@@ -527,7 +527,7 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 		pr_warn("native HELLO_ACK route=0x%llx failed: %d\n",
 			info.route, ret);
 	else
-		pr_info("native HELLO_ACK route=0x%llx rail=0x%x tx_hop=%u rx_hop=%u out_hop=%u\n",
+		pr_debug("native HELLO_ACK route=0x%llx rail=0x%x tx_hop=%u rx_hop=%u out_hop=%u\n",
 			info.route, local.rail_id, local.tx_hop,
 			local.rx_hop, local.transmit_path);
 
@@ -593,7 +593,7 @@ static int tbv_native_control_exchange_once(struct tbv_state *state,
 	if (ret)
 		goto out_unlock;
 
-	pr_info("native HELLO negotiated route=0x%llx rail=0x%x remote_out=%u remote_tx=%u remote_rx=%u attempt=%u\n",
+	pr_debug("native HELLO negotiated route=0x%llx rail=0x%x remote_out=%u remote_tx=%u remote_rx=%u attempt=%u\n",
 		info.route, remote.rail_id, remote.transmit_path,
 		remote.tx_hop, remote.rx_hop, attempt);
 out_unlock:
@@ -653,7 +653,7 @@ static int tbv_native_control_ready_once(struct tbv_state *state,
 	if (ret)
 		goto out_unlock;
 
-	pr_info("native READY sent route=0x%llx rail=0x%x\n",
+	pr_debug("native READY sent route=0x%llx rail=0x%x\n",
 		info.route, rail->rail_id);
 out_unlock:
 	mutex_unlock(&peer->control_lock);
@@ -760,7 +760,7 @@ static void tbv_native_control_work(struct work_struct *work)
 			goto out;
 		}
 
-		pr_info("enabled tunnel route=0x%llx rail=0x%x out_hop=%d remote_out_hop=%d tx_hop=%d rx_hop=%d\n",
+		pr_debug("enabled tunnel route=0x%llx rail=0x%x out_hop=%d remote_out_hop=%d tx_hop=%d rx_hop=%d\n",
 			rail->key.route, rail->rail_id,
 			rail->path.local_transmit_path,
 			rail->remote_transmit_path,

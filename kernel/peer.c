@@ -145,7 +145,7 @@ struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
 		mutex_unlock(&state->lock);
 		tb_xdomain_put(peer->xd);
 		kfree(peer);
-		pr_info("peer %u reused backend=%s refs=%u\n", pos->peer_id,
+		pr_debug("peer %u reused backend=%s refs=%u\n", pos->peer_id,
 			tbv_backend_name(backend), refcount_read(&pos->refcnt));
 		return pos;
 	}

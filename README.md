@@ -392,6 +392,10 @@ nhi_interrupt_throttle_ns=<ns>
 
 Run `make -C kernel help` for the full parameter list.
 
+Each rail's connection steps (HELLO, READY, rings, tunnel) log at debug
+level; load with `dyndbg=+p` to see them, which also works where kernel
+lockdown (Secure Boot) blocks `/sys/kernel/debug/dynamic_debug/control`.
+
 ### One QP across rails
 
 By default a QP's data stays on one rail, so an application that uses a
