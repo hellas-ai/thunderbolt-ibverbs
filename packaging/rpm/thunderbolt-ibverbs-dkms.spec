@@ -51,6 +51,12 @@ fi
 /usr/src/%{modname}-%{version}/*
 
 %changelog
+* Wed Sep 30 2026 Sven Neuhaus <neuhaus@users.noreply.github.com> - 0.4.0-1
+- v0.4.0: stripe one QP's RDMA WRITEs across every rail to a host
+  (native_write_striping), use several cables to one host, refund the
+  credits of lost frames, send each ACK on one rail, and speed up the
+  native data path.
+
 * Tue Jun 16 2026 George Whewell <george@hellas.ai> - 0.3.4-1
 - v0.3.4: improve Apple TX window admission sharing, minimal login
   cadence, and uc_oneway queue-depth handling.
