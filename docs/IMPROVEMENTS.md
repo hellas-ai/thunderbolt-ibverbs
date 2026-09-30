@@ -52,6 +52,13 @@ InfiniBand link (ConnectX-3, PCIe 3.0 x4), decode at 95 %.
   in a hash table instead of a list walk under the receive lock. With deep
   send queues the rails drift apart, the list grew long, and the receive
   workers blocked each other (26 instead of 44 Gbit/s).
+- **One ACK per message.** Every OK ACK went out on all rails, as a guard
+  against lost ACKs. ACKs are control frames, which take no data credit, so
+  at high message rates four per message overran the peer's RX rings and
+  dropped data frames: bidirectional 4 KiB WRITEs lost hundreds of frames
+  per second and failed. With the ACK on the rail the message arrived on no
+  frame was lost in the same tests, and small messages got faster (4 KiB
+  both ways 7.9 to 13.3 Gbit/s, 64 KiB both ways 46 to 59 Gbit/s).
 - **Memory region page index.** Copies into and out of a memory region
   looked up their offset by walking the scatterlist from the start, which
   grew with the offset; a page array makes it constant.
@@ -92,9 +99,6 @@ InfiniBand link (ConnectX-3, PCIe 3.0 x4), decode at 95 %.
   retries exceeded.
 - SENDs above 512 KiB fail with write striping enabled, which turns on the
   existing fragment striping for SENDs.
-- Frames still get lost under bidirectional or SEND-heavy load (thousands
-  per minute), probably when control frames, which take no credit, overflow
-  an RX ring; each loss costs a retransmission timeout.
 - A single READ stream stays on one rail (about 10 Gbit/s).
 - Sends are still copied once into frames; zero-copy from the memory
   region's pages is the next step.
