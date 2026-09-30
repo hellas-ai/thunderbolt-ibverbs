@@ -222,6 +222,25 @@ by bus path (`rocep...`), but the `usb4_rdma` provider finds its devices by
 name. Copy the rule to `/etc/udev/rules.d/` and exclude them:
 `KERNEL!="hfi1*", KERNEL!="usb4_rdma*", PROGRAM="rdma_rename %k NAME_FALLBACK"`.
 
+## Checking the link speed
+
+Each rail can only be as fast as its link, and USB4 links do not always train
+at full speed. Check both ends after plugging in or booting:
+
+```sh
+for d in /sys/bus/thunderbolt/devices/*-*; do
+  [ -e "$d/rx_speed" ] && echo "$(basename "$d") rx $(cat "$d/rx_speed") x $(cat "$d/rx_lanes")" \
+    "tx $(cat "$d/tx_speed") x $(cat "$d/tx_lanes")"
+done
+```
+
+A full-speed USB4 40 Gb/s link shows `20.0 Gb/s` on 2 lanes each way; a
+link that trained down shows `10.0 Gb/s`, or 1 lane. Between two Strix Halo
+hosts, links came up at 10 Gb/s per lane after boot or the first plug more
+than once, and trained at 20 Gb/s after unplugging and plugging the cable
+again. `nix run .#tbv-perftest` checks this before a run with
+`--expect-speed 20Gb/s`.
+
 ## Build Without DKMS
 
 For a one-off build against the running kernel:
