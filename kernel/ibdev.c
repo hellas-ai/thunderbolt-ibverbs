@@ -6339,46 +6339,6 @@ static int tbv_send_control_frame_on_path(struct tbv_qp *tqp,
 	return -ENOTCONN;
 }
 
-static int tbv_send_control_frame_on_all_native_paths(struct tbv_qp *tqp,
-						      struct tbv_path *rx_path,
-						      const void *frame,
-						      u32 len)
-{
-	struct tbv_path *paths[TBV_NATIVE_MAX_DATA_PATHS] = {};
-	struct tbv_state *state;
-	u32 path_count;
-	u32 i;
-	int first_ret = -ENOTCONN;
-	bool sent = false;
-
-	if (!tqp || !tqp->rail || tqp->rail->peer->backend != TBV_BACKEND_NATIVE)
-		return tbv_send_control_frame_on_path(tqp, rx_path, frame, len);
-
-	state = tqp->owner;
-	mutex_lock(&state->lock);
-	path_count = tbv_collect_native_data_paths_for_qp_locked(
-		tqp, paths, ARRAY_SIZE(paths));
-	mutex_unlock(&state->lock);
-
-	if (!path_count)
-		return -ENOTCONN;
-
-	for (i = 0; i < path_count; i++) {
-		int ret = tbv_path_send(paths[i], frame, len,
-					TBV_PATH_SEND_CONTROL, NULL, NULL);
-
-		if (!ret) {
-			sent = true;
-			continue;
-		}
-		if (first_ret == -ENOTCONN)
-			first_ret = ret;
-	}
-
-	tbv_release_path_refs(paths, path_count);
-	return sent ? 0 : first_ret;
-}
-
 static int tbv_send_ack_on_path(struct tbv_qp *tqp,
 				struct tbv_path *rx_path, u32 dest_qp,
 				u32 src_qp, u32 psn, int status)
@@ -6399,16 +6359,12 @@ static int tbv_send_ack_on_path(struct tbv_qp *tqp,
 		return len;
 
 	/*
-	 * OK SEND ACKs are idempotent, and a lost ACK forces the peer to
-	 * retransmit the whole SEND. On native multi-rail peers, put OK ACKs
-	 * on every live rail; non-OK ACKs stay single-path to preserve their
-	 * existing retry/error timing.
+	 * One ACK, on the path the message arrived on. Copies on every rail
+	 * guarded against lost ACKs but caused the losses: control frames take
+	 * no data credit, and at high message rates four ACKs per message
+	 * overran the peer's RX rings, dropping data frames along with them.
 	 */
-	if (status == TBV_NATIVE_SEND_ACK_OK)
-		ret = tbv_send_control_frame_on_all_native_paths(tqp, rx_path,
-								frame, len);
-	else
-		ret = tbv_send_control_frame_on_path(tqp, rx_path, frame, len);
+	ret = tbv_send_control_frame_on_path(tqp, rx_path, frame, len);
 	if (tqp && tqp->owner) {
 		if (ret)
 			atomic64_inc(&tqp->owner->data_tx_ack_send_error);
