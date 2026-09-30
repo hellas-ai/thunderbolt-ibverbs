@@ -307,6 +307,13 @@ struct tbv_peer {
 	struct mutex control_lock;
 	u32 native_qp_rr_rail_id;
 	u32 nr_rails;
+	/*
+	 * Host identity the remote side sent in native control (protected by
+	 * state->lock). Peers with the same one are links to the same host,
+	 * and a QP may spread data over the rails of all of them.
+	 */
+	u8 remote_host_id[16];
+	bool remote_host_known;
 };
 
 static inline bool tbv_rail_data_ready(const struct tbv_rail *rail)
@@ -462,6 +469,12 @@ struct tbv_state {
 	bool verbs_registered;
 	bool native_control_registered;
 	bool native_control_source_aware;
+	/*
+	 * Native control messages name their source link and host, so links
+	 * are told apart even by a source-blind XDomain handler.
+	 */
+	bool native_control_ids;
+	u8 native_host_id[16];
 	bool native_legacy_multicable_warned;
 	bool apple_rails_wait_tbnet;
 	bool apple_rails_pending;

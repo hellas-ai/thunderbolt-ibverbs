@@ -33,8 +33,9 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "native_same_peer_multicable: %s\n",
 		   !state->cfg.native_enabled ||
 		   !state->native_control_registered ? "off" :
-		   state->native_control_source_aware ? "enabled" :
-						       "limited");
+		   state->native_control_source_aware ||
+		   state->native_control_ids ? "enabled" : "limited");
+	seq_printf(s, "native_host_id: %16phN\n", state->native_host_id);
 	seq_printf(s, "native_legacy_ambiguous_limited: %lld\n",
 		   atomic64_read(&state->native_legacy_ambiguous_limited));
 	seq_printf(s, "configured_links: %u\n", tbv_link_count(state));
@@ -398,9 +399,12 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 	list_for_each_entry(peer, &state->peers, node) {
 		struct tbv_rail *rail;
 
-		seq_printf(s, "peer %u backend=%s rails=%u native_qp_rr_rail_id=%u\n",
+		seq_printf(s, "peer %u backend=%s rails=%u native_qp_rr_rail_id=%u domain=%d remote_host=%16phN\n",
 			   peer->peer_id, tbv_backend_name(peer->backend),
-			   peer->nr_rails, peer->native_qp_rr_rail_id);
+			   peer->nr_rails, peer->native_qp_rr_rail_id,
+			   peer->xd && peer->xd->tb ? peer->xd->tb->index : -1,
+			   peer->remote_host_known ? peer->remote_host_id :
+			   (const u8[16]){ 0 });
 
 		list_for_each_entry(rail, &peer->rails, node) {
 			bool service_ready;

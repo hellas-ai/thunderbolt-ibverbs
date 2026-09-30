@@ -5,6 +5,7 @@
 #include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
+#include <linux/random.h>
 #include <linux/string.h>
 #include <linux/workqueue.h>
 
@@ -39,6 +40,7 @@ int tbv_core_init(struct tbv_state *state,
 	xa_init(&state->verbs_mrs_xa);
 	xa_init(&state->verbs_qps_xa);
 	state->next_peer_id = 1;
+	get_random_bytes(state->native_host_id, sizeof(state->native_host_id));
 	state->workqueue = alloc_workqueue("tbv_ibdev",
 					   WQ_UNBOUND | WQ_MEM_RECLAIM |
 						   WQ_HIGHPRI,

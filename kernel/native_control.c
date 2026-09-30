@@ -66,6 +66,41 @@ static void tbv_native_control_fill_hello(const struct tbv_state *state,
 	hello->tx_ring_size = rail->path.cfg.tx_ring_size;
 	hello->rx_ring_size = rail->path.cfg.rx_ring_size;
 	hello->path_flags = tbv_native_control_path_flags(&rail->path);
+	if (peer->xd->local_uuid)
+		memcpy(hello->src_domain, peer->xd->local_uuid,
+		       sizeof(hello->src_domain));
+	memcpy(hello->host_id, state->native_host_id, sizeof(hello->host_id));
+	hello->has_ids = 1;
+}
+
+/*
+ * The link a message came over, from the sender's domain UUID it names:
+ * that is the remote UUID of our XDomain on the same link. Only compared
+ * against peer->xd, never dereferenced by callers.
+ */
+static struct tb_xdomain *
+tbv_native_control_find_source(struct tbv_state *state,
+			       const struct tbv_native_wire_hello *remote)
+{
+	struct tb_xdomain *found = NULL;
+	struct tbv_peer *peer;
+
+	if (!remote->has_ids)
+		return NULL;
+
+	mutex_lock(&state->lock);
+	list_for_each_entry(peer, &state->peers, node) {
+		if (peer->backend != TBV_BACKEND_NATIVE ||
+		    !peer->xd->remote_uuid)
+			continue;
+		if (memcmp(peer->xd->remote_uuid, remote->src_domain,
+			   sizeof(remote->src_domain)))
+			continue;
+		found = peer->xd;
+		break;
+	}
+	mutex_unlock(&state->lock);
+	return found;
 }
 
 static bool tbv_native_control_peer_matches_source(
@@ -233,6 +268,11 @@ static int tbv_native_control_apply_remote(struct tbv_state *state,
 			rail->remote_transmit_path = remote->transmit_path;
 			rail->remote_tx_hop = remote->tx_hop;
 			rail->remote_rx_hop = remote->rx_hop;
+			if (remote->has_ids) {
+				memcpy(peer->remote_host_id, remote->host_id,
+				       sizeof(peer->remote_host_id));
+				peer->remote_host_known = true;
+			}
 			tbv_path_set_remote_rx_capacity(&rail->path,
 							remote->rx_ring_size);
 			ret = 0;
@@ -371,6 +411,14 @@ int tbv_native_control_handle_packet(struct tbv_state *state,
 	ret = tbv_native_wire_parse_hello(buf, size, &remote, &info);
 	if (ret)
 		return 0;
+
+	/*
+	 * A source-blind handler does not say which link a message came over;
+	 * two links to one host can use the same route. The sender names its
+	 * domain, which tells the link apart.
+	 */
+	if (!source_xd)
+		source_xd = tbv_native_control_find_source(state, &remote);
 
 	if (info.op == TBV_NATIVE_WIRE_OP_HELLO_ACK) {
 		ret = tbv_native_control_apply_ack(state, source_xd, &info,
@@ -801,8 +849,10 @@ int tbv_native_control_start(struct tbv_state *state)
 	state->native_control_source_aware = false;
 	ret = tbv_native_control_legacy_start(state);
 #endif
-	if (!ret)
+	if (!ret) {
 		state->native_control_registered = true;
+		state->native_control_ids = true;
+	}
 	return ret;
 }
 
@@ -816,6 +866,7 @@ void tbv_native_control_stop(struct tbv_state *state)
 	if (state) {
 		state->native_control_registered = false;
 		state->native_control_source_aware = false;
+		state->native_control_ids = false;
 	}
 }
 
