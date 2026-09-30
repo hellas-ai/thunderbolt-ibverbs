@@ -191,6 +191,37 @@ To remove it:
 sudo make dkms-remove
 ```
 
+## Keeping thunderbolt-net off the links
+
+When a peer offers its network service, distributions load `thunderbolt_net`
+automatically (by modalias) as soon as a cable is plugged in. It then takes a
+DMA ring of each USB4 controller, which has only two for data, so this module
+gets fewer rails or none; loaded afterwards, `thunderbolt_net` fails with
+`failed to allocate Tx ring` and does no harm. `tbnet=` only sets this
+module's own behavior and does not keep `thunderbolt_net` away. Only root
+can, with `/etc/modprobe.d/`; `blacklist` stops the automatic load (an
+explicit `modprobe thunderbolt_net` still works, and IP over Thunderbolt is
+gone while it is blacklisted).
+
+A persistent setup, here with the module installed by DKMS and a dummy
+netdev for the RoCE addresses (use a different address on the other host):
+
+```text
+# /etc/modprobe.d/thunderbolt-ibverbs.conf
+blacklist thunderbolt_net
+options thunderbolt_ibverbs profile=linux_perf tbnet=prefer_rdma lanes=2 register_verbs=1 roce_netdev=tbv0 native_write_striping=1
+# the RoCE netdev has to exist before the rails register
+install thunderbolt_ibverbs /usr/sbin/ip link show tbv0 >/dev/null 2>&1 || { /usr/sbin/ip link add tbv0 type dummy && /usr/sbin/ip addr add 10.77.0.1/24 dev tbv0 && /usr/sbin/ip link set tbv0 up; }; /usr/sbin/modprobe --ignore-install thunderbolt_ibverbs $CMDLINE_OPTS
+
+# /etc/modules-load.d/thunderbolt-ibverbs.conf
+thunderbolt_ibverbs
+```
+
+rdma-core's udev rule `60-rdma-persistent-naming.rules` renames RDMA devices
+by bus path (`rocep...`), but the `usb4_rdma` provider finds its devices by
+name. Copy the rule to `/etc/udev/rules.d/` and exclude them:
+`KERNEL!="hfi1*", KERNEL!="usb4_rdma*", PROGRAM="rdma_rename %k NAME_FALLBACK"`.
+
 ## Build Without DKMS
 
 For a one-off build against the running kernel:
@@ -386,37 +417,6 @@ credits are refunded and retransmission recovers the message).
 `peers` shows each rail's credits and, on `tx_pump`, why queued frames are
 not being sent. What this branch changes and measures:
 [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
-
-### Keeping thunderbolt-net off the links
-
-When a peer offers its network service, distributions load `thunderbolt_net`
-automatically (by modalias) as soon as a cable is plugged in. It then takes a
-DMA ring of each USB4 controller, which has only two for data, so this module
-gets fewer rails or none; loaded afterwards, `thunderbolt_net` fails with
-`failed to allocate Tx ring` and does no harm. `tbnet=` only sets this
-module's own behavior and does not keep `thunderbolt_net` away. Only root
-can, with `/etc/modprobe.d/`; `blacklist` stops the automatic load (an
-explicit `modprobe thunderbolt_net` still works, and IP over Thunderbolt is
-gone while it is blacklisted).
-
-A persistent setup, here with the module installed by DKMS and a dummy
-netdev for the RoCE addresses (use a different address on the other host):
-
-```text
-# /etc/modprobe.d/thunderbolt-ibverbs.conf
-blacklist thunderbolt_net
-options thunderbolt_ibverbs profile=linux_perf tbnet=prefer_rdma lanes=2 register_verbs=1 roce_netdev=tbv0 native_write_striping=1
-# the RoCE netdev has to exist before the rails register
-install thunderbolt_ibverbs /usr/sbin/ip link show tbv0 >/dev/null 2>&1 || { /usr/sbin/ip link add tbv0 type dummy && /usr/sbin/ip addr add 10.77.0.1/24 dev tbv0 && /usr/sbin/ip link set tbv0 up; }; /usr/sbin/modprobe --ignore-install thunderbolt_ibverbs $CMDLINE_OPTS
-
-# /etc/modules-load.d/thunderbolt-ibverbs.conf
-thunderbolt_ibverbs
-```
-
-rdma-core's udev rule `60-rdma-persistent-naming.rules` renames RDMA devices
-by bus path (`rocep...`), but the `usb4_rdma` provider finds its devices by
-name. Copy the rule to `/etc/udev/rules.d/` and exclude them:
-`KERNEL!="hfi1*", KERNEL!="usb4_rdma*", PROGRAM="rdma_rename %k NAME_FALLBACK"`.
 
 ## Nix Thunderbolt Kernel
 
