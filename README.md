@@ -16,9 +16,11 @@ a linux kernel module + userspace shim to emulate an InfiniBand RDMA verb device
 ## does it work?
 yes! obviously not as well as real hardware, but better than onboard ethernet and lower latency than RXE-over-`thunderbolt-net`
 
-![Per-rail bandwidth by verb (read / write / send), strix-1 ↔ strix-2: native usb4_rdma vs RXE over thunderbolt-net vs RXE over 2.5G LAN](docs/img/bw_vs_size.svg)
+![Bandwidth by verb and message size with the busy CPU cores of both hosts, 1 QP: usb4_rdma over two USB4 cables with write striping vs InfiniBand FDR on PCIe 3.0 x4](docs/img/bw_vs_size.svg)
 
-![One-way latency by verb (read / write / send), 1 QP, 64 B → 1 MiB, native usb4_rdma vs RXE over thunderbolt-net vs RXE over 2.5G LAN](docs/img/lat_vs_size.svg)
+![One-way latency by verb and message size with the busy CPU cores of both hosts, 1 QP: usb4_rdma over two USB4 cables vs InfiniBand FDR on PCIe 3.0 x4](docs/img/lat_vs_size.svg)
+
+How these charts are made: [bench/README.md](bench/README.md#readme-charts).
 
 ## does it do anything useful?
 with my two 128GB devices, i can:
