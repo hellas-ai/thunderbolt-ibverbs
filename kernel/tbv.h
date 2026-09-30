@@ -26,6 +26,8 @@
 #define TBV_ETH_ALEN 6
 #define TBV_NATIVE_PROTOCOL_KEY "tbverbs"
 #define TBV_NATIVE_MAX_LANES 4
+/* Rails one QP may spread data over: those of every link to its host. */
+#define TBV_NATIVE_MAX_DATA_PATHS (2 * TBV_NATIVE_MAX_LANES)
 #define TBV_DATA_PDF_FRAME_START 1
 #define TBV_DATA_PDF_FRAME_END 3
 #define TBV_NATIVE_PRTCID 1

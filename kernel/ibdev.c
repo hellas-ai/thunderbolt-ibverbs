@@ -1831,7 +1831,7 @@ static void tbv_qp_flush_reads(struct tbv_qp *tqp, struct list_head *flush)
 static void tbv_cancel_send_ctx_packets(struct tbv_send_ctx *send)
 {
 	struct tbv_qp *tqp;
-	struct tbv_path *paths[TBV_NATIVE_MAX_LANES] = {};
+	struct tbv_path *paths[TBV_NATIVE_MAX_DATA_PATHS] = {};
 	u32 path_count = 0;
 	u32 i;
 
@@ -2026,19 +2026,11 @@ static void tbv_qp_unbind_rail(struct tbv_qp *tqp)
 	tqp->rail = NULL;
 }
 
-static u32 tbv_collect_native_data_paths_for_qp_locked(struct tbv_qp *tqp,
-						       struct tbv_path **paths,
-						       u32 max_paths)
+static u32 tbv_collect_peer_data_paths_locked(struct tbv_peer *peer,
+					      struct tbv_path **paths,
+					      u32 count, u32 max_paths)
 {
-	struct tbv_peer *peer;
 	struct tbv_rail *rail;
-	u32 count = 0;
-
-	if (!tqp->rail || max_paths == 0)
-		return 0;
-	peer = tqp->rail->peer;
-	if (!peer || peer->backend != TBV_BACKEND_NATIVE)
-		return 0;
 
 	list_for_each_entry(rail, &peer->rails, node) {
 		if (count == max_paths)
@@ -2047,7 +2039,41 @@ static u32 tbv_collect_native_data_paths_for_qp_locked(struct tbv_qp *tqp,
 			continue;
 		paths[count++] = &rail->path;
 	}
+	return count;
+}
 
+/*
+ * The ready data paths of a native QP: its own link's rails first, then
+ * those of every other link to the same host, which the remote side names
+ * in native control. Takes a reference on each returned path.
+ */
+static u32 tbv_collect_native_data_paths_for_qp_locked(struct tbv_qp *tqp,
+						       struct tbv_path **paths,
+						       u32 max_paths)
+{
+	struct tbv_peer *peer;
+	struct tbv_peer *pos;
+	u32 count;
+
+	if (!tqp->rail || max_paths == 0)
+		return 0;
+	peer = tqp->rail->peer;
+	if (!peer || peer->backend != TBV_BACKEND_NATIVE)
+		return 0;
+
+	count = tbv_collect_peer_data_paths_locked(peer, paths, 0, max_paths);
+	if (!peer->remote_host_known)
+		return count;
+
+	list_for_each_entry(pos, &peer->state->peers, node) {
+		if (pos == peer || pos->backend != TBV_BACKEND_NATIVE ||
+		    !pos->remote_host_known ||
+		    memcmp(pos->remote_host_id, peer->remote_host_id,
+			   sizeof(pos->remote_host_id)))
+			continue;
+		count = tbv_collect_peer_data_paths_locked(pos, paths, count,
+							   max_paths);
+	}
 	return count;
 }
 
@@ -4579,12 +4605,12 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 	struct tbv_qp *tqp = ctx->tqp;
 	struct tbv_native_data_header hdr = {};
 	struct tbv_path *path = NULL;
-	struct tbv_path *paths[TBV_NATIVE_MAX_LANES] = {};
-	struct list_head frame_lists[TBV_NATIVE_MAX_LANES];
-	struct list_head packet_lists[TBV_NATIVE_MAX_LANES];
-	u32 reservations[TBV_NATIVE_MAX_LANES] = {};
-	u32 frame_counts[TBV_NATIVE_MAX_LANES] = {};
-	u32 packet_counts[TBV_NATIVE_MAX_LANES] = {};
+	struct tbv_path *paths[TBV_NATIVE_MAX_DATA_PATHS] = {};
+	struct list_head frame_lists[TBV_NATIVE_MAX_DATA_PATHS];
+	struct list_head packet_lists[TBV_NATIVE_MAX_DATA_PATHS];
+	u32 reservations[TBV_NATIVE_MAX_DATA_PATHS] = {};
+	u32 frame_counts[TBV_NATIVE_MAX_DATA_PATHS] = {};
+	u32 packet_counts[TBV_NATIVE_MAX_DATA_PATHS] = {};
 	u32 nfrags = ctx->total_len ?
 		     DIV_ROUND_UP(ctx->total_len,
 				  TBV_NATIVE_DATA_MAX_PAYLOAD) : 1;
@@ -6044,7 +6070,7 @@ static int tbv_send_control_frame_on_all_native_paths(struct tbv_qp *tqp,
 						      const void *frame,
 						      u32 len)
 {
-	struct tbv_path *paths[TBV_NATIVE_MAX_LANES] = {};
+	struct tbv_path *paths[TBV_NATIVE_MAX_DATA_PATHS] = {};
 	struct tbv_state *state;
 	u32 path_count;
 	u32 i;
