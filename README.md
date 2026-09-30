@@ -312,6 +312,7 @@ lanes=auto|N|MIN-MAX
 register_verbs=0|1
 native_wr_striping=0|1
 native_fragment_striping=0|1
+native_domain_mask=<mask>
 zcopy_min_bytes=<bytes>
 qp_timeout_ms=<ms>
 nhi_interrupt_throttle_ns=<ns>

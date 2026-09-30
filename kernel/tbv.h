@@ -454,6 +454,7 @@ struct tbv_state {
 	bool native_data;
 	bool apple_data;
 	bool native_fragment_striping;
+	u32 native_domain_mask;
 	bool register_verbs;
 	bool services_registered;
 	bool verbs_registered;

@@ -107,6 +107,11 @@ module_param(native_fragment_striping, bool, 0444);
 MODULE_PARM_DESC(native_fragment_striping,
 		 "Stripe native Linux SEND fragments across active rails");
 
+static unsigned int native_domain_mask = ~0u;
+module_param(native_domain_mask, uint, 0444);
+MODULE_PARM_DESC(native_domain_mask,
+		 "Bitmask of Thunderbolt domain indices whose links carry native rails (default: all)");
+
 static bool register_verbs;
 module_param(register_verbs, bool, 0444);
 MODULE_PARM_DESC(register_verbs,
@@ -171,6 +176,7 @@ static int __init tbv_init(void)
 	if (ret)
 		goto err_path_symbols;
 	tbv_driver_state.native_fragment_striping = native_fragment_striping;
+	tbv_driver_state.native_domain_mask = native_domain_mask;
 	tbv_driver_state.native_data = native_data;
 	tbv_driver_state.apple_data = apple_data;
 
