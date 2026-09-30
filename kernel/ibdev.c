@@ -3486,6 +3486,17 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 				need_resched = true;
 				continue;
 			}
+			/*
+			 * An RNR can arrive while the attempt it answers is
+			 * still being sent; retry once its frames drained.
+			 */
+			if (send->retryable &&
+			    (send->retrying || atomic_read(&send->tx_pending)) &&
+			    tbv_send_rnr_retry_allowed(send) &&
+			    !tqp->closing && tqp->state != IB_QPS_ERR) {
+				need_resched = true;
+				continue;
+			}
 			if (send->retryable && !send->retrying &&
 			    !atomic_read(&send->tx_pending) &&
 			    tbv_send_rnr_retry_allowed(send) &&
