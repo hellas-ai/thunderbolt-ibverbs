@@ -159,6 +159,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_zcopy_fallback_unsafe_sge));
 	seq_printf(s, "data_wr_block_split: %lld\n",
 		   atomic64_read(&state->data_wr_block_split));
+	seq_printf(s, "data_wr_block_async: %lld\n",
+		   atomic64_read(&state->data_wr_block_async));
 	seq_printf(s, "data_wr_copy_error: %lld\n",
 		   atomic64_read(&state->data_wr_copy_error));
 	seq_printf(s, "data_wr_path_send: %lld\n",

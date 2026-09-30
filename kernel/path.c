@@ -603,6 +603,9 @@ void tbv_path_init(struct tbv_path *path,
 	path->state = TBV_PATH_NEW;
 	path->cfg = *cfg;
 	path->rail = rail;
+	spin_lock_init(&path->build_lock);
+	INIT_LIST_HEAD(&path->build_jobs);
+	INIT_WORK(&path->build_work, tbv_ibdev_path_build_work);
 	spin_lock_init(&path->tx_lock);
 	INIT_LIST_HEAD(&path->tx_free);
 	INIT_LIST_HEAD(&path->tx_control_free);
@@ -626,6 +629,9 @@ void tbv_path_reset(struct tbv_path *path)
 	path->rx_ring = NULL;
 	memset(path, 0, sizeof(*path));
 	path->state = TBV_PATH_STOPPED;
+	spin_lock_init(&path->build_lock);
+	INIT_LIST_HEAD(&path->build_jobs);
+	INIT_WORK(&path->build_work, tbv_ibdev_path_build_work);
 	spin_lock_init(&path->tx_lock);
 	INIT_LIST_HEAD(&path->tx_free);
 	INIT_LIST_HEAD(&path->tx_control_free);
@@ -2553,6 +2559,8 @@ void tbv_path_destroy(struct tbv_path *path, struct tb_xdomain *xd)
 	bool rings_started = tunnel_enabled ||
 			     path->state == TBV_PATH_RING_STARTED;
 
+	/* Build jobs hold rail references, so none is left by now. */
+	cancel_work_sync(&path->build_work);
 	cancel_delayed_work_sync(&path->tx_poll_work);
 	cancel_delayed_work_sync(&path->rx_supp_poll_work);
 

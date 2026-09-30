@@ -4606,6 +4606,256 @@ static void tbv_send_ctx_build_native_header(struct tbv_send_ctx *ctx,
 	}
 }
 
+/*
+ * One path's contiguous block of a block-striped send, built by the path's
+ * build work. Holds a reference on the send and on the path's rail.
+ */
+struct tbv_send_build_job {
+	struct list_head node;
+	struct tbv_send_ctx *send;
+	struct tbv_path *path;
+	u32 first_frag;
+	u32 nfrags;
+};
+
+/* Frames a block is built and queued in, so sending starts while it builds. */
+#define TBV_SEND_BUILD_CHUNK 64u
+
+/*
+ * Builds the frames of fragments [first_frag, first_frag + nfrags) of a
+ * block-striped send and queues them on @path. The send's tx_pending
+ * already counts them; on failure the caller takes them back out.
+ */
+static int tbv_native_send_build_chunk(struct tbv_send_ctx *ctx,
+				       struct tbv_path *path, u32 first_frag,
+				       u32 nfrags)
+{
+	struct tbv_qp *tqp = ctx->tqp;
+	struct tbv_native_data_header hdr;
+	LIST_HEAD(frames);
+	LIST_HEAD(packets);
+	u32 packet_count = 0;
+	u32 refs = 0;
+	u32 i;
+	int ret;
+
+	ret = tbv_path_reserve_data(path, nfrags);
+	if (ret) {
+		atomic64_inc(&tqp->owner->data_wr_no_path);
+		return ret;
+	}
+
+	for (i = 0; i < nfrags; i++) {
+		u32 offset = (first_frag + i) * TBV_NATIVE_DATA_MAX_PAYLOAD;
+		u32 payload_len = min_t(u32, ctx->total_len - offset,
+					TBV_NATIVE_DATA_MAX_PAYLOAD);
+		bool last = offset + payload_len == ctx->total_len;
+		u32 packet_len = TBV_NATIVE_DATA_HDR_SIZE + payload_len;
+		struct tbv_path_owned_frame *owned;
+		u8 *frame;
+
+		frame = kmalloc(packet_len, GFP_KERNEL);
+		if (!frame) {
+			ret = -ENOMEM;
+			goto err_frames;
+		}
+		ret = tbv_copy_send_range(ctx->segs, ctx->nsegs, offset,
+					  frame + TBV_NATIVE_DATA_HDR_SIZE,
+					  payload_len);
+		if (ret) {
+			kfree(frame);
+			atomic64_inc(&tqp->owner->data_wr_copy_error);
+			goto err_frames;
+		}
+		tbv_send_ctx_build_native_header(ctx, offset, payload_len,
+						 last, true, &hdr);
+		ret = tbv_native_data_build_header(frame, packet_len, &hdr);
+		if (ret < 0) {
+			kfree(frame);
+			goto err_frames;
+		}
+		owned = kzalloc(sizeof(*owned), GFP_KERNEL);
+		if (!owned) {
+			kfree(frame);
+			ret = -ENOMEM;
+			goto err_frames;
+		}
+		INIT_LIST_HEAD(&owned->node);
+		owned->data = frame;
+		owned->len = packet_len;
+		owned->sof = TBV_DATA_PDF_FRAME_START;
+		owned->eof = TBV_DATA_PDF_FRAME_END;
+		list_add_tail(&owned->node, &frames);
+	}
+
+	ret = tbv_path_prepare_owned_list(path, &frames, &packets,
+					  &packet_count, TBV_PATH_SEND_DEFER,
+					  tbv_send_tx_done, ctx);
+	if (ret) {
+		atomic64_inc(&tqp->owner->data_wr_path_send_error);
+		goto err_frames;
+	}
+	if (packet_count != nfrags)
+		atomic_add((int)packet_count - (int)nfrags, &ctx->tx_pending);
+	for (refs = 0; refs < packet_count; refs++) {
+		tbv_send_ctx_get(ctx);
+		atomic64_inc(&tqp->owner->data_wr_path_send);
+	}
+
+	ret = tbv_path_enqueue_prepared_reserved(path, &packets, packet_count,
+						 TBV_PATH_SEND_DEFER);
+	if (ret) {
+		/* The failed enqueue released the packets without callbacks. */
+		atomic64_inc(&tqp->owner->data_wr_path_send_error);
+		tbv_path_release_data_reservation(path, nfrags);
+		/* The caller takes out nfrags; take out the difference. */
+		if (packet_count != nfrags)
+			atomic_sub((int)packet_count - (int)nfrags,
+				   &ctx->tx_pending);
+		while (refs--)
+			tbv_send_ctx_put(ctx);
+		return ret;
+	}
+	tbv_kick_paths(&path, 1);
+	return 0;
+
+err_frames:
+	tbv_release_owned_frame_lists(&frames, 1);
+	tbv_path_release_data_reservation(path, nfrags);
+	return ret;
+}
+
+/*
+ * Builds and queues a block in chunks of TBV_SEND_BUILD_CHUNK frames.
+ * Returns how many of its frames will not be sent.
+ */
+static u32 tbv_native_send_build_block(struct tbv_send_ctx *ctx,
+				       struct tbv_path *path, u32 first_frag,
+				       u32 nfrags)
+{
+	u32 done = 0;
+
+	while (done < nfrags) {
+		u32 n = min_t(u32, nfrags - done, TBV_SEND_BUILD_CHUNK);
+
+		if (tbv_native_send_build_chunk(ctx, path, first_frag + done,
+						n))
+			return nfrags - done;
+		done += n;
+	}
+	return 0;
+}
+
+/* A send whose remaining blocks need not be built any more. */
+static bool tbv_send_build_needless(struct tbv_send_ctx *ctx)
+{
+	struct tbv_qp *tqp = ctx->tqp;
+
+	return READ_ONCE(ctx->completed) || READ_ONCE(tqp->closing) ||
+	       READ_ONCE(tqp->state) == IB_QPS_ERR;
+}
+
+static void tbv_native_send_run_build_job(struct tbv_send_build_job *job)
+{
+	struct tbv_send_ctx *ctx = job->send;
+	u32 unsent = job->nfrags;
+
+	if (!tbv_send_build_needless(ctx))
+		unsent = tbv_native_send_build_block(ctx, job->path,
+						     job->first_frag,
+						     job->nfrags);
+	/*
+	 * Frames that will not be sent must not keep the send pending; the
+	 * send is then retransmitted after its timeout, or flushed.
+	 */
+	if (unsent)
+		atomic_sub(unsent, &ctx->tx_pending);
+}
+
+void tbv_ibdev_path_build_work(struct work_struct *work)
+{
+	struct tbv_path *path = container_of(work, struct tbv_path,
+					     build_work);
+	struct tbv_send_build_job *job;
+	struct tbv_send_build_job *tmp;
+	unsigned long flags;
+	LIST_HEAD(done);
+
+	for (;;) {
+		spin_lock_irqsave(&path->build_lock, flags);
+		job = list_first_entry_or_null(&path->build_jobs,
+					       struct tbv_send_build_job, node);
+		if (job)
+			list_del(&job->node);
+		spin_unlock_irqrestore(&path->build_lock, flags);
+		if (!job)
+			break;
+		tbv_native_send_run_build_job(job);
+		list_add_tail(&job->node, &done);
+	}
+
+	/*
+	 * Drop the jobs' references only now: the last rail reference may
+	 * let the rail, and so this work item's path, be freed.
+	 */
+	list_for_each_entry_safe(job, tmp, &done, node) {
+		list_del(&job->node);
+		tbv_send_ctx_put(job->send);
+		tbv_release_path_refs(&job->path, 1);
+		kfree(job);
+	}
+}
+
+/*
+ * Hands each path its contiguous block of a block-striped send (the same
+ * split as the synchronous post), to be built by the path's build work.
+ * Consumes the path references. A block whose job cannot be allocated is
+ * built here instead.
+ */
+static void tbv_native_send_queue_blocks(struct tbv_send_ctx *ctx,
+					 struct tbv_path **paths,
+					 u32 path_count, u32 nfrags)
+{
+	struct tbv_qp *tqp = ctx->tqp;
+	u32 p;
+
+	/* Count every frame up front so the send cannot drain early. */
+	atomic_add(nfrags, &ctx->tx_pending);
+	for (p = 0; p < path_count; p++) {
+		u32 first = DIV_ROUND_UP(p * nfrags, path_count);
+		u32 end = DIV_ROUND_UP((p + 1) * nfrags, path_count);
+		struct tbv_send_build_job *job;
+		unsigned long flags;
+
+		if (end == first) {
+			tbv_release_path_refs(&paths[p], 1);
+			continue;
+		}
+		job = kmalloc(sizeof(*job), GFP_KERNEL);
+		if (!job) {
+			u32 unsent = tbv_native_send_build_block(ctx, paths[p],
+								 first,
+								 end - first);
+
+			if (unsent)
+				atomic_sub(unsent, &ctx->tx_pending);
+			tbv_release_path_refs(&paths[p], 1);
+			continue;
+		}
+		tbv_send_ctx_get(ctx);
+		job->send = ctx;
+		job->path = paths[p];
+		job->first_frag = first;
+		job->nfrags = end - first;
+		spin_lock_irqsave(&paths[p]->build_lock, flags);
+		list_add_tail(&job->node, &paths[p]->build_jobs);
+		spin_unlock_irqrestore(&paths[p]->build_lock, flags);
+		queue_work(tqp->owner->workqueue ? tqp->owner->workqueue :
+			   system_unbound_wq, &paths[p]->build_work);
+	}
+	atomic64_inc(&tqp->owner->data_wr_block_async);
+}
+
 static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 					   enum tbv_send_post_reason reason)
 {
@@ -4752,10 +5002,22 @@ static int tbv_native_send_ctx_post_frames(struct tbv_send_ctx *ctx,
 			ret = -ENOTCONN;
 			goto out_unlock_paths;
 		}
+		if (path_count > 1 && reason == TBV_SEND_POST_INITIAL) {
+			atomic64_inc(&tqp->owner->data_wr_block_split);
+			/*
+			 * Let the paths' build work build the blocks in
+			 * parallel, so the poster does not wait for them. A
+			 * retransmission is rare and builds here.
+			 */
+			if (ctx->retryable) {
+				mutex_unlock(&tqp->owner->lock);
+				tbv_native_send_queue_blocks(ctx, paths,
+							     path_count, nfrags);
+				return 0;
+			}
+		}
 		for (i = 0; i < nfrags; i++)
 			reservations[i * path_count / nfrags]++;
-		if (path_count > 1 && reason == TBV_SEND_POST_INITIAL)
-			atomic64_inc(&tqp->owner->data_wr_block_split);
 	} else {
 		path = tbv_select_native_data_path_for_qp_locked(tqp);
 		if (!path) {

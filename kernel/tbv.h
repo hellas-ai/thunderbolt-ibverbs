@@ -192,6 +192,14 @@ struct tbv_path {
 	struct list_head tx_zcopy_inflight;
 	struct delayed_work tx_poll_work;
 	struct delayed_work rx_supp_poll_work;
+	/*
+	 * Blocks of native sends whose frames this path still has to build
+	 * (ibdev.c). A work item builds them in order, in parallel with the
+	 * other paths, so post_send does not build large sends itself.
+	 */
+	spinlock_t build_lock;
+	struct list_head build_jobs;
+	struct work_struct build_work;
 	atomic_t tx_inflight;
 	atomic64_t data_tx_enqueued;
 	atomic64_t data_tx_posted;
@@ -504,6 +512,7 @@ struct tbv_state {
 	atomic64_t data_wr_zcopy_fallback_striping;
 	atomic64_t data_wr_zcopy_fallback_unsafe_sge;
 	atomic64_t data_wr_block_split;
+	atomic64_t data_wr_block_async;
 	atomic64_t data_wr_copy_error;
 	atomic64_t data_wr_path_send;
 	atomic64_t data_wr_path_send_error;
@@ -799,6 +808,7 @@ void tbv_path_set_remote_rx_capacity(struct tbv_path *path, u32 rx_ring_size);
 void tbv_path_add_remote_rx_credits(struct tbv_path *path, u32 credits);
 int tbv_path_reserve_data(struct tbv_path *path, u32 frames);
 void tbv_path_release_data_reservation(struct tbv_path *path, u32 frames);
+void tbv_ibdev_path_build_work(struct work_struct *work);
 int tbv_path_send(struct tbv_path *path, const void *data, u32 len,
 		  unsigned int flags,
 		  tbv_path_tx_done_fn done, void *done_ctx);
