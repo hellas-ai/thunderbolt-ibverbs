@@ -183,6 +183,10 @@ struct tbv_path {
 	u32 tx_remote_data_credits;
 	u32 tx_remote_data_credit_max;
 	u32 rx_data_credit_pending;
+	/* Native per-path frame sequence (TBV_NATIVE_DATA_PATH_SEQ_*). */
+	u16 tx_data_seq;
+	u16 rx_data_seq_next;
+	bool rx_data_seq_valid;
 	spinlock_t tx_lock;
 	struct list_head tx_free;
 	struct list_head tx_control_free;
@@ -215,6 +219,7 @@ struct tbv_path {
 	atomic64_t data_rx_credit_sent;
 	atomic64_t data_rx_credit_send_error;
 	atomic64_t data_rx_repost_failed;
+	atomic64_t data_rx_lost;
 	atomic64_t tx_poll_calls;
 	atomic64_t tx_poll_completed;
 	atomic64_t rx_supp_poll_calls;
@@ -538,6 +543,7 @@ struct tbv_state {
 	atomic64_t data_rx_credit_sent;
 	atomic64_t data_rx_credit_send_error;
 	atomic64_t data_rx_repost_failed;
+	atomic64_t data_rx_lost;
 	atomic64_t data_rx_bad_frame;
 	atomic64_t data_rx_bad_header;
 	atomic64_t data_rx_bad_header_parse;

@@ -852,6 +852,41 @@ static void tbv_path_zcopy_tx_complete(struct tb_ring *ring,
 	tbv_path_schedule_tx(path);
 }
 
+/*
+ * Checks a native data frame's path sequence number and returns how many
+ * frames went missing on the path before it; their data credits must be
+ * returned, since they never occupied an RX buffer. Retransmission recovers
+ * their messages.
+ */
+static u32 tbv_path_rx_note_seq(struct tbv_path *path, const void *buf)
+{
+	struct tbv_state *state = tbv_path_state(path);
+	u16 v = tbv_wire_get_le16((const tbv_wire_u8 *)buf +
+				  TBV_NATIVE_DATA_PATH_SEQ_OFFSET);
+	u16 seq = v & TBV_NATIVE_DATA_PATH_SEQ_MASK;
+	u32 lost = 0;
+
+	if (!(v & TBV_NATIVE_DATA_PATH_SEQ_PRESENT))
+		return 0;
+	if (path->rx_data_seq_valid)
+		lost = (seq - path->rx_data_seq_next) &
+		       TBV_NATIVE_DATA_PATH_SEQ_MASK;
+	path->rx_data_seq_next = (seq + 1) & TBV_NATIVE_DATA_PATH_SEQ_MASK;
+	path->rx_data_seq_valid = true;
+	if (!lost)
+		return 0;
+	/* More than the credit window cannot be in flight: a restart. */
+	if (lost > tbv_path_data_credit_window(path->cfg.rx_ring_size))
+		return 0;
+
+	if (state)
+		atomic64_add(lost, &state->data_rx_lost);
+	atomic64_add(lost, &path->data_rx_lost);
+	pr_warn_ratelimited("native RX lost %u frame(s) before path seq %u\n",
+			    lost, seq);
+	return lost;
+}
+
 static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 				 bool canceled)
 {
@@ -922,13 +957,17 @@ static void tbv_path_rx_complete(struct tb_ring *ring, struct ring_frame *frame,
 						   TBV_NATIVE_DATA_F_RAW_STREAM))) {
 					atomic64_inc(&state->data_rx_bad_frame);
 				} else {
-					return_rx_credits = 1;
+					return_rx_credits = 1 +
+						tbv_path_rx_note_seq(path,
+								     f->buf);
 					tbv_path_rx_start_raw(path, &hdr);
 				}
 			} else {
 				if (!ret &&
 				    tbv_native_data_consumes_rx_credit(hdr.opcode))
-					return_rx_credits = 1;
+					return_rx_credits = 1 +
+						tbv_path_rx_note_seq(path,
+								     f->buf);
 				tbv_ibdev_rx_frame(state, path, f->buf, len);
 			}
 		}
@@ -1704,6 +1743,7 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		void *old_raw_stream_owner;
 		u32 old_raw_stream_inflight;
 		bool charged_data_credit;
+		bool seq_assigned;
 		bool from_control_queue;
 		u32 old_start_credit_group_frames;
 		int ret;
@@ -1893,6 +1933,16 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 		}
 
 		memcpy(f->buf, packet->buf, packet->len);
+		seq_assigned = charged_data_credit &&
+			       packet->len >= TBV_NATIVE_DATA_HDR_SIZE &&
+			       path->rail && path->rail->peer &&
+			       path->rail->peer->backend == TBV_BACKEND_NATIVE;
+		if (seq_assigned)
+			tbv_wire_put_le16(f->buf +
+					  TBV_NATIVE_DATA_PATH_SEQ_OFFSET,
+					  TBV_NATIVE_DATA_PATH_SEQ_PRESENT |
+					  (path->tx_data_seq++ &
+					   TBV_NATIVE_DATA_PATH_SEQ_MASK));
 		f->packet = packet;
 		f->done = packet->done;
 		f->done_ctx = packet->done_ctx;
@@ -1923,6 +1973,9 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 
 		if (state)
 			atomic64_inc(&state->data_tx_errors);
+		/* The frame was not sent, so its number is free again. */
+		if (seq_assigned)
+			path->tx_data_seq--;
 		f->packet = NULL;
 		f->done = NULL;
 		f->done_ctx = NULL;

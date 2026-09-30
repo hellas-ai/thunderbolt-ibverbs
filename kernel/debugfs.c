@@ -209,6 +209,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_credit_sent));
 	seq_printf(s, "data_rx_credit_send_error: %lld\n",
 		   atomic64_read(&state->data_rx_credit_send_error));
+	seq_printf(s, "data_rx_lost: %lld\n",
+		   atomic64_read(&state->data_rx_lost));
 	seq_printf(s, "data_rx_repost_failed: %lld\n",
 		   atomic64_read(&state->data_rx_repost_failed));
 	seq_printf(s, "data_rx_bad_frame: %lld\n",
@@ -473,13 +475,27 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 				   rail->path.cfg.sof_mask,
 				   rail->path.cfg.eof_mask);
 			seq_printf(s,
-				   "    data_rx_completed=%lld data_rx_canceled=%lld data_rx_credit_sent=%lld data_rx_credit_send_error=%lld data_rx_repost_failed=%lld rx_credit_pending=%u\n",
+				   "    data_rx_completed=%lld data_rx_canceled=%lld data_rx_credit_sent=%lld data_rx_credit_send_error=%lld data_rx_repost_failed=%lld data_rx_lost=%lld rx_credit_pending=%u\n",
 				   atomic64_read(&rail->path.data_rx_completed),
 				   atomic64_read(&rail->path.data_rx_canceled),
 				   atomic64_read(&rail->path.data_rx_credit_sent),
 				   atomic64_read(&rail->path.data_rx_credit_send_error),
 				   atomic64_read(&rail->path.data_rx_repost_failed),
+				   atomic64_read(&rail->path.data_rx_lost),
 				   rail->path.rx_data_credit_pending);
+			/* Why a path with queued frames is not sending. */
+			seq_printf(s,
+				   "    tx_pump data_queued=%u control_queued=%u reserved=%u inflight=%d frames=%u free=%zu remote_credits=%u scheduling=%u raw_stream=%u raw_inflight=%u\n",
+				   rail->path.tx_data_queued,
+				   rail->path.tx_control_queued,
+				   rail->path.tx_data_reserved,
+				   atomic_read(&rail->path.tx_inflight),
+				   rail->path.tx_frame_count,
+				   list_count_nodes(&rail->path.tx_free),
+				   rail->path.tx_remote_data_credits,
+				   rail->path.tx_scheduling,
+				   rail->path.tx_raw_stream_active,
+				   rail->path.tx_raw_stream_inflight);
 			seq_printf(s,
 				   "    tx_poll enabled=%u calls=%lld completed=%lld\n",
 				   rail->path.tx_poll_enabled,

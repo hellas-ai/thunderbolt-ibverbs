@@ -83,6 +83,17 @@ struct tbv_native_data_header {
 	tbv_wire_u32 frag_offset;
 };
 
+/*
+ * Header bytes 10-11, zero before and ignored by the parser: the sender's
+ * per-path sequence number of frames that take a data credit, set as the
+ * frame enters the TX ring. A receiver that sees a gap knows frames were
+ * lost on the path and returns their credits, which would otherwise be gone
+ * for good. Without the PRESENT bit a frame carries no number.
+ */
+#define TBV_NATIVE_DATA_PATH_SEQ_OFFSET 10
+#define TBV_NATIVE_DATA_PATH_SEQ_PRESENT 0x8000u
+#define TBV_NATIVE_DATA_PATH_SEQ_MASK 0x7fffu
+
 static inline tbv_wire_u32
 tbv_native_data_credit_return_threshold(tbv_wire_u32 credit_window)
 {
