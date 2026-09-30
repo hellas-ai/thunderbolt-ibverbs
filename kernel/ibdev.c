@@ -400,6 +400,12 @@ struct tbv_qp {
 	struct tbv_rail *rail;
 	spinlock_t lock;
 	struct mutex rx_lock;
+	/*
+	 * Serializes SEND_ACK handling. ACKs for consecutive PSNs can arrive
+	 * on different rails at once; without it, two handlers could complete
+	 * their drained sends concurrently and report them out of order.
+	 */
+	struct mutex ack_lock;
 	wait_queue_head_t credit_wait;
 	wait_queue_head_t apple_tx_wait;
 	wait_queue_head_t refs_wait;
@@ -2577,6 +2583,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	tqp->owner = state;
 	spin_lock_init(&tqp->lock);
 	mutex_init(&tqp->rx_lock);
+	mutex_init(&tqp->ack_lock);
 	init_waitqueue_head(&tqp->credit_wait);
 	init_waitqueue_head(&tqp->apple_tx_wait);
 	init_waitqueue_head(&tqp->refs_wait);
@@ -8973,6 +8980,7 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 		bool completed_error = false;
 
 		atomic64_inc(&state->data_rx_ack);
+		mutex_lock(&tqp->ack_lock);
 		switch (hdr->imm_data) {
 		case TBV_NATIVE_SEND_ACK_OK:
 			status = 0;
@@ -8991,6 +8999,7 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 				tqp, hdr->psn, status, &acked, &matched_send);
 			break;
 		default:
+			mutex_unlock(&tqp->ack_lock);
 			tbv_rx_bad_header_note(state, rx_path,
 					       &state->data_rx_bad_header_ack,
 					       "send_ack", hdr,
@@ -9023,6 +9032,7 @@ void tbv_ibdev_rx_native_frame(struct tbv_state *state,
 			tbv_send_complete(send, send->completion_status);
 			tbv_send_ctx_put(send);
 		}
+		mutex_unlock(&tqp->ack_lock);
 		if (completed_error && completed_ack)
 			tbv_qp_mark_error(tqp);
 		tbv_qp_put(tqp);
