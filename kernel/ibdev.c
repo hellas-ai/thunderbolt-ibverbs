@@ -8,6 +8,7 @@
 #include <linux/crc32c.h>
 #include <linux/delay.h>
 #include <linux/errno.h>
+#include <linux/hashtable.h>
 #include <linux/highmem.h>
 #include <linux/idr.h>
 #include <linux/in6.h>
@@ -343,6 +344,7 @@ enum tbv_rx_reorder_kind {
 
 struct tbv_rx_reorder_msg {
 	struct list_head node;
+	struct hlist_node hnode;
 	struct list_head frags;
 	unsigned long first_jiffies;
 	enum tbv_rx_reorder_kind kind;
@@ -456,6 +458,8 @@ struct tbv_qp {
 	struct tbv_rx_message rx_msg;
 	struct tbv_rx_write rx_write;
 	struct list_head rx_reorder;
+	/* The rx_reorder entries by PSN, so a fragment finds its own fast. */
+	DECLARE_HASHTABLE(rx_reorder_hash, 8);
 	/* Generation of the next block-write reorder entry (rx_lock). */
 	u64 rx_block_gen;
 	struct tbv_ack_history_entry ack_history[TBV_ACK_HISTORY_SIZE];
@@ -2720,6 +2724,7 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	INIT_LIST_HEAD(&tqp->pending_read_resps);
 	INIT_LIST_HEAD(&tqp->apple_sq);
 	INIT_LIST_HEAD(&tqp->rx_reorder);
+	hash_init(tqp->rx_reorder_hash);
 	INIT_WORK(&tqp->apple_sq_work, tbv_apple_sq_work);
 	INIT_WORK(&tqp->error_work, tbv_qp_error_work);
 	INIT_DELAYED_WORK(&tqp->timeout_work, tbv_qp_timeout_work);
@@ -7343,6 +7348,7 @@ static void tbv_qp_flush_reorder(struct tbv_qp *tqp)
 				    msg->received, msg->frags_received,
 				    msg->frag_count, msg->buffered_bytes);
 		list_del(&msg->node);
+		hash_del(&msg->hnode);
 		tbv_rx_reorder_free_msg(msg);
 		discarded++;
 	}
@@ -7385,7 +7391,7 @@ tbv_rx_reorder_find(struct tbv_qp *tqp, u32 psn)
 {
 	struct tbv_rx_reorder_msg *msg;
 
-	list_for_each_entry(msg, &tqp->rx_reorder, node) {
+	hash_for_each_possible(tqp->rx_reorder_hash, msg, hnode, psn) {
 		if (msg->psn == psn)
 			return msg;
 	}
@@ -7424,10 +7430,19 @@ static bool tbv_rx_write_fragment_shape(u32 total_len, u32 offset, u32 len,
 					 frag_count);
 }
 
+static void tbv_rx_reorder_link_msg_locked(struct tbv_qp *tqp,
+					   struct tbv_rx_reorder_msg *msg)
+{
+	list_add_tail(&msg->node, &tqp->rx_reorder);
+	hash_add(tqp->rx_reorder_hash, &msg->hnode, msg->psn);
+	tqp->rx_reorder_count++;
+}
+
 static void tbv_rx_reorder_unlink_msg_locked(struct tbv_qp *tqp,
 					     struct tbv_rx_reorder_msg *msg)
 {
 	list_del(&msg->node);
+	hash_del(&msg->hnode);
 	tqp->rx_reorder_count--;
 	if (tqp->rx_reorder_bytes >= msg->buffered_bytes)
 		tqp->rx_reorder_bytes -= msg->buffered_bytes;
@@ -8099,8 +8114,7 @@ static void tbv_rx_buffer_read_req_locked(
 		msg->complete = true;
 		msg->frag_count = 1;
 		msg->frags_received = 1;
-		list_add_tail(&msg->node, &tqp->rx_reorder);
-		tqp->rx_reorder_count++;
+		tbv_rx_reorder_link_msg_locked(tqp, msg);
 		atomic64_inc(&state->data_rx_reorder_buffered);
 		tbv_qp_schedule_timeout(tqp);
 		return;
@@ -8182,8 +8196,7 @@ static void tbv_rx_buffer_fragment_locked(struct tbv_state *state,
 		msg->imm_data = imm_data;
 		msg->frag_count = frag_count;
 		msg->solicited = hdr->flags & TBV_NATIVE_DATA_F_SOLICITED;
-		list_add_tail(&msg->node, &tqp->rx_reorder);
-		tqp->rx_reorder_count++;
+		tbv_rx_reorder_link_msg_locked(tqp, msg);
 		atomic64_inc(&state->data_rx_reorder_buffered);
 		tbv_qp_schedule_timeout(tqp);
 	} else if (msg->kind != TBV_RX_REORDER_SEND ||
@@ -8290,8 +8303,7 @@ static void tbv_rx_buffer_write_fragment_locked(
 		msg->frag_count = frag_count;
 		msg->with_imm = with_imm;
 		msg->solicited = hdr->flags & TBV_NATIVE_DATA_F_SOLICITED;
-		list_add_tail(&msg->node, &tqp->rx_reorder);
-		tqp->rx_reorder_count++;
+		tbv_rx_reorder_link_msg_locked(tqp, msg);
 		atomic64_inc(&state->data_rx_reorder_buffered);
 		tbv_qp_schedule_timeout(tqp);
 	} else if (msg->kind != TBV_RX_REORDER_WRITE ||
@@ -8735,8 +8747,7 @@ static void tbv_rx_handle_block_write_fragment(struct tbv_state *state,
 		msg->frag_count = frag_count;
 		msg->with_imm = with_imm;
 		msg->gen = ++tqp->rx_block_gen;
-		list_add_tail(&msg->node, &tqp->rx_reorder);
-		tqp->rx_reorder_count++;
+		tbv_rx_reorder_link_msg_locked(tqp, msg);
 		tbv_qp_schedule_timeout(tqp);
 	} else if (msg->kind != TBV_RX_REORDER_BLOCK_WRITE ||
 		   msg->src_qp != hdr->src_qp ||
