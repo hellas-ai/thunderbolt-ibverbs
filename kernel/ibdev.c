@@ -362,6 +362,11 @@ struct tbv_rx_reorder_msg {
 	bool solicited;
 	/* BLOCK_WRITE: fragments of a retransmission seen since completion. */
 	u32 retry_frags;
+	/*
+	 * BLOCK_WRITE: tells this entry from a later one for the same PSN to a
+	 * handler that placed a fragment without rx_lock and relocks.
+	 */
+	u64 gen;
 	/* BLOCK_WRITE: the last fragment (and so the immediate) has arrived. */
 	bool last_seen;
 };
@@ -451,6 +456,8 @@ struct tbv_qp {
 	struct tbv_rx_message rx_msg;
 	struct tbv_rx_write rx_write;
 	struct list_head rx_reorder;
+	/* Generation of the next block-write reorder entry (rx_lock). */
+	u64 rx_block_gen;
 	struct tbv_ack_history_entry ack_history[TBV_ACK_HISTORY_SIZE];
 	u32 rx_reorder_count;
 	u32 rx_reorder_bytes;
@@ -8404,11 +8411,14 @@ static void tbv_rx_handle_block_write_fragment(struct tbv_state *state,
 	u32 psn = hdr->psn & TBV_PSN_MASK;
 	struct tbv_rx_reorder_msg *msg;
 	struct tbv_mr *mr;
+	u64 remote_addr;
 	u64 frag_end;
 	u64 copy_addr;
+	u64 gen;
 	u32 total_len;
 	u32 frag_idx;
 	u32 frag_count;
+	u32 rkey;
 	s32 delta;
 	int ret;
 
@@ -8462,6 +8472,7 @@ static void tbv_rx_handle_block_write_fragment(struct tbv_state *state,
 		msg->rkey = hdr->rkey;
 		msg->frag_count = frag_count;
 		msg->with_imm = with_imm;
+		msg->gen = ++tqp->rx_block_gen;
 		list_add_tail(&msg->node, &tqp->rx_reorder);
 		tqp->rx_reorder_count++;
 		tbv_qp_schedule_timeout(tqp);
@@ -8491,35 +8502,48 @@ static void tbv_rx_handle_block_write_fragment(struct tbv_state *state,
 		goto out_unlock;
 	}
 
-	if (hdr->length) {
-		mr = tbv_mr_get(state, msg->rkey);
-		if (!mr || !(mr->access & IB_ACCESS_REMOTE_WRITE) ||
-		    check_add_overflow(msg->remote_addr, (u64)hdr->frag_offset,
-				       &copy_addr)) {
-			if (mr)
-				tbv_mr_put(mr);
-			atomic64_inc(&state->data_rx_copy_error);
-			tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
-			goto error_ack;
-		}
-		ret = tbv_umem_copy_to_iova(mr, copy_addr, payload,
-					    hdr->length);
-		tbv_mr_put(mr);
-		if (ret) {
-			atomic64_inc(&state->data_rx_copy_error);
-			tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
-			goto error_ack;
-		}
-	}
-
+	/*
+	 * Claim the fragment and place it without rx_lock: the rails of a QP
+	 * deliver in parallel, and placing is most of the work. The fragment
+	 * counts once placed, so the message completes only after every copy.
+	 */
 	set_bit(frag_idx, msg->frag_seen);
-	msg->frags_received++;
-	msg->received += hdr->length;
 	if (last) {
 		msg->last_seen = true;
 		msg->imm_data = with_imm ? hdr->imm_data : 0;
 		msg->solicited = hdr->flags & TBV_NATIVE_DATA_F_SOLICITED;
 	}
+	gen = msg->gen;
+	rkey = msg->rkey;
+	remote_addr = msg->remote_addr;
+	mutex_unlock(&tqp->rx_lock);
+
+	ret = 0;
+	if (hdr->length) {
+		mr = tbv_mr_get(state, rkey);
+		if (!mr || !(mr->access & IB_ACCESS_REMOTE_WRITE) ||
+		    check_add_overflow(remote_addr, (u64)hdr->frag_offset,
+				       &copy_addr))
+			ret = -EFAULT;
+		else
+			ret = tbv_umem_copy_to_iova(mr, copy_addr, payload,
+						    hdr->length);
+		if (mr)
+			tbv_mr_put(mr);
+	}
+
+	mutex_lock(&tqp->rx_lock);
+	/* The entry may have timed out or been flushed meanwhile. */
+	msg = tbv_rx_reorder_find(tqp, psn);
+	if (!msg || msg->kind != TBV_RX_REORDER_BLOCK_WRITE || msg->gen != gen)
+		goto out_unlock;
+	if (ret) {
+		atomic64_inc(&state->data_rx_copy_error);
+		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
+		goto error_ack;
+	}
+	msg->frags_received++;
+	msg->received += hdr->length;
 	if (msg->frags_received == msg->frag_count) {
 		msg->complete = true;
 		if (psn == tqp->rx_expected_psn)
