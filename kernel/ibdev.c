@@ -3732,6 +3732,11 @@ static bool tbv_qp_timeout_reap_rx(struct tbv_qp *tqp, unsigned long now,
 		total_len = msg->total_len;
 		kind = msg->kind;
 		expected = psn == tqp->rx_expected_psn;
+		pr_warn_ratelimited("native RX reorder timeout qpn=0x%x expected_psn=%u psn=%u kind=%u complete=%u frags=%u/%u total=%u age_ms=%u\n",
+				    tqp->base.qp_num, tqp->rx_expected_psn, psn,
+				    kind, msg->complete, msg->frags_received,
+				    msg->frag_count, total_len,
+				    jiffies_to_msecs(now - msg->first_jiffies));
 		tbv_rx_drop_reorder_msg_locked(state, tqp, msg);
 		atomic64_inc(&state->data_rx_reorder_timeout);
 		if (expected)
