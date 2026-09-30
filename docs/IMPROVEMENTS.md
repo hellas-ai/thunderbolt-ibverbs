@@ -87,7 +87,9 @@ InfiniBand link (ConnectX-3, PCIe 3.0 x4), decode at 95 %.
 
 ## Known limits
 
-- RDMA READs above 512 KiB fail, also in upstream `76ba39b`.
+- RDMA READs above 512 KiB fail, also in upstream `76ba39b`, and long
+  series of small READs (over 100 000 in a row) occasionally end with
+  retries exceeded.
 - SENDs above 512 KiB fail with write striping enabled, which turns on the
   existing fragment striping for SENDs.
 - Frames still get lost under bidirectional or SEND-heavy load (thousands

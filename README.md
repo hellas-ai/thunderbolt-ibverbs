@@ -16,6 +16,17 @@ a linux kernel module + userspace shim to emulate an InfiniBand RDMA verb device
 ## does it work?
 yes! obviously not as well as real hardware, but better than onboard ethernet and lower latency than RXE-over-`thunderbolt-net`
 
+The charts measure one QP (queue pair: an RDMA connection's send and receive
+queues, the unit an application posts its reads, writes and sends to) per
+test, with write striping spreading that QP over four rails.
+
+For tensor-parallel inference RDMA WRITE is the verb that counts: gufo's TP
+exchanges use RDMA WRITE with immediate only, and NCCL/RCCL (as used by vLLM
+across hosts) typically moves its data with RDMA WRITEs as well. RDMA READ
+matters for stacks such as UCX, whose rendezvous protocol fetches large
+messages with READs; READs are limited here (see
+[known limits](docs/IMPROVEMENTS.md#known-limits)).
+
 ![Bandwidth by verb and message size with the busy CPU cores of both hosts, 1 QP: usb4_rdma over two USB4 cables with write striping vs InfiniBand FDR on PCIe 3.0 x4](docs/img/bw_vs_size.svg)
 
 ![One-way latency by verb and message size with the busy CPU cores of both hosts, 1 QP: usb4_rdma over two USB4 cables vs InfiniBand FDR on PCIe 3.0 x4](docs/img/lat_vs_size.svg)
@@ -323,6 +334,58 @@ nhi_interrupt_throttle_ns=<ns>
 ```
 
 Run `make -C kernel help` for the full parameter list.
+
+### One QP across rails
+
+By default a QP's data stays on one rail, so an application that uses a
+single QP gets one DMA ring's worth of bandwidth (about 10 Gbit/s).
+`native_write_striping=1` cuts every RDMA WRITE of at least
+`native_write_stripe_min_bytes` (default 64 KiB) into one contiguous block per
+rail; the receiver places each fragment directly and completes the WRITE in
+order. It also turns on `native_fragment_striping` for SENDs, which share the
+ordered receive path. The rails of every link to the same host form one
+pool, so a second cable adds its rails; `native_domain_mask` limits native
+rails to some USB4 controllers (bit n = domain n). Both hosts need the same
+build. For two cables between two Strix Halo hosts:
+
+```text
+profile=linux_perf tbnet=prefer_rdma lanes=2 register_verbs=1 native_write_striping=1
+```
+
+Example: tensor parallelism (TP=2) of [gufo](https://github.com/gufo-org/gufo)
+over two cables, with its RDMA transport from the `rdma` branch of
+[neuhaus/gufo](https://github.com/neuhaus/gufo/tree/rdma) (upstream in review).
+gufo exchanges each layer's partial results with one QP and
+RDMA WRITE with immediate, so it relies on write striping. RoCE addressing
+needs a netdev with an IPv4 address; a dummy one per host is enough:
+
+```sh
+# both hosts (10.77.0.2 on the second)
+sudo ip link add tbv0 type dummy
+sudo ip addr add 10.77.0.1/24 dev tbv0 && sudo ip link set tbv0 up
+sudo modprobe thunderbolt_ibverbs profile=linux_perf tbnet=prefer_rdma \
+  lanes=2 register_verbs=1 roce_netdev=tbv0 native_write_striping=1
+
+# any rail device will do; its QP stripes over all four rails
+ibv_devices
+gufo serve llm --model MODEL.gguf --tp-world-size 2 --tp-rank 0 \
+  --tp-bootstrap-port 18515 --tp-control-port 18516 \
+  --tp-control-token SHARED_TOKEN --tp-rdma-device usb4_rdma0
+gufo serve llm --model MODEL.gguf --tp-world-size 2 --tp-rank 1 \
+  --tp-bootstrap-host RANK0_ADDRESS --tp-bootstrap-port 18515 \
+  --tp-control-port 18516 --tp-control-token SHARED_TOKEN \
+  --tp-rdma-device usb4_rdma0
+```
+
+Measured this way (Qwen3.8 Flash-Next Q4, 25.8k-token prompt), prefill ran
+at 1824 tok/s against 1892 over FDR InfiniBand, with identical output.
+
+`/sys/kernel/debug/thunderbolt_ibverbs/summary` counts striped WRITEs
+(`data_wr_block_split`) and frames lost on a path (`data_rx_lost`; their
+credits are refunded and retransmission recovers the message).
+`peers` shows each rail's credits and, on `tx_pump`, why queued frames are
+not being sent. What this branch changes and measures:
+[docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
 
 ## Nix Thunderbolt Kernel
 

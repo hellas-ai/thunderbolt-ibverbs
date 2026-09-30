@@ -9,8 +9,9 @@ kernel workers that a per-process measurement (perftest --cpu_util) misses.
     sweep_perftest.py --server misty --dev usb4_rdma_p1r0 --gid 1 \\
         --label "usb4_rdma, 2 cables" --csv tbv.csv
 
-Appends one row per case: label, test, size, gbps, lat_us, client_cores,
-server_cores (busy cores averaged over the sample window).
+Appends one row per case: label, test, size, gbps, lat_us (typical, that is
+median, one-way latency), client_cores, server_cores (busy cores averaged
+over the sample window).
 """
 import argparse
 import csv
@@ -41,9 +42,12 @@ def busy_cores(out: str) -> float:
     return ncpu * (total - idle) / total if total else 0.0
 
 
-def run_case(args, test: str, size: int, port: int, bidir: bool):
+def run_case(args, test: str, size: int, port: int, bidir: bool, iters: int = 0):
     lat = test.endswith("_lat")
-    flags = f"-d {args.dev} -x {args.gid} -s {size} -D {args.seconds} -F -p {port}"
+    # Latency runs a fixed number of iterations: ib_read_lat fails at the end
+    # of a timed (-D) run on usb4_rdma.
+    run = f"-n {iters}" if lat else f"-D {args.seconds}"
+    flags = f"-d {args.dev} -x {args.gid} -s {size} {run} -F -p {port}"
     if not lat:
         flags += " --report_gbits"
         if bidir:
@@ -81,7 +85,7 @@ def run_case(args, test: str, size: int, port: int, bidir: bool):
         f = line.split()
         if len(f) >= 4 and re.fullmatch(r"\d+", f[0]) and re.fullmatch(r"\d+", f[1]):
             if lat:
-                lat_us = f[2]  # t_avg in duration mode
+                lat_us = f[4]  # t_typical (median)
             else:
                 gbps = f[3]  # BW average
     return gbps, lat_us, samples.get("client", ""), samples.get("server", "")
@@ -118,7 +122,15 @@ def main():
                 continue
             if size > max_size.get(name, size):
                 continue
-            gbps, lat_us, cc, sc = run_case(args, test, size, args.port + i % 50, bidir)
+            iters = 0
+            if test.endswith("_lat"):
+                # A short probe sizes the run to about --seconds.
+                probe = run_case(args, test, size, args.port + i % 50, bidir, 200)[1]
+                # At most 50000: long READ series fail now and then on usb4_rdma.
+                iters = min(max(int(args.seconds * 1e6 / float(probe)), 1000),
+                            50000) if probe else 1000
+            gbps, lat_us, cc, sc = run_case(args, test, size, args.port + i % 50, bidir,
+                                            iters)
             row = [args.label, name, size, gbps, lat_us,
                    f"{cc:.2f}" if cc != "" else "", f"{sc:.2f}" if sc != "" else ""]
             w.writerow(row)

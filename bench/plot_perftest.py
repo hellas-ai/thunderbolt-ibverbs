@@ -109,7 +109,7 @@ def main():
     figure(data, labels,
            [("ib_write_lat", "RDMA WRITE"), ("ib_read_lat", "RDMA READ"),
             ("ib_send_lat", "SEND")],
-           "lat_us", "average latency (µs)", "One-way latency by message size, 1 QP",
+           "lat_us", "typical latency (µs)", "One-way latency by message size, 1 QP",
            out / "lat_vs_size.svg", logy=True)
 
 

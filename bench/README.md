@@ -125,6 +125,11 @@ READs above 512 KiB fail on this driver without striping as well, and SENDs
 above 512 KiB fail with `native_write_striping` (which enables fragment
 striping for SENDs).
 
+Latency runs a fixed number of iterations (a probe sizes it to about
+`--seconds`, at most 50 000) and reports the typical, that is median,
+latency; `ib_read_lat` fails at the end of timed runs on usb4_rdma. Runs
+shorter than the CPU sample window show too little CPU load.
+
 `plot_perftest.py` draws the measure on top and the busy cores below: solid
 for the client, dashed for the server (for READ the client is the reader).
 The output is deterministic for the same CSV.
