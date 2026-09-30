@@ -484,6 +484,13 @@ struct tbv_mr {
 	struct ib_mr base;
 	struct tbv_state *owner;
 	struct ib_umem *umem;
+	/*
+	 * The umem's pages in order, so a copy finds the page of an offset
+	 * directly; scatterlist copy helpers walk from the first entry, which
+	 * costs one step per page before the offset. NULL when unindexed.
+	 */
+	struct page **pages;
+	unsigned long npages;
 	refcount_t refs;
 	struct work_struct free_work;
 	u64 start;
@@ -849,6 +856,7 @@ out:
 
 static void tbv_mr_free(struct tbv_mr *mr)
 {
+	kvfree(mr->pages);
 	if (mr->umem)
 		ib_umem_release(mr->umem);
 	if (mr->owner)
@@ -872,6 +880,80 @@ static void tbv_mr_put(struct tbv_mr *mr)
 		queue_work(mr->owner && mr->owner->workqueue ?
 			   mr->owner->workqueue : system_unbound_wq,
 			   &mr->free_work);
+}
+
+/*
+ * Lists the umem's pages in order. The index is optional: a scatterlist
+ * that does not start page-aligned and consist of whole pages (other than
+ * its last entry) leaves the MR unindexed, and copies walk the list.
+ */
+static void tbv_mr_index_pages(struct tbv_mr *mr)
+{
+	struct sg_table *sgt = &mr->umem->sgt_append.sgt;
+	unsigned long npages = 0;
+	struct scatterlist *sg;
+	struct page **pages;
+	unsigned int i;
+
+	for_each_sgtable_sg(sgt, sg, i) {
+		if (sg->offset ||
+		    (!sg_is_last(sg) && !PAGE_ALIGNED(sg->length)))
+			return;
+		npages += DIV_ROUND_UP(sg->length, PAGE_SIZE);
+	}
+	if (!npages)
+		return;
+
+	pages = kvmalloc_array(npages, sizeof(*pages), GFP_KERNEL);
+	if (!pages)
+		return;
+	npages = 0;
+	for_each_sgtable_sg(sgt, sg, i) {
+		unsigned long n = DIV_ROUND_UP(sg->length, PAGE_SIZE);
+		unsigned long j;
+
+		for (j = 0; j < n; j++)
+			pages[npages++] =
+				pfn_to_page(page_to_pfn(sg_page(sg)) + j);
+	}
+	mr->pages = pages;
+	mr->npages = npages;
+}
+
+/*
+ * Copies @len bytes between @buf and an indexed MR at @offset, counted from
+ * the start of the umem's first page (ib_umem_offset() plus the offset from
+ * the MR start). Returns -ENOENT for an unindexed MR.
+ */
+static int tbv_mr_copy_pages(struct tbv_mr *mr, size_t offset, void *buf,
+			     size_t len, bool to_mr)
+{
+	if (!mr->pages)
+		return -ENOENT;
+
+	while (len) {
+		unsigned long idx = offset >> PAGE_SHIFT;
+		size_t in_page = offset_in_page(offset);
+		size_t chunk = min_t(size_t, len, PAGE_SIZE - in_page);
+		struct page *page;
+		u8 *va;
+
+		if (idx >= mr->npages)
+			return -EFAULT;
+		page = mr->pages[idx];
+		va = kmap_local_page(page);
+		if (to_mr) {
+			memcpy(va + in_page, buf, chunk);
+			flush_dcache_page(page);
+		} else {
+			memcpy(buf, va + in_page, chunk);
+		}
+		kunmap_local(va);
+		buf = (u8 *)buf + chunk;
+		offset += chunk;
+		len -= chunk;
+	}
+	return 0;
 }
 
 static struct tbv_qp *tbv_qp_get_by_num(struct tbv_state *state, u32 qpn)
@@ -4080,9 +4162,17 @@ static int tbv_copy_send_range(const struct tbv_send_segment *segs, int nsegs,
 			seg_off = offset - skipped;
 
 		chunk = min_t(u32, seg->length - seg_off, length - copied);
-		ret = ib_umem_copy_from((u8 *)dst + copied, seg->mr->umem,
-					seg->addr + seg_off - seg->mr->start,
-					chunk);
+		ret = tbv_mr_copy_pages(seg->mr,
+					ib_umem_offset(seg->mr->umem) +
+						seg->addr + seg_off -
+						seg->mr->start,
+					(u8 *)dst + copied, chunk, false);
+		if (ret == -ENOENT)
+			ret = ib_umem_copy_from((u8 *)dst + copied,
+						seg->mr->umem,
+						seg->addr + seg_off -
+							seg->mr->start,
+						chunk);
 		if (ret)
 			return ret;
 		copied += chunk;
@@ -6629,6 +6719,7 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 	size_t copied;
 	u64 mr_end;
 	u64 end;
+	int ret;
 
 	if (!len)
 		return 0;
@@ -6642,6 +6733,9 @@ static int tbv_umem_copy_to(struct tbv_mr *mr, u64 addr, const void *src,
 		return -EFAULT;
 
 	offset = ib_umem_offset(mr->umem) + addr - mr->start;
+	ret = tbv_mr_copy_pages(mr, offset, (void *)src, len, true);
+	if (ret != -ENOENT)
+		return ret;
 	copied = sg_pcopy_from_buffer(sgt->sgl, sgt->orig_nents, src, len,
 				      offset);
 	return copied == len ? 0 : -EFAULT;
@@ -6704,6 +6798,10 @@ static int tbv_umem_copy_from_iova(struct tbv_mr *mr, u64 iova,
 	if (ret)
 		return ret;
 
+	ret = tbv_mr_copy_pages(mr, ib_umem_offset(mr->umem) + addr - mr->start,
+				dst, len, false);
+	if (ret != -ENOENT)
+		return ret;
 	return ib_umem_copy_from(dst, mr->umem, addr - mr->start, len);
 }
 
@@ -6730,6 +6828,19 @@ static int tbv_umem_page_from_addr(struct tbv_mr *mr, u64 addr, u32 max_len,
 		return -EFAULT;
 
 	offset = ib_umem_offset(mr->umem) + addr - mr->start;
+	if (mr->pages) {
+		unsigned long idx = offset >> PAGE_SHIFT;
+		size_t page_off = offset_in_page(offset);
+		size_t chunk = min_t(size_t, PAGE_SIZE - page_off, max_len);
+
+		chunk = min_t(size_t, chunk, TBV_NATIVE_DATA_FRAME_SIZE);
+		if (idx >= mr->npages || !chunk)
+			return -EFAULT;
+		*page_out = mr->pages[idx];
+		*page_off_out = page_off;
+		*len_out = chunk;
+		return 0;
+	}
 	for_each_sgtable_sg(sgt, sg, i) {
 		size_t seg_len = sg->length;
 		size_t seg_off;
@@ -9473,8 +9584,10 @@ static struct ib_mr *tbv_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	mr->length = length;
 	mr->virt_addr = virt_addr;
 	mr->access = access;
+	tbv_mr_index_pages(mr);
 	ret = tbv_mr_publish(mr, pd);
 	if (ret) {
+		kvfree(mr->pages);
 		ib_umem_release(mr->umem);
 		kfree(mr);
 		return ERR_PTR(ret);
