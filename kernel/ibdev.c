@@ -10032,10 +10032,11 @@ static int tbv_ibdev_register_one(struct tbv_state *state,
  * The historical commit (module/ ca70710) called out that probe-order
  * naming gives different ib_device numbers on different nodes for the
  * same physical lane, which breaks any tooling that pins to "usb4_rdma2".
- * Use (tb_domain_index * TBV_NATIVE_MAX_LANES + lane) so the same lane on
- * the same domain always gets the same name. Apple peers don't carry a
+ * Use (tb_domain_index * (TBV_NATIVE_MAX_LANES + 1) + lane) so the same lane
+ * on the same domain always gets the same name. Apple peers don't carry a
  * lane subdivision, so they take the per-domain "Apple slot" which lives
- * just above the native lane range.
+ * just above the native lane range: with four lanes, domain 0 names
+ * usb4_rdma0..3 (Apple 4) and domain 1 usb4_rdma5..8 (Apple 9).
  */
 static int tbv_ibdev_rail_name_index(const struct tbv_rail *rail)
 {
