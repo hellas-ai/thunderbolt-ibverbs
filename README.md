@@ -204,17 +204,24 @@ explicit `modprobe thunderbolt_net` still works, and IP over Thunderbolt is
 gone while it is blacklisted).
 
 A persistent setup, here with the module installed by DKMS and a dummy
-netdev for the RoCE addresses (use a different address on the other host):
+netdev for the RoCE addresses:
 
 ```text
 # /etc/modprobe.d/thunderbolt-ibverbs.conf
 blacklist thunderbolt_net
 options thunderbolt_ibverbs profile=linux_perf tbnet=prefer_rdma lanes=2 register_verbs=1 roce_netdev=tbv0 native_write_striping=1
-# the RoCE netdev has to exist before the rails register
-install thunderbolt_ibverbs /usr/sbin/ip link show tbv0 >/dev/null 2>&1 || { /usr/sbin/ip link add tbv0 type dummy && /usr/sbin/ip addr add 10.77.0.1/24 dev tbv0 && /usr/sbin/ip link set tbv0 up; }; /usr/sbin/modprobe --ignore-install thunderbolt_ibverbs $CMDLINE_OPTS
 
 # /etc/modules-load.d/thunderbolt-ibverbs.conf
 thunderbolt_ibverbs
+```
+
+The rails register their RDMA devices only once `roce_netdev` exists, so
+the netdev can come up at any point during boot. With NetworkManager (use a
+different address on the other host):
+
+```sh
+sudo nmcli connection add type dummy ifname tbv0 con-name tbv0 \
+  ipv4.method manual ipv4.addresses 192.168.240.1/24 ipv6.method disabled
 ```
 
 rdma-core's udev rule `60-rdma-persistent-naming.rules` renames RDMA devices
