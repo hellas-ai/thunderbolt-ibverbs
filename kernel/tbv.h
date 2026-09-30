@@ -454,6 +454,8 @@ struct tbv_state {
 	bool native_data;
 	bool apple_data;
 	bool native_fragment_striping;
+	bool native_write_striping;
+	u32 native_write_stripe_min_bytes;
 	u32 native_domain_mask;
 	bool register_verbs;
 	bool services_registered;
@@ -486,6 +488,7 @@ struct tbv_state {
 	atomic64_t data_wr_zcopy_fallback;
 	atomic64_t data_wr_zcopy_fallback_striping;
 	atomic64_t data_wr_zcopy_fallback_unsafe_sge;
+	atomic64_t data_wr_block_split;
 	atomic64_t data_wr_copy_error;
 	atomic64_t data_wr_path_send;
 	atomic64_t data_wr_path_send_error;
@@ -582,6 +585,7 @@ struct tbv_state {
 	atomic64_t data_rx_active_timeout;
 	atomic64_t data_rx_reorder_buffered;
 	atomic64_t data_rx_reorder_delivered;
+	atomic64_t data_rx_block_write;
 	atomic64_t data_rx_reorder_dropped;
 	atomic64_t data_rx_reorder_timeout;
 	atomic64_t data_rx_reorder_window;

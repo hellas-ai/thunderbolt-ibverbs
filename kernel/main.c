@@ -107,6 +107,16 @@ module_param(native_fragment_striping, bool, 0444);
 MODULE_PARM_DESC(native_fragment_striping,
 		 "Stripe native Linux SEND fragments across active rails");
 
+static bool native_write_striping;
+module_param(native_write_striping, bool, 0444);
+MODULE_PARM_DESC(native_write_striping,
+		 "Split native RDMA WRITEs into one contiguous block per active rail (both peers; implies native_fragment_striping)");
+
+static unsigned int native_write_stripe_min_bytes = 65536;
+module_param(native_write_stripe_min_bytes, uint, 0444);
+MODULE_PARM_DESC(native_write_stripe_min_bytes,
+		 "Smallest native RDMA WRITE split across rails; smaller ones stay on the QP's rail");
+
 static unsigned int native_domain_mask = ~0u;
 module_param(native_domain_mask, uint, 0444);
 MODULE_PARM_DESC(native_domain_mask,
@@ -175,7 +185,15 @@ static int __init tbv_init(void)
 	ret = tbv_core_init(&tbv_driver_state, &resolved, &identity_cfg);
 	if (ret)
 		goto err_path_symbols;
-	tbv_driver_state.native_fragment_striping = native_fragment_striping;
+	/*
+	 * Block-striped writes advance the receive PSN out of arrival order, so
+	 * SENDs on the same QP need the reordering receive path too.
+	 */
+	tbv_driver_state.native_fragment_striping = native_fragment_striping ||
+						    native_write_striping;
+	tbv_driver_state.native_write_striping = native_write_striping;
+	tbv_driver_state.native_write_stripe_min_bytes =
+		native_write_stripe_min_bytes;
 	tbv_driver_state.native_domain_mask = native_domain_mask;
 	tbv_driver_state.native_data = native_data;
 	tbv_driver_state.apple_data = apple_data;

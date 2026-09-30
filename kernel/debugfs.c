@@ -113,6 +113,10 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "apple_data: %u\n", state->apple_data);
 	seq_printf(s, "native_fragment_striping: %u\n",
 		   state->native_fragment_striping);
+	seq_printf(s, "native_write_striping: %u\n",
+		   state->native_write_striping);
+	seq_printf(s, "native_write_stripe_min_bytes: %u\n",
+		   state->native_write_stripe_min_bytes);
 	seq_printf(s, "native_domain_mask: 0x%x\n", state->native_domain_mask);
 	seq_printf(s, "register_verbs: %u\n", state->register_verbs);
 	seq_printf(s, "verbs_registered: %u\n", state->verbs_registered);
@@ -152,6 +156,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_zcopy_fallback_striping));
 	seq_printf(s, "data_wr_zcopy_fallback_unsafe_sge: %lld\n",
 		   atomic64_read(&state->data_wr_zcopy_fallback_unsafe_sge));
+	seq_printf(s, "data_wr_block_split: %lld\n",
+		   atomic64_read(&state->data_wr_block_split));
 	seq_printf(s, "data_wr_copy_error: %lld\n",
 		   atomic64_read(&state->data_wr_copy_error));
 	seq_printf(s, "data_wr_path_send: %lld\n",
@@ -344,6 +350,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_reorder_buffered));
 	seq_printf(s, "data_rx_reorder_delivered: %lld\n",
 		   atomic64_read(&state->data_rx_reorder_delivered));
+	seq_printf(s, "data_rx_block_write: %lld\n",
+		   atomic64_read(&state->data_rx_block_write));
 	seq_printf(s, "data_rx_reorder_dropped: %lld\n",
 		   atomic64_read(&state->data_rx_reorder_dropped));
 	seq_printf(s, "data_rx_reorder_timeout: %lld\n",

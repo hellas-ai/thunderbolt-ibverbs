@@ -35,6 +35,14 @@ enum tbv_native_data_flag {
 	TBV_NATIVE_DATA_F_LAST = 1u << 0,
 	TBV_NATIVE_DATA_F_SOLICITED = 1u << 1,
 	TBV_NATIVE_DATA_F_RAW_STREAM = 1u << 2,
+	/*
+	 * Fragment of an RDMA_WRITE/RDMA_WRITE_IMM whose fragments may arrive
+	 * over several rails in any order. The receiver places each fragment at
+	 * remote_addr + frag_offset as it arrives. imm_data carries the total
+	 * message length, except in the last fragment of an RDMA_WRITE_IMM,
+	 * where it carries the immediate data.
+	 */
+	TBV_NATIVE_DATA_F_BLOCK = 1u << 3,
 };
 
 enum tbv_native_read_ack_status {
