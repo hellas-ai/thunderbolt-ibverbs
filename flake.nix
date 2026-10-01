@@ -21,10 +21,12 @@
       upstreamThunderboltKernelPatches = import ./kernel-workflow/patches/upstream-thunderbolt-next.nix;
       portableLocalThunderboltKernelPatches = import ./kernel-workflow/patches/local-portable.nix;
       portableThunderboltKernelPatches = import ./kernel-workflow/patches/portable.nix;
+      portableThunderboltKernelPatchesFor = import ./kernel-workflow/patches/portable-for-kernel.nix;
       integrationDebugThunderboltKernelPatches = import ./kernel-workflow/patches/local-integration-debug.nix;
       integrationThunderboltKernelPatches = import ./kernel-workflow/patches/local.nix;
       kernelPatchSets = {
         kernelPatches = portableThunderboltKernelPatches;
+        kernelPatchesFor = portableThunderboltKernelPatchesFor;
         portableKernelPatches = portableThunderboltKernelPatches;
         integrationKernelPatches = integrationThunderboltKernelPatches;
         upstreamKernelPatches = upstreamThunderboltKernelPatches;
@@ -141,20 +143,22 @@
       mkPortableKernelPatchCheck =
         pkgs:
         let
+          kernel = pkgs.linuxPackages_latest.kernel;
+          kernelPatches = portableThunderboltKernelPatchesFor kernel.version;
           portablePatchBundle = pkgs.runCommand "thunderbolt-portable-kernel-patches" { } ''
             mkdir -p "$out"
             ${lib.concatMapStringsSep "\n" (patch: ''
               cp ${patch.patch} "$out/${baseNameOf (toString patch.patch)}"
-            '') portableThunderboltKernelPatches}
+            '') kernelPatches}
             printf '%s\n' ${
-              lib.escapeShellArgs (map (patch: baseNameOf (toString patch.patch)) portableThunderboltKernelPatches)
+              lib.escapeShellArgs (map (patch: baseNameOf (toString patch.patch)) kernelPatches)
             } > "$out/series"
           '';
         in
         pkgs.stdenv.mkDerivation {
           pname = "thunderbolt-portable-kernel-patches-apply-check";
           version = "0.3.4";
-          src = pkgs.linuxPackages_latest.kernel.src;
+          src = kernel.src;
 
           nativeBuildInputs = [ pkgs.git ];
 
