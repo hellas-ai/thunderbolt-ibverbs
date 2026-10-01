@@ -327,6 +327,10 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_rnr_suppressed));
 	seq_printf(s, "data_rx_copy_error: %lld\n",
 		   atomic64_read(&state->data_rx_copy_error));
+	seq_printf(s, "data_rx_dmabuf_zcopy: %lld\n",
+		   atomic64_read(&state->data_rx_dmabuf_zcopy));
+	seq_printf(s, "data_rx_dmabuf_zcopy_error: %lld\n",
+		   atomic64_read(&state->data_rx_dmabuf_zcopy_error));
 	seq_printf(s, "data_rx_send_len_error: %lld\n",
 		   atomic64_read(&state->data_rx_send_len_error));
 	seq_printf(s, "data_rx_send_prot_error: %lld\n",

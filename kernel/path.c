@@ -95,6 +95,13 @@ struct tbv_data_frame {
 	tbv_path_tx_done_fn done;
 	void *done_ctx;
 	bool tx;
+	/* zcopy_rx-only: one-shot frame that DMAs the wire payload
+	 * directly into an MR page, no kernel bounce buffer. Set on
+	 * the rx_path branch in tbv_path_post_rx_zcopy_frame().
+	 */
+	bool zcopy_rx;
+	struct page *zcopy_page;
+	unsigned int zcopy_page_off;
 };
 
 struct tbv_tx_packet {
@@ -751,6 +758,9 @@ static void tbv_path_rx_supp_poll_work(struct work_struct *work)
 }
 
 static int tbv_path_post_rx_frame(struct tbv_data_frame *f);
+static void tbv_path_zcopy_rx_complete(struct tb_ring *ring,
+				       struct ring_frame *frame,
+				       bool canceled);
 
 static void tbv_path_rx_start_raw(struct tbv_path *path,
 				  const struct tbv_native_data_header *hdr)
@@ -1155,6 +1165,84 @@ static int tbv_path_post_rx_frame(struct tbv_data_frame *f)
 	dma_sync_single_for_device(tb_ring_dma_device(path->rx_ring), f->dma,
 				   TBV_DATA_FRAME_SIZE, DMA_FROM_DEVICE);
 	return tb_ring_rx(path->rx_ring, &f->frame);
+}
+
+int tbv_path_post_rx_zcopy_frame(struct tbv_path *path,
+				 struct page *page, unsigned int page_off,
+				 u32 len, void *done_ctx)
+{
+	struct tbv_data_frame *f;
+	struct device *dma_dev;
+	dma_addr_t dma;
+
+	if (!path || !path->rx_ring || !page)
+		return -EINVAL;
+
+	dma_dev = tb_ring_dma_device(path->rx_ring);
+	if (!tbv_dma_device_ready(dma_dev))
+		return -EIO;
+
+	if (page_off + len > PAGE_SIZE)
+		return -EINVAL;
+
+	f = kzalloc(sizeof(*f), GFP_KERNEL);
+	if (!f)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&f->frame.list);
+	INIT_LIST_HEAD(&f->free_node);
+	f->path = path;
+	f->tx = false;
+	f->zcopy_rx = true;
+	f->buf = NULL;
+	f->zcopy_page = page;
+	f->zcopy_page_off = page_off;
+	f->done = tbv_rx_zcopy_complete;
+	f->done_ctx = done_ctx;
+
+	dma = dma_map_page(dma_dev, page, page_off, len, DMA_FROM_DEVICE);
+	if (dma_mapping_error(dma_dev, dma)) {
+		kfree(f);
+		return -EIO;
+	}
+	f->dma = dma;
+	f->frame.buffer_phy = dma;
+	f->frame.size = len;
+	f->frame.flags = 0;
+	f->frame.sof = 0;
+	f->frame.eof = 0;
+	f->frame.callback = tbv_path_zcopy_rx_complete;
+
+	dma_sync_single_for_device(dma_dev, dma, len, DMA_FROM_DEVICE);
+	return tb_ring_rx(path->rx_ring, &f->frame);
+}
+
+static void tbv_path_zcopy_rx_complete(struct tb_ring *ring,
+				       struct ring_frame *frame,
+				       bool canceled)
+{
+	struct tbv_data_frame *f = container_of(frame, struct tbv_data_frame,
+						frame);
+	struct tbv_path *path = f->path;
+	struct device *dma_dev = tb_ring_dma_device(ring);
+	int status = canceled ? -ECANCELED : 0;
+
+	if (tbv_dma_device_ready(dma_dev))
+		dma_unmap_page(dma_dev, f->dma, f->frame.size, DMA_FROM_DEVICE);
+
+	if (path && path->rail && path->rail->peer) {
+		struct tbv_state *state = path->rail->peer->state;
+
+		if (state) {
+			atomic64_inc(&state->data_rx_dmabuf_zcopy);
+			if (status)
+				atomic64_inc(&state->data_rx_dmabuf_zcopy_error);
+		}
+	}
+
+	if (f->done)
+		f->done(f->done_ctx, status);
+	kfree(f);
 }
 
 const char *tbv_path_state_name(enum tbv_path_state state)
@@ -2377,6 +2465,131 @@ int tbv_path_send_page_stream(struct tbv_path *path,
 						     done, done_ctx);
 		if (!packet) {
 			dma_unmap_page(dma_dev, dma, len, DMA_TO_DEVICE);
+			if (done)
+				done(done_ctx, -ENOMEM);
+			ret = -ENOMEM;
+			goto err_release;
+		}
+		packet->owner_ctx = meta_done_ctx ? meta_done_ctx : done_ctx;
+		packet->raw_stream_end = last;
+		list_add_tail(&packet->node, &packets);
+		packet_count++;
+		prepared += len;
+	}
+
+	ret = tbv_path_enqueue_data_list(path, &packets, packet_count,
+					 send_flags & TBV_PATH_SEND_DEFER);
+	if (ret)
+		goto err_release;
+	return 0;
+
+err_release:
+	if (!packet_count && meta_done)
+		meta_done(meta_done_ctx, ret);
+	tbv_path_release_packet_list(&packets, ret);
+	return ret;
+
+err_meta_done:
+	if (meta_done)
+		meta_done(meta_done_ctx, ret);
+	return ret;
+}
+
+int tbv_path_send_dma_stream(struct tbv_path *path,
+			     const struct tbv_native_data_header *hdr,
+			     u32 total_length, unsigned int send_flags,
+			     tbv_path_tx_done_fn meta_done,
+			     void *meta_done_ctx,
+			     tbv_path_next_dma_fn next, void *next_ctx)
+{
+	LIST_HEAD(packets);
+	u32 prepared = 0;
+	u32 packet_count = 0;
+	struct tbv_tx_packet *packet;
+	u32 max_raw_payload;
+	struct tbv_native_data_header stream_hdr;
+	u8 *hdr_buf;
+	int ret;
+
+	if (!path || !hdr || !next || !total_length) {
+		ret = -EINVAL;
+		goto err_meta_done;
+	}
+	if (send_flags & ~(TBV_PATH_SEND_DEFER)) {
+		ret = -EINVAL;
+		goto err_meta_done;
+	}
+	if (total_length > TBV_NATIVE_DATA_MAX_MSG_SIZE) {
+		ret = -EMSGSIZE;
+		goto err_meta_done;
+	}
+	if (!path->tx_ring) {
+		ret = -ENOTCONN;
+		goto err_meta_done;
+	}
+	if (hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_WRITE ||
+	    hdr->opcode == TBV_NATIVE_DATA_OP_RDMA_WRITE_IMM)
+		max_raw_payload = TBV_DATA_FRAME_SIZE;
+	else
+		max_raw_payload = TBV_NATIVE_DATA_MAX_PAYLOAD;
+
+	if (!tbv_dma_device_ready(tb_ring_dma_device(path->tx_ring))) {
+		ret = -EPROBE_DEFER;
+		goto err_meta_done;
+	}
+
+	hdr_buf = kzalloc(TBV_NATIVE_DATA_HDR_SIZE, GFP_KERNEL);
+	if (!hdr_buf) {
+		ret = -ENOMEM;
+		goto err_release;
+	}
+
+	stream_hdr = *hdr;
+	stream_hdr.length = total_length;
+	stream_hdr.flags |= TBV_NATIVE_DATA_F_LAST |
+			    TBV_NATIVE_DATA_F_RAW_STREAM;
+	ret = tbv_native_data_build_header(hdr_buf, TBV_NATIVE_DATA_HDR_SIZE,
+					   &stream_hdr);
+	if (ret < 0) {
+		kfree(hdr_buf);
+		goto err_release;
+	}
+
+	packet = tbv_path_alloc_data_packet_owned(path, hdr_buf,
+						  TBV_NATIVE_DATA_HDR_SIZE,
+						  meta_done, meta_done_ctx);
+	if (!packet) {
+		kfree(hdr_buf);
+		ret = -ENOMEM;
+		goto err_release;
+	}
+	packet->raw_stream_start = true;
+	list_add_tail(&packet->node, &packets);
+	packet_count++;
+
+	while (prepared < total_length) {
+		tbv_path_tx_done_fn done = NULL;
+		void *done_ctx = NULL;
+		dma_addr_t dma = 0;
+		bool last;
+		u32 len = 0;
+
+		ret = next(next_ctx, &dma, &len, &done, &done_ctx);
+		if (ret)
+			goto err_release;
+		if (!len || len > max_raw_payload ||
+		    len > total_length - prepared) {
+			if (done)
+				done(done_ctx, -EINVAL);
+			ret = -EINVAL;
+			goto err_release;
+		}
+
+		last = prepared + len == total_length;
+
+		packet = tbv_path_alloc_zcopy_packet(path, dma, len, false,
+						     done, done_ctx);
+		if (!packet) {
 			if (done)
 				done(done_ctx, -ENOMEM);
 			ret = -ENOMEM;

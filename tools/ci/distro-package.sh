@@ -75,6 +75,7 @@ stage_source() {
 		README.md \
 		kernel \
 		proto \
+		userspace/usb4_rdma/usb4_rdma_dv.h \
 		| tar -C "$stage" -xf -
 }
 
