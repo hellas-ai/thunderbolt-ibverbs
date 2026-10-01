@@ -2502,6 +2502,23 @@ static int tbv_create_qp(struct ib_qp *qp, struct ib_qp_init_attr *init_attr,
 	    init_attr->qp_type != IB_QPT_UC &&
 	    init_attr->qp_type != IB_QPT_GSI)
 		return -EOPNOTSUPP;
+	/*
+	 * The transport cannot retransmit on its own: a SEND that arrives
+	 * before the peer has posted its receive gets an RNR NAK.  With the
+	 * verbs defaults (rnr_retry = 0, retry_cnt = 0) that SEND completes
+	 * immediately with RNR_RETRY_EXC_ERR and marks the QP in error,
+	 * taking the whole connection down on a single scheduler-induced
+	 * race between the sender's post_send and the receiver's
+	 * post_recv.  Default data QPs to infinite RNR retries and a retry
+	 * count instead: the SEND then waits for the peer's advertised
+	 * recv credits (see tbv_send_rnr_waits_for_recv_credit).  Users can
+	 * still override both through modify_qp (IB_QP_RNR_RETRY /
+	 * IB_QP_RETRY_CNT).
+	 */
+	if (!gsi) {
+		tqp->attr.rnr_retry = 7; /* infinite, per the IB spec */
+		tqp->attr.retry_cnt = TBV_SEND_MAX_RETRIES;
+	}
 	tqp->backend = tbv_ibdev_backend(qp->device);
 	if (tbv_backend_is_apple(tqp->backend) &&
 	    init_attr->qp_type != IB_QPT_UC)
