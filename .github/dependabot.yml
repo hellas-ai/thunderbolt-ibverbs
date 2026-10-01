@@ -1,18 +1,7 @@
 version: 2
-registries:
-  kernel-org:
-    # Declare this anonymous Git host for Dependabot's egress allowlist.
-    type: git
-    url: https://git.kernel.org
-    # GitHub requires a secret reference even for this public host. This
-    # Dependabot secret contains the public dummy value "anonymous".
-    username: anonymous
-    password: ${{ secrets.KERNEL_ORG_ANONYMOUS_PASSWORD }}
 updates:
   - package-ecosystem: "nix"
     directory: "/"
-    registries:
-      - kernel-org
     schedule:
       interval: "daily"
     groups:
