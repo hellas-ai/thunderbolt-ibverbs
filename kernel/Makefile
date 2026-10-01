@@ -11,6 +11,18 @@ thunderbolt_ibverbs-y := main.o profile.o backend.o configfs.o core.o debugfs.o 
 
 ccflags-y := -Wall -Wextra -Wno-unused-parameter -I$(src) -I$(src)/..
 
+# Thunderbolt dropped the probe ID argument in Linux 7.3. Probe the actual
+# headers, including distro backports, instead of assuming a version boundary.
+ifneq ($(KERNELRELEASE),)
+tbv-probe-without-id := $(call try-run,\
+	$(CC) $(NOSTDINC_FLAGS) $(LINUXINCLUDE) $(KBUILD_CPPFLAGS) $(KBUILD_CFLAGS) \
+	-include $(srctree)/include/linux/compiler_types.h \
+	-DMODULE -Werror -c $(src)/compat/tb_service_probe.c -o "$$TMP",y,n)
+ifeq ($(tbv-probe-without-id),y)
+ccflags-y += -DTBV_TB_SERVICE_PROBE_WITHOUT_ID
+endif
+endif
+
 .PHONY: all clean modules modules_install help
 
 all: modules

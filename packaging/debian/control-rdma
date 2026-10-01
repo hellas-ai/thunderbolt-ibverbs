@@ -3,7 +3,7 @@ Version: @VERSION@
 Section: libs
 Priority: optional
 Architecture: amd64
-Depends: libibverbs1
+Depends: libibverbs1 (= @RDMA_CORE_VERSION@)
 Maintainer: George Whewell <george@hellas.ai>
 Homepage: https://github.com/hellas-ai/thunderbolt-ibverbs
 Description: usb4_rdma libibverbs userspace provider

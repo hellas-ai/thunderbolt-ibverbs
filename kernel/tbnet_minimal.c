@@ -1421,8 +1421,12 @@ tbv_tbnet_minimal_legacy_session_allowed(struct tbv_tbnet_identity *identity,
 #endif
 }
 
+#ifdef TBV_TB_SERVICE_PROBE_WITHOUT_ID
+static int tbv_tbnet_minimal_probe(struct tb_service *svc)
+#else
 static int tbv_tbnet_minimal_probe(struct tb_service *svc,
 				   const struct tb_service_id *id)
+#endif
 {
 	struct tbv_tbnet_identity *identity = tbv_tbnet_minimal_identity;
 	struct tb_xdomain *xd = tb_service_parent(svc);

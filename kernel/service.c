@@ -554,12 +554,45 @@ static const struct tb_service_id tbv_service_ids[] = {
 };
 MODULE_DEVICE_TABLE(tbsvc, tbv_service_ids);
 
+#ifdef TBV_TB_SERVICE_PROBE_WITHOUT_ID
+static int tbv_service_probe_without_id(struct tb_service *svc)
+{
+	const struct tb_service_id *id;
+
+	/*
+	 * The new callback omits the matched ID. Recover the same table entry
+	 * so driver_data continues to select the native lane and Apple matches
+	 * retain their protocol version/revision restrictions.
+	 */
+	for (id = tbv_service_ids; id->match_flags; id++) {
+		if ((id->match_flags & TBSVC_MATCH_PROTOCOL_KEY) &&
+		    strcmp(id->protocol_key, svc->key))
+			continue;
+		if ((id->match_flags & TBSVC_MATCH_PROTOCOL_ID) &&
+		    id->protocol_id != svc->prtcid)
+			continue;
+		if ((id->match_flags & TBSVC_MATCH_PROTOCOL_VERSION) &&
+		    id->protocol_version != svc->prtcvers)
+			continue;
+		if ((id->match_flags & TBSVC_MATCH_PROTOCOL_REVISION) &&
+		    id->protocol_revision != svc->prtcrevs)
+			continue;
+		return tbv_service_probe(svc, id);
+	}
+	return -ENODEV;
+}
+#endif
+
 static struct tb_service_driver tbv_service_driver = {
 	.driver = {
 		.owner = THIS_MODULE,
 		.name = TBV_DRV_NAME,
 	},
+#ifdef TBV_TB_SERVICE_PROBE_WITHOUT_ID
+	.probe = tbv_service_probe_without_id,
+#else
 	.probe = tbv_service_probe,
+#endif
 	.remove = tbv_service_remove,
 	.id_table = tbv_service_ids,
 };

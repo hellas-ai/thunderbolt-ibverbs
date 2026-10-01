@@ -4,10 +4,8 @@
 # rdma-core source as the target distro's libibverbs so the PABI version
 # matches and apt/dnf/pacman can install the package as a drop-in.
 #
-#   debian      → upstream rdma-core v62.0 (Debian sid ships current)
-#   ubuntu      → distro's own rdma-core via apt-get source (handles 22.04+
-#                 where stock libibverbs PABI is older than v62.0)
-#   fedora|arch → upstream rdma-core v62.0
+#   debian|ubuntu → exact source package of the installed libibverbs1
+#   fedora|arch   → upstream tag matching the installed rdma-core version
 
 set -euo pipefail
 
@@ -23,8 +21,9 @@ Environment:
   TBV_VERSION       Override base version (default reads PACKAGE_VERSION from dkms.conf).
   OUT_DIR           Output directory (default $PWD/dist).
   WORK_DIR          Scratch directory (default mktemp).
-  RDMA_CORE_TAG     rdma-core git tag for the upstream-source distros (default v62.0).
-                    Ignored for ubuntu (uses apt-get source).
+  RDMA_CORE_TAG     Override the matching upstream tag for fedora/arch.
+                    The built provider must still resolve against stock libibverbs.
+                    Ignored for debian/ubuntu (uses apt-get source).
   TBV_SKIP_DEPS     Skip distro deps install (default 0).
   TBV_SKIP_BUILD    Skip the rdma-core build step (used by the arch builder
                     re-exec; default 0).
@@ -57,7 +56,7 @@ fi
 
 out_dir="${OUT_DIR:-$repo_root/dist}"
 work_dir="${WORK_DIR:-$(mktemp -d)}"
-rdma_core_tag="${RDMA_CORE_TAG:-v62.0}"
+rdma_core_tag="${RDMA_CORE_TAG:-}"
 skip_deps="${TBV_SKIP_DEPS:-0}"
 skip_build="${TBV_SKIP_BUILD:-0}"
 pkgname="usb4-rdma-provider"
@@ -67,54 +66,58 @@ mkdir -p "$out_dir" "$work_dir"
 install_deps() {
 	[[ "$skip_deps" == "1" ]] && return 0
 	case "$distro" in
-		debian)
+		debian|ubuntu)
 			export DEBIAN_FRONTEND=noninteractive
+			# Enable source repositories in both deb822 and traditional images.
+			local sources
+			for sources in /etc/apt/sources.list.d/*.sources; do
+				[[ -f "$sources" ]] || continue
+				sed -i 's/^Types: deb$/Types: deb deb-src/' "$sources"
+			done
+			for sources in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+				[[ -f "$sources" ]] || continue
+				awk '$1 == "deb" { $1 = "deb-src"; print }' "$sources"
+			done > /etc/apt/sources.list.d/tbv-rdma-source.list
 			apt-get update -qq
 			apt-get install -y -qq --no-install-recommends \
 				build-essential ca-certificates cmake dpkg-dev \
-				git libcap-dev libnl-3-dev libnl-route-3-dev libsystemd-dev \
-				libudev-dev libssl-dev ninja-build patch patchelf pkg-config \
-				python3-docutils python3-pyelftools
-			;;
-		ubuntu)
-			export DEBIAN_FRONTEND=noninteractive
-			# Enable deb-src so apt-get source can fetch rdma-core. Ubuntu 22.04
-			# uses /etc/apt/sources.list; 24.04 uses /etc/apt/sources.list.d/ubuntu.sources.
-			if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
-				sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
-			else
-				sed -i 's/^# deb-src/deb-src/' /etc/apt/sources.list
-			fi
-			apt-get update -qq
-			apt-get install -y -qq --no-install-recommends \
-				build-essential ca-certificates cmake dpkg-dev \
-				libcap-dev libnl-3-dev libnl-route-3-dev libsystemd-dev \
+				libcap-dev libibverbs1 libnl-3-dev libnl-route-3-dev libsystemd-dev \
 				libudev-dev libssl-dev ninja-build patch patchelf pkg-config \
 				python3-docutils python3-pyelftools
 			;;
 		fedora)
 			dnf install -y -q --setopt=install_weak_deps=False \
-				cmake gcc gcc-c++ git libcap-devel libnl3-devel libudev-devel \
+				cmake gcc gcc-c++ git libcap-devel libibverbs libnl3-devel libudev-devel \
 				make ninja-build openssl-devel patch patchelf pkgconf rpm-build \
 				python3-docutils python3-pyelftools systemd-devel tar
 			;;
 		arch)
 			pacman -Syu --noconfirm --needed \
 				base-devel ca-certificates cmake git libnl ninja patch \
-				patchelf python-docutils python-pyelftools sudo systemd
+				patchelf python-docutils python-pyelftools rdma-core sudo systemd
 			;;
 	esac
 }
 
-# Populate $src with the rdma-core source tree, patched. Strategy depends on
-# distro: ubuntu uses its own packaged source so PABI matches stock libibverbs;
-# everything else uses upstream v62.0.
+# The provider uses rdma-core's private ABI, which changes independently of
+# libibverbs.so.1. Always select source matching the installed distro library.
+rdma_core_package_version() {
+	case "$distro" in
+		debian|ubuntu) dpkg-query -W -f='${Version}' libibverbs1 ;;
+		fedora) rpm -q --qf '%{VERSION}' libibverbs ;;
+		arch) pacman -Q rdma-core | awk '{ print $2 }' ;;
+	esac
+}
+
 fetch_rdma_core_source() {
 	local src="$1"
 	rm -rf "$src"
-	if [[ "$distro" == "ubuntu" ]]; then
+	if [[ "$distro" == "debian" || "$distro" == "ubuntu" ]]; then
+		local source_package
+		source_package="$(dpkg-query -W -f='${source:Package}=${source:Version}' libibverbs1)"
 		mkdir -p "$src"
-		( cd "$src" && apt-get source rdma-core >/dev/null )
+		printf '==> Distro rdma-core source: %s\n' "$source_package"
+		( cd "$src" && apt-get source "$source_package" >/dev/null )
 		# apt-get source extracts to ./rdma-core-<ver>/; move it up so $src
 		# itself is the source root.
 		local extracted
@@ -124,6 +127,12 @@ fetch_rdma_core_source() {
 		mv "$extracted"/* "$extracted"/.[!.]* "$src"/ 2>/dev/null || true
 		rmdir "$extracted"
 	else
+		local upstream_version
+		upstream_version="$(rdma_core_package_version)"
+		upstream_version="${upstream_version#*:}"
+		[[ "$distro" != "arch" ]] || upstream_version="${upstream_version%-*}"
+		rdma_core_tag="${rdma_core_tag:-v$upstream_version}"
+		printf '==> Matching upstream rdma-core source: %s\n' "$rdma_core_tag"
 		git clone --depth 1 --branch "$rdma_core_tag" \
 			https://github.com/linux-rdma/rdma-core "$src"
 	fi
@@ -158,6 +167,14 @@ build_provider() {
 	# build tree without installing. For packaging we want a clean .so with no
 	# build-host paths leaked — strip the RUNPATH.
 	patchelf --remove-rpath "$so"
+	# Check the distro library, not the just-built libibverbs in build/lib.
+	# Fail before packaging if a distro patch or explicit tag changed the ABI.
+	local relocations
+	if ! relocations="$(env -u LD_LIBRARY_PATH -u LD_PRELOAD ldd -r "$so" 2>&1)" ||
+		grep -Eq 'not found|undefined symbol' <<< "$relocations"; then
+		printf '%s\nerror: provider does not match installed libibverbs\n' "$relocations" >&2
+		exit 1
+	fi
 
 	printf '==> Built provider: %s\n' "$(basename "$so")"
 }
@@ -202,6 +219,8 @@ build_deb() {
 		"$deb_stage/etc/libibverbs.d/usb4_rdma.driver"
 
 	substitute "$repo_root/packaging/debian/control-rdma" "$deb_stage/DEBIAN/control"
+	# A plain libibverbs1 dependency allows upgrades that remove our private ABI.
+	sed -i "s/@RDMA_CORE_VERSION@/$(rdma_core_package_version)/g" "$deb_stage/DEBIAN/control"
 
 	local deb="$out_dir/${pkgname}_${version}_amd64.deb"
 	dpkg-deb --root-owner-group --build "$deb_stage" "$deb" >/dev/null
@@ -241,6 +260,7 @@ build_arch_as_builder() {
 	[[ -n "$soname" ]] || { printf 'error: staged .so missing\n' >&2; exit 1; }
 
 	sed -e "s/@VERSION@/${version}/g" -e "s/@SONAME@/${soname}/g" \
+		-e "s/@RDMA_CORE_VERSION@/$(rdma_core_package_version)/g" \
 		"$repo_root/packaging/arch/PKGBUILD-rdma" > "$stage/PKGBUILD"
 
 	( cd "$stage" && makepkg --noconfirm --skipchecksums --nodeps )

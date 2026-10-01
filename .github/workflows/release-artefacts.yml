@@ -1,5 +1,8 @@
 name: release-artefacts
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
