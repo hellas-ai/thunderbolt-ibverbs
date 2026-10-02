@@ -33,8 +33,9 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "native_same_peer_multicable: %s\n",
 		   !state->cfg.native_enabled ||
 		   !state->native_control_registered ? "off" :
-		   state->native_control_source_aware ? "enabled" :
-						       "limited");
+		   state->native_control_source_aware ||
+		   state->native_control_ids ? "enabled" : "limited");
+	seq_printf(s, "native_host_id: %16phN\n", state->native_host_id);
 	seq_printf(s, "native_legacy_ambiguous_limited: %lld\n",
 		   atomic64_read(&state->native_legacy_ambiguous_limited));
 	seq_printf(s, "configured_links: %u\n", tbv_link_count(state));
@@ -113,6 +114,11 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 	seq_printf(s, "apple_data: %u\n", state->apple_data);
 	seq_printf(s, "native_fragment_striping: %u\n",
 		   state->native_fragment_striping);
+	seq_printf(s, "native_write_striping: %u\n",
+		   state->native_write_striping);
+	seq_printf(s, "native_write_stripe_min_bytes: %u\n",
+		   state->native_write_stripe_min_bytes);
+	seq_printf(s, "native_domain_mask: 0x%x\n", state->native_domain_mask);
 	seq_printf(s, "register_verbs: %u\n", state->register_verbs);
 	seq_printf(s, "verbs_registered: %u\n", state->verbs_registered);
 	seq_printf(s, "verbs_ucontexts: %d\n",
@@ -151,6 +157,10 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_wr_zcopy_fallback_striping));
 	seq_printf(s, "data_wr_zcopy_fallback_unsafe_sge: %lld\n",
 		   atomic64_read(&state->data_wr_zcopy_fallback_unsafe_sge));
+	seq_printf(s, "data_wr_block_split: %lld\n",
+		   atomic64_read(&state->data_wr_block_split));
+	seq_printf(s, "data_wr_block_async: %lld\n",
+		   atomic64_read(&state->data_wr_block_async));
 	seq_printf(s, "data_wr_copy_error: %lld\n",
 		   atomic64_read(&state->data_wr_copy_error));
 	seq_printf(s, "data_wr_path_send: %lld\n",
@@ -199,6 +209,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_credit_sent));
 	seq_printf(s, "data_rx_credit_send_error: %lld\n",
 		   atomic64_read(&state->data_rx_credit_send_error));
+	seq_printf(s, "data_rx_lost: %lld\n",
+		   atomic64_read(&state->data_rx_lost));
 	seq_printf(s, "data_rx_repost_failed: %lld\n",
 		   atomic64_read(&state->data_rx_repost_failed));
 	seq_printf(s, "data_rx_bad_frame: %lld\n",
@@ -343,6 +355,8 @@ static int tbv_debugfs_summary_show(struct seq_file *s, void *unused)
 		   atomic64_read(&state->data_rx_reorder_buffered));
 	seq_printf(s, "data_rx_reorder_delivered: %lld\n",
 		   atomic64_read(&state->data_rx_reorder_delivered));
+	seq_printf(s, "data_rx_block_write: %lld\n",
+		   atomic64_read(&state->data_rx_block_write));
 	seq_printf(s, "data_rx_reorder_dropped: %lld\n",
 		   atomic64_read(&state->data_rx_reorder_dropped));
 	seq_printf(s, "data_rx_reorder_timeout: %lld\n",
@@ -389,9 +403,12 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 	list_for_each_entry(peer, &state->peers, node) {
 		struct tbv_rail *rail;
 
-		seq_printf(s, "peer %u backend=%s rails=%u native_qp_rr_rail_id=%u\n",
+		seq_printf(s, "peer %u backend=%s rails=%u native_qp_rr_rail_id=%u domain=%d remote_host=%16phN\n",
 			   peer->peer_id, tbv_backend_name(peer->backend),
-			   peer->nr_rails, peer->native_qp_rr_rail_id);
+			   peer->nr_rails, peer->native_qp_rr_rail_id,
+			   peer->xd && peer->xd->tb ? peer->xd->tb->index : -1,
+			   peer->remote_host_known ? peer->remote_host_id :
+			   (const u8[16]){ 0 });
 
 		list_for_each_entry(rail, &peer->rails, node) {
 			bool service_ready;
@@ -458,13 +475,27 @@ static int tbv_debugfs_peers_show(struct seq_file *s, void *unused)
 				   rail->path.cfg.sof_mask,
 				   rail->path.cfg.eof_mask);
 			seq_printf(s,
-				   "    data_rx_completed=%lld data_rx_canceled=%lld data_rx_credit_sent=%lld data_rx_credit_send_error=%lld data_rx_repost_failed=%lld rx_credit_pending=%u\n",
+				   "    data_rx_completed=%lld data_rx_canceled=%lld data_rx_credit_sent=%lld data_rx_credit_send_error=%lld data_rx_repost_failed=%lld data_rx_lost=%lld rx_credit_pending=%u\n",
 				   atomic64_read(&rail->path.data_rx_completed),
 				   atomic64_read(&rail->path.data_rx_canceled),
 				   atomic64_read(&rail->path.data_rx_credit_sent),
 				   atomic64_read(&rail->path.data_rx_credit_send_error),
 				   atomic64_read(&rail->path.data_rx_repost_failed),
+				   atomic64_read(&rail->path.data_rx_lost),
 				   rail->path.rx_data_credit_pending);
+			/* Why a path with queued frames is not sending. */
+			seq_printf(s,
+				   "    tx_pump data_queued=%u control_queued=%u reserved=%u inflight=%d frames=%u free=%zu remote_credits=%u scheduling=%u raw_stream=%u raw_inflight=%u\n",
+				   rail->path.tx_data_queued,
+				   rail->path.tx_control_queued,
+				   rail->path.tx_data_reserved,
+				   atomic_read(&rail->path.tx_inflight),
+				   rail->path.tx_frame_count,
+				   list_count_nodes(&rail->path.tx_free),
+				   rail->path.tx_remote_data_credits,
+				   rail->path.tx_scheduling,
+				   rail->path.tx_raw_stream_active,
+				   rail->path.tx_raw_stream_inflight);
 			seq_printf(s,
 				   "    tx_poll enabled=%u calls=%lld completed=%lld\n",
 				   rail->path.tx_poll_enabled,

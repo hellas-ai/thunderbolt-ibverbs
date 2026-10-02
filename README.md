@@ -16,9 +16,22 @@ a linux kernel module + userspace shim to emulate an InfiniBand RDMA verb device
 ## does it work?
 yes! obviously not as well as real hardware, but better than onboard ethernet and lower latency than RXE-over-`thunderbolt-net`
 
-![Per-rail bandwidth by verb (read / write / send), strix-1 ↔ strix-2: native usb4_rdma vs RXE over thunderbolt-net vs RXE over 2.5G LAN](docs/img/bw_vs_size.svg)
+The charts measure one QP (queue pair: an RDMA connection's send and receive
+queues, the unit an application posts its reads, writes and sends to) per
+test, with write striping spreading that QP over four rails.
 
-![One-way latency by verb (read / write / send), 1 QP, 64 B → 1 MiB, native usb4_rdma vs RXE over thunderbolt-net vs RXE over 2.5G LAN](docs/img/lat_vs_size.svg)
+For tensor-parallel inference RDMA WRITE is the verb that counts: gufo's TP
+exchanges use RDMA WRITE with immediate only, and NCCL/RCCL (as used by vLLM
+across hosts) typically moves its data with RDMA WRITEs as well. RDMA READ
+matters for stacks such as UCX, whose rendezvous protocol fetches large
+messages with READs; READs are limited here (see
+[known limits](docs/IMPROVEMENTS.md#known-limits)).
+
+![Bandwidth by verb and message size with the busy CPU cores of both hosts, 1 QP: usb4_rdma over two USB4 cables with write striping vs InfiniBand FDR on PCIe 3.0 x4](docs/img/bw_vs_size.svg)
+
+![One-way latency by verb and message size with the busy CPU cores of both hosts, 1 QP: usb4_rdma over two USB4 cables vs InfiniBand FDR on PCIe 3.0 x4](docs/img/lat_vs_size.svg)
+
+How these charts are made: [bench/README.md](bench/README.md#readme-charts).
 
 ## does it do anything useful?
 with my two 128GB devices, i can:
@@ -178,6 +191,63 @@ To remove it:
 sudo make dkms-remove
 ```
 
+## Keeping thunderbolt-net off the links
+
+When a peer offers its network service, distributions load `thunderbolt_net`
+automatically (by modalias) as soon as a cable is plugged in. It then takes a
+DMA ring of each USB4 controller, which has only two for data, so this module
+gets fewer rails or none; loaded afterwards, `thunderbolt_net` fails with
+`failed to allocate Tx ring` and does no harm. `tbnet=` only sets this
+module's own behavior and does not keep `thunderbolt_net` away. Only root
+can, with `/etc/modprobe.d/`; `blacklist` stops the automatic load (an
+explicit `modprobe thunderbolt_net` still works, and IP over Thunderbolt is
+gone while it is blacklisted).
+
+A persistent setup, here with the module installed by DKMS and a dummy
+netdev for the RoCE addresses:
+
+```text
+# /etc/modprobe.d/thunderbolt-ibverbs.conf
+blacklist thunderbolt_net
+options thunderbolt_ibverbs profile=linux_perf tbnet=prefer_rdma lanes=2 register_verbs=1 roce_netdev=tbv0 native_write_striping=1
+
+# /etc/modules-load.d/thunderbolt-ibverbs.conf
+thunderbolt_ibverbs
+```
+
+The rails register their RDMA devices only once `roce_netdev` exists, so
+the netdev can come up at any point during boot. With NetworkManager (use a
+different address on the other host):
+
+```sh
+sudo nmcli connection add type dummy ifname tbv0 con-name tbv0 \
+  ipv4.method manual ipv4.addresses 192.168.240.1/24 ipv6.method disabled
+```
+
+rdma-core's udev rule `60-rdma-persistent-naming.rules` renames RDMA devices
+by bus path (`rocep...`), but the `usb4_rdma` provider finds its devices by
+name. Copy the rule to `/etc/udev/rules.d/` and exclude them:
+`KERNEL!="hfi1*", KERNEL!="usb4_rdma*", PROGRAM="rdma_rename %k NAME_FALLBACK"`.
+
+## Checking the link speed
+
+Each rail can only be as fast as its link, and USB4 links do not always train
+at full speed. Check both ends after plugging in or booting:
+
+```sh
+for d in /sys/bus/thunderbolt/devices/*-*; do
+  [ -e "$d/rx_speed" ] && echo "$(basename "$d") rx $(cat "$d/rx_speed") x $(cat "$d/rx_lanes")" \
+    "tx $(cat "$d/tx_speed") x $(cat "$d/tx_lanes")"
+done
+```
+
+A full-speed USB4 40 Gb/s link shows `20.0 Gb/s` on 2 lanes each way; a
+link that trained down shows `10.0 Gb/s`, or 1 lane. Between two Strix Halo
+hosts, links came up at 10 Gb/s per lane after boot or the first plug more
+than once, and trained at 20 Gb/s after unplugging and plugging the cable
+again. `nix run .#tbv-perftest` checks this before a run with
+`--expect-speed 20Gb/s`.
+
 ## Build Without DKMS
 
 For a one-off build against the running kernel:
@@ -312,12 +382,71 @@ lanes=auto|N|MIN-MAX
 register_verbs=0|1
 native_wr_striping=0|1
 native_fragment_striping=0|1
+native_write_striping=0|1
+native_write_stripe_min_bytes=<bytes>
+native_domain_mask=<mask>
 zcopy_min_bytes=<bytes>
 qp_timeout_ms=<ms>
 nhi_interrupt_throttle_ns=<ns>
 ```
 
 Run `make -C kernel help` for the full parameter list.
+
+Each rail's connection steps (HELLO, READY, rings, tunnel) log at debug
+level; load with `dyndbg=+p` to see them, which also works where kernel
+lockdown (Secure Boot) blocks `/sys/kernel/debug/dynamic_debug/control`.
+
+### One QP across rails
+
+By default a QP's data stays on one rail, so an application that uses a
+single QP gets one DMA ring's worth of bandwidth (about 10 Gbit/s).
+`native_write_striping=1` cuts every RDMA WRITE of at least
+`native_write_stripe_min_bytes` (default 64 KiB) into one contiguous block per
+rail; the receiver places each fragment directly and completes the WRITE in
+order. It also turns on `native_fragment_striping` for SENDs, which share the
+ordered receive path. The rails of every link to the same host form one
+pool, so a second cable adds its rails; `native_domain_mask` limits native
+rails to some USB4 controllers (bit n = domain n). Both hosts need the same
+build. For two cables between two Strix Halo hosts:
+
+```text
+profile=linux_perf tbnet=prefer_rdma lanes=2 register_verbs=1 native_write_striping=1
+```
+
+Example: tensor parallelism (TP=2) of [gufo](https://github.com/gufo-org/gufo)
+over two cables, with its RDMA transport from the `rdma` branch of
+[neuhaus/gufo](https://github.com/neuhaus/gufo/tree/rdma) (upstream in review).
+gufo exchanges each layer's partial results with one QP and
+RDMA WRITE with immediate, so it relies on write striping. RoCE addressing
+needs a netdev with an IPv4 address; a dummy one per host is enough:
+
+```sh
+# both hosts (10.77.0.2 on the second)
+sudo ip link add tbv0 type dummy
+sudo ip addr add 10.77.0.1/24 dev tbv0 && sudo ip link set tbv0 up
+sudo modprobe thunderbolt_ibverbs profile=linux_perf tbnet=prefer_rdma \
+  lanes=2 register_verbs=1 roce_netdev=tbv0 native_write_striping=1
+
+# any rail device will do; its QP stripes over all four rails
+ibv_devices
+gufo serve llm --model MODEL.gguf --tp-world-size 2 --tp-rank 0 \
+  --tp-bootstrap-port 18515 --tp-control-port 18516 \
+  --tp-control-token SHARED_TOKEN --tp-rdma-device usb4_rdma0
+gufo serve llm --model MODEL.gguf --tp-world-size 2 --tp-rank 1 \
+  --tp-bootstrap-host RANK0_ADDRESS --tp-bootstrap-port 18515 \
+  --tp-control-port 18516 --tp-control-token SHARED_TOKEN \
+  --tp-rdma-device usb4_rdma0
+```
+
+Measured this way (Qwen3.8 Flash-Next Q4, 25.8k-token prompt), prefill ran
+at 1824 tok/s against 1892 over FDR InfiniBand, with identical output.
+
+`/sys/kernel/debug/thunderbolt_ibverbs/summary` counts striped WRITEs
+(`data_wr_block_split`) and frames lost on a path (`data_rx_lost`; their
+credits are refunded and retransmission recovers the message).
+`peers` shows each rail's credits and, on `tx_pump`, why queued frames are
+not being sent. What this branch changes and measures:
+[docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
 
 ## Nix Thunderbolt Kernel
 

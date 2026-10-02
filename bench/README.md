@@ -94,6 +94,46 @@ nix run .#tbv-perftest -- --hosts strix-1,strix-2 \
   --tag rxe-tbnet --csv "$out/rxe-tbnet.csv" --jsonl "$out/rxe-tbnet.jsonl"
 ```
 
+## README charts
+
+`docs/img/bw_vs_size.svg` and `docs/img/lat_vs_size.svg` come from two
+scripts outside the Nix suite. `sweep_perftest.py` runs perftest between the
+host it runs on (client) and a server host over SSH, one case at a time:
+`ib_{write,read,send}_bw` and bidirectional `ib_write_bw` from 64 B to 4 MiB,
+`ib_{write,read,send}_lat` from 64 B to 1 MiB, one QP each. While a case runs
+it samples `/proc/stat` on both hosts and records the busy CPU cores, since
+`thunderbolt_ibverbs` does most of its work in kernel workers that perftest's
+per-process `--cpu_util` does not see. Each device gets its own label; one CSV
+can hold several:
+
+```sh
+RDMAV_DRIVERS=$HOME/tbv/libusb4_rdma python3 bench/sweep_perftest.py \
+  --server strix-2 --dev usb4_rdma_p1r0 --gid 1 \
+  --label "usb4_rdma, 2 cables (striping)" --csv sweep.csv \
+  --max-size ib_read_bw=524288 --max-size ib_read_lat=524288 \
+  --max-size ib_send_bw=524288 --max-size ib_send_lat=524288
+python3 bench/sweep_perftest.py --server strix-2 --dev mlx4_0 --gid 0 \
+  --label "InfiniBand FDR, PCIe 3.0 x4" --csv sweep.csv
+python3 bench/plot_perftest.py sweep.csv --out docs/img   # needs matplotlib
+```
+
+`--gid` selects the RoCE v2 GID for `usb4_rdma` (1 with an IPv4 address on
+`roce_netdev`) and 0 for InfiniBand. Both hosts need perftest; the server is
+reached by `ssh <server>` without a password. A case that fails leaves its
+cells empty. The `--max-size` caps skip what currently fails:
+READs above 512 KiB fail on this driver without striping as well, and SENDs
+above 512 KiB fail with `native_write_striping` (which enables fragment
+striping for SENDs).
+
+Latency runs a fixed number of iterations (a probe sizes it to about
+`--seconds`, at most 50 000) and reports the typical, that is median,
+latency; `ib_read_lat` fails at the end of timed runs on usb4_rdma. Runs
+shorter than the CPU sample window show too little CPU load.
+
+`plot_perftest.py` draws the measure on top and the busy cores below: solid
+for the client, dashed for the server (for READ the client is the reader).
+The output is deterministic for the same CSV.
+
 ## Apple Thunderbolt RDMA
 
 Apple `rdma_en*` devices need the Thunderbolt interface, not `bridge0`, to own

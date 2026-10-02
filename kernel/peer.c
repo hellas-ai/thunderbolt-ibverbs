@@ -145,13 +145,14 @@ struct tbv_peer *tbv_peer_get_or_create(struct tbv_state *state,
 		mutex_unlock(&state->lock);
 		tb_xdomain_put(peer->xd);
 		kfree(peer);
-		pr_info("peer %u reused backend=%s refs=%u\n", pos->peer_id,
+		pr_debug("peer %u reused backend=%s refs=%u\n", pos->peer_id,
 			tbv_backend_name(backend), refcount_read(&pos->refcnt));
 		return pos;
 	}
 
 	if (backend == TBV_BACKEND_NATIVE &&
 	    !state->native_control_source_aware &&
+	    !state->native_control_ids &&
 	    !tbv_native_legacy_xdomain_allowed_locked(state, xd,
 						      &existing_peer_id)) {
 		atomic64_inc(&state->native_legacy_ambiguous_limited);
@@ -256,6 +257,7 @@ struct tbv_rail *tbv_peer_add_rail(struct tbv_peer *peer,
 	mutex_lock(&peer->state->lock);
 	if (peer->backend == TBV_BACKEND_NATIVE &&
 	    !peer->state->native_control_source_aware &&
+	    !peer->state->native_control_ids &&
 	    !tbv_native_legacy_rail_key_allowed_locked(peer, key,
 						       &existing_peer_id)) {
 		atomic64_inc(&peer->state->native_legacy_ambiguous_limited);

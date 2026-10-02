@@ -363,6 +363,16 @@ static u32 tbv_service_native_lane(const struct tb_service_id *id)
 	return (u32)id->driver_data;
 }
 
+static bool tbv_service_native_domain_allowed(const struct tbv_state *state,
+					      const struct tb_xdomain *xd)
+{
+	int index = xd->tb->index;
+
+	if (index < 0 || index >= 32)
+		return state->native_domain_mask == ~0u;
+	return state->native_domain_mask & BIT(index);
+}
+
 static u32 tbv_config_native_lane_count(const struct tbv_state *state)
 {
 	if (state->cfg.requested.lanes_auto)
@@ -414,6 +424,10 @@ static int tbv_service_probe(struct tb_service *svc,
 	    native_lane >= tbv_config_native_lane_count(tbv_service_state))
 		return -ENODEV;
 
+	if (backend == TBV_BACKEND_NATIVE &&
+	    !tbv_service_native_domain_allowed(tbv_service_state, xd))
+		return -ENODEV;
+
 	binding = kzalloc(sizeof(*binding), GFP_KERNEL);
 	if (!binding)
 		return -ENOMEM;
@@ -446,7 +460,7 @@ static int tbv_service_probe(struct tb_service *svc,
 			goto err_remove_rail;
 		}
 
-		pr_info("allocated rings service id=%d native_lane=%u tx_hop=%d rx_hop=%d out_hop=%d\n",
+		pr_debug("allocated rings service id=%d native_lane=%u tx_hop=%d rx_hop=%d out_hop=%d\n",
 			svc->id, backend == TBV_BACKEND_NATIVE ? native_lane : 0,
 			rail->path.tx_ring->hop,
 			rail->path.rx_ring->hop,
@@ -457,7 +471,7 @@ static int tbv_service_probe(struct tb_service *svc,
 			if (ret)
 				goto err_remove_rail;
 
-			pr_info("started rings service id=%d native_lane=%u tx_hop=%d rx_hop=%d\n",
+			pr_debug("started rings service id=%d native_lane=%u tx_hop=%d rx_hop=%d\n",
 				svc->id,
 				backend == TBV_BACKEND_NATIVE ? native_lane : 0,
 				rail->path.tx_ring->hop,

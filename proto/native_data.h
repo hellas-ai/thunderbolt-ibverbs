@@ -10,7 +10,11 @@
 #define TBV_NATIVE_DATA_FRAME_SIZE	4096u
 #define TBV_NATIVE_DATA_MAX_PAYLOAD \
 	(TBV_NATIVE_DATA_FRAME_SIZE - TBV_NATIVE_DATA_HDR_SIZE)
-#define TBV_NATIVE_DATA_MAX_MSG_SIZE	(16u * 1024u * 1024u)
+/*
+ * Largest native message. Applications size RDMA windows well above 16 MiB
+ * (gufo's TP2 exchanges use 32 MiB windows); fragment counts still fit u16.
+ */
+#define TBV_NATIVE_DATA_MAX_MSG_SIZE	(64u * 1024u * 1024u)
 #define TBV_NATIVE_DATA_CREDIT_BATCH	32u
 #define TBV_NATIVE_DATA_MAX_FRAGS \
 	((TBV_NATIVE_DATA_MAX_MSG_SIZE + TBV_NATIVE_DATA_MAX_PAYLOAD - 1u) / \
@@ -35,6 +39,14 @@ enum tbv_native_data_flag {
 	TBV_NATIVE_DATA_F_LAST = 1u << 0,
 	TBV_NATIVE_DATA_F_SOLICITED = 1u << 1,
 	TBV_NATIVE_DATA_F_RAW_STREAM = 1u << 2,
+	/*
+	 * Fragment of an RDMA_WRITE/RDMA_WRITE_IMM whose fragments may arrive
+	 * over several rails in any order. The receiver places each fragment at
+	 * remote_addr + frag_offset as it arrives. imm_data carries the total
+	 * message length, except in the last fragment of an RDMA_WRITE_IMM,
+	 * where it carries the immediate data.
+	 */
+	TBV_NATIVE_DATA_F_BLOCK = 1u << 3,
 };
 
 enum tbv_native_read_ack_status {
@@ -70,6 +82,17 @@ struct tbv_native_data_header {
 	tbv_wire_u32 rkey;
 	tbv_wire_u32 frag_offset;
 };
+
+/*
+ * Header bytes 10-11, zero before and ignored by the parser: the sender's
+ * per-path sequence number of frames that take a data credit, set as the
+ * frame enters the TX ring. A receiver that sees a gap knows frames were
+ * lost on the path and returns their credits, which would otherwise be gone
+ * for good. Without the PRESENT bit a frame carries no number.
+ */
+#define TBV_NATIVE_DATA_PATH_SEQ_OFFSET 10
+#define TBV_NATIVE_DATA_PATH_SEQ_PRESENT 0x8000u
+#define TBV_NATIVE_DATA_PATH_SEQ_MASK 0x7fffu
 
 static inline tbv_wire_u32
 tbv_native_data_credit_return_threshold(tbv_wire_u32 credit_window)

@@ -26,6 +26,8 @@
 #define TBV_ETH_ALEN 6
 #define TBV_NATIVE_PROTOCOL_KEY "tbverbs"
 #define TBV_NATIVE_MAX_LANES 4
+/* Rails one QP may spread data over: those of every link to its host. */
+#define TBV_NATIVE_MAX_DATA_PATHS (2 * TBV_NATIVE_MAX_LANES)
 #define TBV_DATA_PDF_FRAME_START 1
 #define TBV_DATA_PDF_FRAME_END 3
 #define TBV_NATIVE_PRTCID 1
@@ -181,6 +183,10 @@ struct tbv_path {
 	u32 tx_remote_data_credits;
 	u32 tx_remote_data_credit_max;
 	u32 rx_data_credit_pending;
+	/* Native per-path frame sequence (TBV_NATIVE_DATA_PATH_SEQ_*). */
+	u16 tx_data_seq;
+	u16 rx_data_seq_next;
+	bool rx_data_seq_valid;
 	spinlock_t tx_lock;
 	struct list_head tx_free;
 	struct list_head tx_control_free;
@@ -190,6 +196,14 @@ struct tbv_path {
 	struct list_head tx_zcopy_inflight;
 	struct delayed_work tx_poll_work;
 	struct delayed_work rx_supp_poll_work;
+	/*
+	 * Blocks of native sends whose frames this path still has to build
+	 * (ibdev.c). A work item builds them in order, in parallel with the
+	 * other paths, so post_send does not build large sends itself.
+	 */
+	spinlock_t build_lock;
+	struct list_head build_jobs;
+	struct work_struct build_work;
 	atomic_t tx_inflight;
 	atomic64_t data_tx_enqueued;
 	atomic64_t data_tx_posted;
@@ -205,6 +219,10 @@ struct tbv_path {
 	atomic64_t data_rx_credit_sent;
 	atomic64_t data_rx_credit_send_error;
 	atomic64_t data_rx_repost_failed;
+	atomic64_t data_rx_lost;
+	/* Frame bytes, headers included, of every frame this path moved. */
+	atomic64_t tx_bytes;
+	atomic64_t rx_bytes;
 	atomic64_t tx_poll_calls;
 	atomic64_t tx_poll_completed;
 	atomic64_t rx_supp_poll_calls;
@@ -307,6 +325,13 @@ struct tbv_peer {
 	struct mutex control_lock;
 	u32 native_qp_rr_rail_id;
 	u32 nr_rails;
+	/*
+	 * Host identity the remote side sent in native control (protected by
+	 * state->lock). Peers with the same one are links to the same host,
+	 * and a QP may spread data over the rails of all of them.
+	 */
+	u8 remote_host_id[16];
+	bool remote_host_known;
 };
 
 static inline bool tbv_rail_data_ready(const struct tbv_rail *rail)
@@ -454,11 +479,20 @@ struct tbv_state {
 	bool native_data;
 	bool apple_data;
 	bool native_fragment_striping;
+	bool native_write_striping;
+	u32 native_write_stripe_min_bytes;
+	u32 native_domain_mask;
 	bool register_verbs;
 	bool services_registered;
 	bool verbs_registered;
 	bool native_control_registered;
 	bool native_control_source_aware;
+	/*
+	 * Native control messages name their source link and host, so links
+	 * are told apart even by a source-blind XDomain handler.
+	 */
+	bool native_control_ids;
+	u8 native_host_id[16];
 	bool native_legacy_multicable_warned;
 	bool apple_rails_wait_tbnet;
 	bool apple_rails_pending;
@@ -485,6 +519,8 @@ struct tbv_state {
 	atomic64_t data_wr_zcopy_fallback;
 	atomic64_t data_wr_zcopy_fallback_striping;
 	atomic64_t data_wr_zcopy_fallback_unsafe_sge;
+	atomic64_t data_wr_block_split;
+	atomic64_t data_wr_block_async;
 	atomic64_t data_wr_copy_error;
 	atomic64_t data_wr_path_send;
 	atomic64_t data_wr_path_send_error;
@@ -510,6 +546,7 @@ struct tbv_state {
 	atomic64_t data_rx_credit_sent;
 	atomic64_t data_rx_credit_send_error;
 	atomic64_t data_rx_repost_failed;
+	atomic64_t data_rx_lost;
 	atomic64_t data_rx_bad_frame;
 	atomic64_t data_rx_bad_header;
 	atomic64_t data_rx_bad_header_parse;
@@ -581,6 +618,7 @@ struct tbv_state {
 	atomic64_t data_rx_active_timeout;
 	atomic64_t data_rx_reorder_buffered;
 	atomic64_t data_rx_reorder_delivered;
+	atomic64_t data_rx_block_write;
 	atomic64_t data_rx_reorder_dropped;
 	atomic64_t data_rx_reorder_timeout;
 	atomic64_t data_rx_reorder_window;
@@ -779,6 +817,7 @@ void tbv_path_set_remote_rx_capacity(struct tbv_path *path, u32 rx_ring_size);
 void tbv_path_add_remote_rx_credits(struct tbv_path *path, u32 credits);
 int tbv_path_reserve_data(struct tbv_path *path, u32 frames);
 void tbv_path_release_data_reservation(struct tbv_path *path, u32 frames);
+void tbv_ibdev_path_build_work(struct work_struct *work);
 int tbv_path_send(struct tbv_path *path, const void *data, u32 len,
 		  unsigned int flags,
 		  tbv_path_tx_done_fn done, void *done_ctx);

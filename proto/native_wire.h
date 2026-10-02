@@ -23,10 +23,22 @@ typedef uint64_t tbv_wire_u64;
 #endif
 
 #define TBV_NATIVE_WIRE_MAGIC		0x31564254u /* "TBV1" little-endian */
-#define TBV_NATIVE_WIRE_VERSION		1u
+/*
+ * Version 2 appends the sender's USB4 domain and host identity to the HELLO
+ * payload. Version 1 messages are still parsed (without them); peers that
+ * only speak version 1 do not accept version 2 messages.
+ */
+#define TBV_NATIVE_WIRE_VERSION		2u
+#define TBV_NATIVE_WIRE_VERSION_V1	1u
 #define TBV_NATIVE_WIRE_XDOMAIN_HDR_SIZE 32u
 #define TBV_NATIVE_WIRE_HDR_SIZE	16u
-#define TBV_NATIVE_WIRE_HELLO_SIZE	40u
+#define TBV_NATIVE_WIRE_ID_SIZE		16u
+#define TBV_NATIVE_WIRE_HELLO_SIZE_V1	40u
+#define TBV_NATIVE_WIRE_HELLO_SIZE \
+	(TBV_NATIVE_WIRE_HELLO_SIZE_V1 + 2u * TBV_NATIVE_WIRE_ID_SIZE)
+#define TBV_NATIVE_WIRE_HELLO_MSG_SIZE_V1 \
+	(TBV_NATIVE_WIRE_XDOMAIN_HDR_SIZE + TBV_NATIVE_WIRE_HDR_SIZE + \
+	 TBV_NATIVE_WIRE_HELLO_SIZE_V1)
 #define TBV_NATIVE_WIRE_HELLO_MSG_SIZE \
 	(TBV_NATIVE_WIRE_XDOMAIN_HDR_SIZE + TBV_NATIVE_WIRE_HDR_SIZE + \
 	 TBV_NATIVE_WIRE_HELLO_SIZE)
@@ -72,6 +84,16 @@ struct tbv_native_wire_hello {
 	tbv_wire_u32 tx_ring_size;
 	tbv_wire_u32 rx_ring_size;
 	tbv_wire_u32 path_flags;
+	/*
+	 * Version 2 only (has_ids): the UUID of the sender's host router on
+	 * the link that carries the message, which is the receiver's remote
+	 * UUID of that link, and a per-boot identity of the sending host.
+	 * They name the link and the host even when the receiver's XDomain
+	 * protocol handler does not report which link a message came from.
+	 */
+	tbv_wire_u8 src_domain[TBV_NATIVE_WIRE_ID_SIZE];
+	tbv_wire_u8 host_id[TBV_NATIVE_WIRE_ID_SIZE];
+	tbv_wire_u8 has_ids;
 };
 
 static inline void tbv_wire_put_le16(tbv_wire_u8 *p, tbv_wire_u16 value)
@@ -182,6 +204,9 @@ tbv_native_wire_build_hello(void *buf, size_t size,
 	tbv_wire_put_le32(p + 28, hello->tx_ring_size);
 	tbv_wire_put_le32(p + 32, hello->rx_ring_size);
 	tbv_wire_put_le32(p + 36, hello->path_flags);
+	memcpy(p + 40, hello->src_domain, TBV_NATIVE_WIRE_ID_SIZE);
+	memcpy(p + 40 + TBV_NATIVE_WIRE_ID_SIZE, hello->host_id,
+	       TBV_NATIVE_WIRE_ID_SIZE);
 
 	return TBV_NATIVE_WIRE_HELLO_MSG_SIZE;
 }
@@ -194,16 +219,28 @@ tbv_native_wire_parse_hello(const void *buf, size_t size,
 	const tbv_wire_u8 *p = buf;
 	tbv_wire_u16 op;
 	tbv_wire_u16 length;
+	tbv_wire_u16 version;
 	tbv_wire_u32 length_sn;
+	tbv_wire_u32 msg_size;
 
 	if (!p || !hello)
 		return -EINVAL;
 
-	if (size < TBV_NATIVE_WIRE_HELLO_MSG_SIZE)
+	if (size < TBV_NATIVE_WIRE_HELLO_MSG_SIZE_V1)
 		return -EINVAL;
 
 	length_sn = tbv_wire_get_le32(p + 8);
-	if ((length_sn & 0x3fu) != (TBV_NATIVE_WIRE_HELLO_MSG_SIZE - 12u) / 4u)
+	if ((length_sn & 0x3fu) == (TBV_NATIVE_WIRE_HELLO_MSG_SIZE - 12u) / 4u) {
+		msg_size = TBV_NATIVE_WIRE_HELLO_MSG_SIZE;
+		version = TBV_NATIVE_WIRE_VERSION;
+	} else if ((length_sn & 0x3fu) ==
+		   (TBV_NATIVE_WIRE_HELLO_MSG_SIZE_V1 - 12u) / 4u) {
+		msg_size = TBV_NATIVE_WIRE_HELLO_MSG_SIZE_V1;
+		version = TBV_NATIVE_WIRE_VERSION_V1;
+	} else {
+		return -EINVAL;
+	}
+	if (size < msg_size)
 		return -EINVAL;
 
 	if (memcmp(p + 12, tbv_native_wire_uuid,
@@ -227,7 +264,7 @@ tbv_native_wire_parse_hello(const void *buf, size_t size,
 	if (tbv_wire_get_le32(p) != TBV_NATIVE_WIRE_MAGIC)
 		return -EINVAL;
 
-	if (tbv_wire_get_le16(p + 4) != TBV_NATIVE_WIRE_VERSION)
+	if (tbv_wire_get_le16(p + 4) != version)
 		return -EINVAL;
 
 	op = tbv_wire_get_le16(p + 6);
@@ -241,7 +278,7 @@ tbv_native_wire_parse_hello(const void *buf, size_t size,
 		return -EINVAL;
 
 	length = tbv_wire_get_le16(p + 8);
-	if (length != TBV_NATIVE_WIRE_HELLO_MSG_SIZE || size < length)
+	if (length != msg_size)
 		return -EINVAL;
 
 	if (info) {
@@ -260,6 +297,16 @@ tbv_native_wire_parse_hello(const void *buf, size_t size,
 	hello->tx_ring_size = tbv_wire_get_le32(p + 28);
 	hello->rx_ring_size = tbv_wire_get_le32(p + 32);
 	hello->path_flags = tbv_wire_get_le32(p + 36);
+	if (version == TBV_NATIVE_WIRE_VERSION) {
+		memcpy(hello->src_domain, p + 40, TBV_NATIVE_WIRE_ID_SIZE);
+		memcpy(hello->host_id, p + 40 + TBV_NATIVE_WIRE_ID_SIZE,
+		       TBV_NATIVE_WIRE_ID_SIZE);
+		hello->has_ids = 1;
+	} else {
+		memset(hello->src_domain, 0, TBV_NATIVE_WIRE_ID_SIZE);
+		memset(hello->host_id, 0, TBV_NATIVE_WIRE_ID_SIZE);
+		hello->has_ids = 0;
+	}
 
 	return 0;
 }
