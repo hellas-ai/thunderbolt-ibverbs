@@ -107,8 +107,8 @@ tbv_vllm_smoke.sh \
   Thunderbolt/USB4 subsystem changes it relies on.
 - `nhi_interrupt_throttle_ns` is active only on kernels that export
   `tb_ring_throttling()`.
-- The Nix flake builds a Thunderbolt testing kernel from the maintainer
-  `next` branch with the local kernel patches applied.
+- The Nix flake targets stock Linux 7.2 and provides a patched Linux 7.2
+  kernel with the remaining local Thunderbolt fixes and ring diagnostics.
 - Debian, Fedora, Arch, and Nix builds are exercised in CI.
 
 ## License
@@ -450,10 +450,11 @@ not being sent. What this branch changes and measures:
 
 ## Nix Thunderbolt Kernel
 
-The module loads on stock kernels. For the maintainer-tree USB4 work, the flake
-also exposes `linux-thunderbolt`: nixpkgs' `linuxPackages_testing.kernel` with
-only the source, version, and kernel patch list overridden. It uses the nixpkgs
-testing kernel configuration, not a machine-local config.
+The default Nix module package targets stock Linux 7.2. The flake also exposes
+`linux-thunderbolt`: nixpkgs' `linuxPackages_7_2.kernel` with the remaining local
+Thunderbolt fixes and ring diagnostics. Both use nixpkgs' kernel configuration.
+The upstream USB4STREAM/XDomain changes are included in Linux 7.2, so the flake
+no longer carries their backports or a separate maintainer-tree source input.
 
 ```sh
 nix build .#linux-thunderbolt
@@ -476,3 +477,5 @@ in {
 Hydra evaluates the same path through
 `hydraJobs.x86_64-linux.linux-thunderbolt` and
 `hydraJobs.x86_64-linux.thunderbolt-ibverbs-linux-thunderbolt`.
+VM smoke tests boot both stock and patched Linux 7.2, load the corresponding
+module, and verify legacy versus source-aware native control respectively.

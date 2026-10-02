@@ -195,22 +195,18 @@ verify_provider() {
 	printf '==> Provider .so: %s\n' "$so"
 	file "$so"
 
-	printf '==> ldd lib resolution\n'
-	if ldd "$so" 2>&1 | grep -E 'not found'; then
-		printf 'error: unresolved dynamic library\n' >&2
-		exit 1
-	fi
-	ldd "$so" | sed -n '1,12p'
-
 	# ldd -r performs relocations and reports missing function references.
 	# Catches PABI mismatches (e.g. wrong verbs_register_driver_<N> version)
 	# and missing imports — without needing an actual /sys/class/infiniband
 	# device for libibverbs to match against.
 	printf '==> ldd -r symbol resolution\n'
-	if ldd -r "$so" 2>&1 | grep -E 'undefined symbol'; then
-		printf 'error: unresolved symbols in provider .so\n' >&2
+	local relocations
+	if ! relocations="$(env -u LD_LIBRARY_PATH -u LD_PRELOAD ldd -r "$so" 2>&1)" ||
+		grep -Eq 'not found|undefined symbol' <<< "$relocations"; then
+		printf '%s\nerror: unresolved dependencies in provider .so\n' "$relocations" >&2
 		exit 1
 	fi
+	printf '%s\n' "$relocations"
 
 	printf '==> ibv_devices smoke\n'
 	ibv_devices

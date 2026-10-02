@@ -6,7 +6,7 @@ pkgdesc="usb4_rdma libibverbs userspace provider"
 arch=('x86_64')
 url="https://github.com/hellas-ai/thunderbolt-ibverbs"
 license=('GPL-2.0-only')
-depends=('rdma-core')
+depends=('rdma-core=@RDMA_CORE_VERSION@')
 options=('!debug' '!strip')
 
 source=("@SONAME@" "usb4_rdma.driver")

@@ -3,31 +3,26 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    linux-src = {
-      # Thunderbolt maintainer tree carrying the USB4STREAM/XDomain base series.
-      url = "git+https://git.kernel.org/pub/scm/linux/kernel/git/westeri/thunderbolt.git?ref=refs/heads/next&shallow=1";
-      flake = false;
-    };
   };
 
   outputs =
     {
       self,
       nixpkgs,
-      linux-src,
     }:
     let
       lib = nixpkgs.lib;
-      upstreamThunderboltKernelPatches = import ./kernel-workflow/patches/upstream-thunderbolt-next.nix;
       portableLocalThunderboltKernelPatches = import ./kernel-workflow/patches/local-portable.nix;
       portableThunderboltKernelPatches = import ./kernel-workflow/patches/portable.nix;
-      integrationDebugThunderboltKernelPatches = import ./kernel-workflow/patches/local-integration-debug.nix;
+      portableThunderboltKernelPatchesFor = import ./kernel-workflow/patches/portable-for-kernel.nix;
       integrationThunderboltKernelPatches = import ./kernel-workflow/patches/local.nix;
       kernelPatchSets = {
         kernelPatches = portableThunderboltKernelPatches;
+        kernelPatchesFor = portableThunderboltKernelPatchesFor;
         portableKernelPatches = portableThunderboltKernelPatches;
         integrationKernelPatches = integrationThunderboltKernelPatches;
-        upstreamKernelPatches = upstreamThunderboltKernelPatches;
+        # Compatibility export: Linux 7.2 already includes the upstream series.
+        upstreamKernelPatches = [ ];
         portableLocalKernelPatches = portableLocalThunderboltKernelPatches;
       };
       linuxSystems = [ "x86_64-linux" ];
@@ -36,43 +31,14 @@
       forAllSystems = f: lib.genAttrs systems (system: f (import nixpkgs { inherit system; }));
       forLinuxSystems = f: lib.genAttrs linuxSystems (system: f (import nixpkgs { inherit system; }));
       forDarwinSystems = f: lib.genAttrs darwinSystems (system: f (import nixpkgs { inherit system; }));
-      linuxSrcMakefile = builtins.readFile "${linux-src}/Makefile";
-      linuxSrcMakeVars =
-        let
-          lines = lib.splitString "\n" linuxSrcMakefile;
-          readVar =
-            name:
-            let
-              matches = lib.filter (match: match != null) (
-                map (line: builtins.match "${name}[[:space:]]*=[[:space:]]*(.*)" line) lines
-              );
-            in
-            if matches == [ ] then
-              throw "could not read ${name} from Linux Makefile"
-            else
-              lib.head (lib.head matches);
-        in
-        {
-          version = readVar "VERSION";
-          patchlevel = readVar "PATCHLEVEL";
-          sublevel = readVar "SUBLEVEL";
-          extraversion = readVar "EXTRAVERSION";
-        };
-      linuxSrcVersion = "${linuxSrcMakeVars.version}.${linuxSrcMakeVars.patchlevel}.${linuxSrcMakeVars.sublevel}${linuxSrcMakeVars.extraversion}";
       mkThunderboltKernel =
         pkgs:
         let
-          testingKernel = pkgs.linuxPackages_testing.kernel;
-          kernelPatches = (testingKernel.passthru.kernelPatches or [ ]) ++ integrationThunderboltKernelPatches;
+          stockKernel = pkgs.linuxPackages_7_2.kernel;
         in
-        (testingKernel.override {
-          argsOverride = {
-            pname = "linux-thunderbolt";
-            version = linuxSrcVersion;
-            modDirVersion = linuxSrcVersion;
-            src = linux-src;
-            inherit kernelPatches;
-          };
+        (stockKernel.override {
+          pname = "linux-thunderbolt";
+          kernelPatches = (stockKernel.kernelPatches or [ ]) ++ integrationThunderboltKernelPatches;
         }).overrideAttrs (old: {
           meta = (old.meta or { }) // {
             maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
@@ -112,7 +78,6 @@
             bash -n \
               packaging/regen-rdma-core-patches.sh \
               packaging/test-rdma-patches.sh \
-              kernel-workflow/regen-upstream-thunderbolt-patches.sh \
               tools/tbv-target-module.sh \
               tools/ci/distro-build.sh \
               tools/ci/distro-install.sh \
@@ -141,20 +106,22 @@
       mkPortableKernelPatchCheck =
         pkgs:
         let
+          kernel = pkgs.linuxPackages_7_2.kernel;
+          kernelPatches = portableThunderboltKernelPatchesFor kernel.version;
           portablePatchBundle = pkgs.runCommand "thunderbolt-portable-kernel-patches" { } ''
             mkdir -p "$out"
             ${lib.concatMapStringsSep "\n" (patch: ''
               cp ${patch.patch} "$out/${baseNameOf (toString patch.patch)}"
-            '') portableThunderboltKernelPatches}
+            '') kernelPatches}
             printf '%s\n' ${
-              lib.escapeShellArgs (map (patch: baseNameOf (toString patch.patch)) portableThunderboltKernelPatches)
+              lib.escapeShellArgs (map (patch: baseNameOf (toString patch.patch)) kernelPatches)
             } > "$out/series"
           '';
         in
         pkgs.stdenv.mkDerivation {
           pname = "thunderbolt-portable-kernel-patches-apply-check";
           version = "0.4.0";
-          src = pkgs.linuxPackages_latest.kernel.src;
+          src = kernel.src;
 
           nativeBuildInputs = [ pkgs.git ];
 
@@ -229,12 +196,13 @@
         };
       mkNixosVmSmoke =
         pkgs:
+        { kernelPackages, expectedNativeControl }:
         let
-          module = pkgs.linuxPackages.callPackage ./nix/module.nix { };
+          module = kernelPackages.callPackage ./nix/module.nix { };
           rdmaCoreUsb4 = mkRdmaCoreUsb4 pkgs;
         in
         pkgs.testers.runNixOSTest {
-          name = "thunderbolt-ibverbs-vm-smoke";
+          name = "thunderbolt-ibverbs-vm-smoke-${expectedNativeControl}";
           meta = {
             maintainers = with pkgs.lib.maintainers; [ georgewhewell ];
           };
@@ -242,6 +210,7 @@
           nodes.machine =
             { pkgs, ... }:
             {
+              boot.kernelPackages = kernelPackages;
               boot.extraModulePackages = [ module ];
               environment.systemPackages = [
                 pkgs.kmod
@@ -252,7 +221,9 @@
           testScript = ''
             machine.start()
             machine.wait_for_unit("multi-user.target")
-            machine.succeed("modprobe thunderbolt_ibverbs profile=linux_perf bind_services=0 register_verbs=1")
+            machine.succeed("test $(uname -r) = '${kernelPackages.kernel.modDirVersion}'")
+            machine.succeed("modprobe thunderbolt_ibverbs profile=linux_perf bind_services=1 register_verbs=1")
+            machine.succeed("grep '^native_control: ${expectedNativeControl}$' /sys/kernel/debug/thunderbolt_ibverbs/summary")
             machine.succeed("grep '^thunderbolt_ibverbs ' /proc/modules")
             machine.succeed("modinfo thunderbolt_ibverbs")
             machine.succeed("modinfo -F depends thunderbolt_ibverbs | tr ',' '\\n' | grep -qx ib_core")
@@ -350,7 +321,7 @@
         }
         // lib.optionalAttrs isLinux (
           let
-            module = pkgs.linuxPackages.callPackage ./nix/module.nix { };
+            module = pkgs.linuxPackages_7_2.callPackage ./nix/module.nix { };
             thunderboltKernel = mkThunderboltKernel pkgs;
             thunderboltLinuxPackages = mkThunderboltLinuxPackages pkgs;
             moduleForThunderboltKernel = thunderboltLinuxPackages.callPackage ./nix/module.nix { };
@@ -450,7 +421,14 @@
           linux-thunderbolt-modules = pkgsAt.linux-thunderbolt-modules;
           rdma-core-usb4 = pkgsAt.rdma-core-usb4;
           thunderbolt-ibverbs-linux-thunderbolt = pkgsAt.thunderbolt-ibverbs-linux-thunderbolt;
-          vm-smoke.nixos = mkNixosVmSmoke pkgs;
+          vm-smoke.nixos = mkNixosVmSmoke pkgs {
+            kernelPackages = pkgs.linuxPackages_7_2;
+            expectedNativeControl = "legacy";
+          };
+          vm-smoke.nixos-thunderbolt = mkNixosVmSmoke pkgs {
+            kernelPackages = mkThunderboltLinuxPackages pkgs;
+            expectedNativeControl = "source_aware";
+          };
         }
       );
 
@@ -508,7 +486,7 @@
             linux-thunderbolt-modules = thunderboltKernel.modules;
             linuxPackages_thunderbolt = thunderboltLinuxPackages;
             rdma-core-usb4 = mkRdmaCoreUsb4 prev;
-            thunderbolt-ibverbs = final.linuxPackages.callPackage ./nix/module.nix { };
+            thunderbolt-ibverbs = final.linuxPackages_7_2.callPackage ./nix/module.nix { };
             thunderbolt-ibverbs-linux-thunderbolt = thunderboltLinuxPackages.callPackage ./nix/module.nix { };
           }
         );
