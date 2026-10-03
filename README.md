@@ -170,6 +170,10 @@ sudo make dkms-build
 sudo make dkms-install
 ```
 
+These targets read the module name and version from `dkms.conf`. Build and
+install default to the running kernel; use `KVER=<kernel-release>` on both
+commands to target another installed kernel with matching headers.
+
 After a kernel upgrade, DKMS should rebuild the module for the new kernel.
 
 To remove it:
@@ -177,6 +181,13 @@ To remove it:
 ```sh
 sudo make dkms-remove
 ```
+
+This removes the version declared in the current checkout from all kernels.
+
+CI runs this add/build/install/remove sequence on Debian, Fedora, and Arch,
+and separately verifies the release packages. These container checks verify
+installation on disk; loading the driver and transferring data require the
+VM and hardware tests.
 
 ## Build Without DKMS
 

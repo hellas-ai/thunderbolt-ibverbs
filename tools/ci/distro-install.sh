@@ -2,8 +2,8 @@
 # Install a thunderbolt-ibverbs-dkms or usb4-rdma-provider package built by the
 # matching distro-package*.sh script. Verifies:
 #
-#   thunderbolt-ibverbs-dkms   — DKMS can build the module against the distro's
-#                                packaged kernel-headers.
+#   thunderbolt-ibverbs-dkms   — DKMS can build and install the module against
+#                                the distro's packaged kernel headers.
 #   usb4-rdma-provider         — provider .so is installed at the expected path,
 #                                its dynamic deps resolve, and libibverbs does
 #                                not crash when its driver hint is present.
@@ -154,6 +154,9 @@ verify_dkms() {
 	printf '==> Version:    %s\n' "$version"
 	printf '==> Kernel:     %s\n' "$kver"
 
+	# DKMS skips depmod when a header-only container has no module index.
+	depmod -a "$kver"
+
 	dkms status -m "$modname" -v "$version" || true
 
 	if ! dkms build -m "$modname" -v "$version" -k "$kver" --force; then
@@ -168,6 +171,21 @@ verify_dkms() {
 
 	file "$built"
 	modinfo "$built" | sed -n '1,20p'
+
+	# Containers share the host kernel, so package hooks may skip it when
+	# only the distro's own headers are installed. Verify installation for
+	# that explicit target too; a built .ko alone is not an installed module.
+	dkms install -m "$modname" -v "$version" -k "$kver" --force
+	local status installed
+	status="$(dkms status -m "$modname" -v "$version" -k "$kver")"
+	printf '%s\n' "$status"
+	[[ "$status" == *": installed" ]] || {
+		printf 'error: DKMS module is not installed for %s\n' "$kver" >&2
+		exit 1
+	}
+	installed="$(modinfo -k "$kver" -n thunderbolt_ibverbs)"
+	test -f "$installed"
+	modinfo -k "$kver" thunderbolt_ibverbs | sed -n '1,20p'
 
 	printf '==> DKMS install verification OK\n'
 }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build the module the way non-Nix users will: inside a distro container,
 # against that distro's packaged kernel headers, through both plain make and
-# DKMS. Also compiles the small userspace-facing protocol header smoke test.
+# the documented Makefile DKMS targets, including installation and removal.
+# Also compiles the small userspace-facing protocol header smoke tests.
 
 set -euo pipefail
 
@@ -18,7 +19,7 @@ Examples:
 EOF
 }
 
-repo_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 	usage
@@ -140,30 +141,48 @@ build_userspace_smoke() {
 
 build_with_dkms() {
 	local kver="$1"
-	local pkg="thunderbolt-ibverbs"
-	local ver="0.3.4"
-	local dkms_src="/usr/src/$pkg-$ver"
-	local built
+	local pkg ver installed status
+	pkg="$(awk -F'"' '/^PACKAGE_NAME=/ { print $2; exit }' /work/src/dkms.conf)"
+	ver="$(awk -F'"' '/^PACKAGE_VERSION=/ { print $2; exit }' /work/src/dkms.conf)"
+	[[ -n "$pkg" && -n "$ver" ]] || {
+		printf 'error: missing package name or version in dkms.conf\n' >&2
+		exit 1
+	}
 
-	rm -rf "$dkms_src"
-	cp -a /work/src "$dkms_src"
-	clean_artifacts "$dkms_src"
+	# Header-only containers have no modules.dep. Initialize the index so
+	# DKMS exercises depmod during installation and removal, as on a host.
+	depmod -a "$kver"
 
-	dkms add -m "$pkg" -v "$ver"
-	if ! dkms build -m "$pkg" -v "$ver" -k "$kver"; then
+	# Exercise the same entry points as the README. Calling dkms directly
+	# would miss a stale version or broken argument in a Makefile target.
+	make -C /work/src dkms-add
+	if ! make -C /work/src KVER="$kver" dkms-build; then
 		cat "/var/lib/dkms/$pkg/$ver/build/make.log" >&2 || true
 		exit 1
 	fi
+	make -C /work/src KVER="$kver" dkms-install
 
-	built="$(find "/var/lib/dkms/$pkg/$ver" -name thunderbolt_ibverbs.ko \
-		-print -quit)"
-	if [[ -z "$built" ]]; then
-		printf 'error: DKMS build succeeded but thunderbolt_ibverbs.ko was not found\n' >&2
+	status="$(dkms status -m "$pkg" -v "$ver" -k "$kver")"
+	printf '%s\n' "$status"
+	if [[ "$status" != *": installed" ]]; then
+		printf 'error: DKMS did not install %s/%s for %s\n' "$pkg" "$ver" "$kver" >&2
 		exit 1
 	fi
+	installed="$(modinfo -k "$kver" -n thunderbolt_ibverbs)"
+	test -f "$installed"
+	file "$installed"
+	modinfo -k "$kver" thunderbolt_ibverbs | sed -n '1,20p'
 
-	file "$built"
-	modinfo "$built" | sed -n '1,20p'
+	make -C /work/src dkms-remove
+	status="$(dkms status -m "$pkg" -v "$ver")"
+	if [[ -n "$status" || -e "$installed" ]]; then
+		printf 'error: make dkms-remove left DKMS state or an installed module\n%s\n' "$status" >&2
+		exit 1
+	fi
+	if modinfo -k "$kver" thunderbolt_ibverbs >/dev/null 2>&1; then
+		printf 'error: module still discoverable after make dkms-remove\n' >&2
+		exit 1
+	fi
 }
 
 install_deps
@@ -181,7 +200,7 @@ build_with_make "$kver"
 printf '==> userspace protocol header smoke\n'
 build_userspace_smoke
 
-printf '==> DKMS build\n'
+printf '==> Documented DKMS add/build/install/remove workflow\n'
 build_with_dkms "$kver"
 
 printf '==> distro build OK\n'

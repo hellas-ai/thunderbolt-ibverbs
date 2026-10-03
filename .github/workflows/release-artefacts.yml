@@ -64,6 +64,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Verify documented DKMS source workflow in ${{ matrix.image }}
+        if: matrix.build_dkms
+        run: bash tools/ci/distro-build.sh '${{ matrix.image }}'
+
       - name: Build DKMS package in ${{ matrix.image }}
         if: matrix.build_dkms
         run: |

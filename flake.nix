@@ -75,7 +75,7 @@
 
           buildPhase = ''
             runHook preBuild
-            bash -n \
+            for script in \
               packaging/regen-rdma-core-patches.sh \
               packaging/test-rdma-patches.sh \
               tools/tbv-target-module.sh \
@@ -86,6 +86,9 @@
               tools/ci/vm-guest-smoke.sh \
               tools/ci/vm-smoke.sh \
               userspace/bench/tbv_vllm_smoke.sh
+            do
+              bash -n "$script"
+            done
             python -m py_compile \
               userspace/bench/tbv_perftest_runner.py \
               userspace/bench/tbv_rdma_sweep.py \
