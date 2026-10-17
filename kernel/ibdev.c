@@ -35,6 +35,9 @@
 #include "../proto/apple_tx.h"
 #include "../proto/native_data.h"
 #include "../proto/reliability.h"
+#include "../proto/tbv_cq_shm.h"
+#include <rdma/uverbs_ioctl.h>
+#include <rdma/ib_user_verbs.h>
 #include "tbv.h"
 
 #define TBV_IBDEV_ABI_VERSION 1
@@ -249,18 +252,38 @@ struct tbv_pd {
 	struct tbv_state *owner;
 };
 
+struct tbv_cq_mmap_entry {
+	struct rdma_user_mmap_entry rdma_entry;
+	void *address;
+};
+
 struct tbv_cq {
 	struct ib_cq base;
 	struct tbv_state *owner;
 	spinlock_t lock;
+	/*
+	 * One vmalloc_user buffer holds the whole CQ: page 0 is the shared
+	 * header the provider maps, then the kernel's ib_wc ring (which carries
+	 * the qp pointer that no uapi format can), then the ib_uverbs_wc ring
+	 * the provider reads. tail and ovf_seen are PRIVATE indices; the only
+	 * shared state is the pair of monotonic totals in the header, so every
+	 * field has exactly one writer. See proto/tbv_cq_shm.h.
+	 */
+	struct tbv_cq_shm *shm;
 	struct ib_wc *entries;
+	struct ib_uverbs_wc *shm_ring;
 	u32 cqe;
-	u32 head;
-	u32 tail;
-	u32 count;
+	u32 tail;     /* next ring slot to write; producer-private */
+	u32 ovf_seen; /* ovf_seq this CQ's consumer has already reported */
 	bool notify_armed;
-	bool overflowed;
+	void *mmap_buf;
+	size_t mmap_len;
+	struct tbv_cq_mmap_entry *mmap_entry;
 };
+static inline u32 tbv_cq_pending(const struct tbv_cq *tcq)
+{
+	return READ_ONCE(tcq->shm->produced) - READ_ONCE(tcq->shm->consumed);
+}
 
 struct tbv_recv_wqe {
 	u64 wr_id;
@@ -614,6 +637,23 @@ struct tbv_gsi_send_ctx {
 
 static DEFINE_IDA(tbv_qpn_ida);
 static atomic_t tbv_mr_key = ATOMIC_INIT(1);
+
+static void tbv_cqe_from_wc(struct ib_uverbs_wc *u, const struct ib_wc *wc)
+{
+	u->wr_id = wc->wr_id;
+	u->status = wc->status;
+	u->opcode = wc->opcode;
+	u->vendor_err = wc->vendor_err;
+	u->byte_len = wc->byte_len;
+	u->qp_num = wc->qp ? wc->qp->qp_num : 0;
+	u->ex.imm_data = wc->ex.imm_data;
+	u->src_qp = wc->src_qp;
+	u->wc_flags = wc->wc_flags;
+	u->pkey_index = wc->pkey_index;
+	u->slid = wc->slid;
+	u->sl = wc->sl;
+	u->dlid_path_bits = wc->dlid_path_bits;
+}
 
 static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc);
 static void tbv_send_ctx_put(struct tbv_send_ctx *send);
@@ -2459,19 +2499,113 @@ static int tbv_create_cq(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
 			 struct uverbs_attr_bundle *attrs)
 {
 	struct tbv_cq *tcq = container_of(cq, struct tbv_cq, base);
+	struct ib_udata *udata = &attrs->driver_udata;
+	size_t len;
 
 	if (!attr || attr->cqe <= 0 || attr->cqe > TBV_IBDEV_MAX_CQE)
 		return -EINVAL;
 
-	tcq->entries = kcalloc(attr->cqe, sizeof(*tcq->entries), GFP_KERNEL);
-	if (!tcq->entries)
+	/*
+	 * ONLY the header and the uapi wire-format ring are mapped to userspace.
+	 *
+	 * The kernel's own ib_wc ring is kcalloc'd SEPARATELY and is deliberately
+	 * NOT in the mapped buffer: struct ib_wc carries `struct ib_qp *qp`, a live
+	 * kernel pointer, and anything in this buffer is readable by the process
+	 * that created the CQ. Mapping the two rings together -- which is what an
+	 * earlier revision of this patch did -- hands userspace a kernel address
+	 * and with it a KASLR/heap-layout bypass. The uapi ring is safe because
+	 * ib_uverbs_wc carries qp_num (a u32), not a pointer.
+	 */
+	len = PAGE_SIZE + PAGE_ALIGN(attr->cqe * sizeof(*tcq->shm_ring));
+	tcq->mmap_buf = vmalloc_user(len);
+	if (!tcq->mmap_buf)
 		return -ENOMEM;
+	memset(tcq->mmap_buf, 0, len);
+	tcq->mmap_len = len;
+	tcq->entries = kcalloc(attr->cqe, sizeof(*tcq->entries), GFP_KERNEL);
+	if (!tcq->entries) {
+		vfree(tcq->mmap_buf);
+		tcq->mmap_buf = NULL;
+		return -ENOMEM;
+	}
+	tcq->shm = tcq->mmap_buf;
+	tcq->shm_ring = (struct ib_uverbs_wc *)((char *)tcq->mmap_buf + PAGE_SIZE);
 
+	tcq->shm->magic = TBV_CQ_SHM_MAGIC;
+	tcq->shm->abi = TBV_CQ_SHM_ABI;
+	tcq->shm->cqe = attr->cqe;
+	tcq->shm->entry_size = sizeof(struct ib_uverbs_wc);
+	tcq->shm->ring_offset = PAGE_SIZE;
+	tcq->shm->map_len = len;
 	spin_lock_init(&tcq->lock);
 	tcq->owner = tbv_ibdev_state(cq->device);
 	tcq->cqe = attr->cqe;
+
+	if (udata && udata->outlen >= sizeof(struct tbv_uresp_create_cq)) {
+		struct tbv_uresp_create_cq uresp = {};
+		struct tbv_ucontext *ctx =
+			rdma_udata_to_drv_context(udata, struct tbv_ucontext, base);
+		struct tbv_cq_mmap_entry *me;
+
+		me = kzalloc(sizeof(*me), GFP_KERNEL);
+		if (me) {
+			me->address = tcq->mmap_buf;
+			if (!rdma_user_mmap_entry_insert(&ctx->base, &me->rdma_entry, len)) {
+				tcq->mmap_entry = me;
+				uresp.cq_mmap_offset =
+					rdma_user_mmap_get_offset(&me->rdma_entry);
+				uresp.cqe = attr->cqe;
+				uresp.shm_abi = TBV_CQ_SHM_ABI;
+				/* Published so the provider maps the whole
+				 * buffer in ONE mmap. The first version mapped a
+				 * single page to discover the length and the
+				 * kernel rejected that call outright.
+				 */
+				uresp.map_len = len;
+				if (ib_copy_to_udata(udata, &uresp, sizeof(uresp))) {
+					rdma_user_mmap_entry_remove(&me->rdma_entry);
+					tcq->mmap_entry = NULL;
+				}
+			} else {
+				kfree(me);
+			}
+		}
+	}
 	atomic_inc(&tcq->owner->verbs_cqs);
 	return 0;
+}
+
+static int tbv_mmap(struct ib_ucontext *context, struct vm_area_struct *vma)
+{
+	struct rdma_user_mmap_entry *entry;
+	struct tbv_cq_mmap_entry *me;
+	unsigned long len = vma->vm_end - vma->vm_start;
+	int ret;
+
+	if (vma->vm_start & (PAGE_SIZE - 1)) {
+		pr_info("tbv: mmap pgoff=%lu len=%lu REJECTED: start %#lx is not page aligned\n",
+			vma->vm_pgoff, len, vma->vm_start);
+		return -EINVAL;
+	}
+	entry = rdma_user_mmap_entry_get(context, vma);
+	if (!entry) {
+		pr_info("tbv: mmap pgoff=%lu len=%lu REJECTED: no mmap entry at that pgoff\n",
+			vma->vm_pgoff, len);
+		return -EINVAL;
+	}
+	me = container_of(entry, struct tbv_cq_mmap_entry, rdma_entry);
+	ret = remap_vmalloc_range(vma, me->address, 0);
+	pr_info("tbv: mmap pgoff=%lu len=%lu -> %d\n", vma->vm_pgoff, len, ret);
+	rdma_user_mmap_entry_put(entry);
+	return ret;
+}
+
+static void tbv_mmap_free(struct rdma_user_mmap_entry *entry)
+{
+	struct tbv_cq_mmap_entry *me =
+		container_of(entry, struct tbv_cq_mmap_entry, rdma_entry);
+
+	kfree(me);
 }
 
 static int tbv_destroy_cq(struct ib_cq *cq, struct ib_udata *udata)
@@ -2480,7 +2614,10 @@ static int tbv_destroy_cq(struct ib_cq *cq, struct ib_udata *udata)
 
 	if (tcq->owner)
 		atomic_dec(&tcq->owner->verbs_cqs);
+	if (tcq->mmap_entry)
+		rdma_user_mmap_entry_remove(&tcq->mmap_entry->rdma_entry);
 	kfree(tcq->entries);
+	vfree(tcq->mmap_buf);
 	return 0;
 }
 
@@ -5407,12 +5544,23 @@ static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc)
 	unsigned long flags;
 	bool notify = false;
 	int ret = 0;
+	u32 produced, consumed;
 
 	spin_lock_irqsave(&tcq->lock, flags);
-	if (tcq->overflowed || tcq->count == tcq->cqe) {
-		tcq->overflowed = true;
+	produced = READ_ONCE(tcq->shm->produced);
+	consumed = READ_ONCE(tcq->shm->consumed);
+	if (produced - consumed >= tcq->cqe) {
+		/*
+		 * Advance a sequence, never a latch. A sticky flag made the CQ
+		 * permanently dead, and perftest's `do { } while (ne == 0)` poll
+		 * loop spins on it forever -- which is how one dropped
+		 * completion became an unkillable "poll on Send CQ failed -1".
+		 */
+		WRITE_ONCE(tcq->shm->ovf_seq, tcq->shm->ovf_seq + 1);
 		if (tcq->owner)
 			atomic64_inc(&tcq->owner->data_cq_overflow);
+		pr_info_ratelimited("tbv: CQ overflow cqe=%u produced=%u consumed=%u\n",
+				    tcq->cqe, produced, consumed);
 		if (tcq->notify_armed) {
 			tcq->notify_armed = false;
 			notify = true;
@@ -5425,8 +5573,11 @@ static int tbv_cq_push(struct tbv_cq *tcq, const struct ib_wc *wc)
 	}
 
 	tcq->entries[tcq->tail] = *wc;
+	if (wc)
+		tbv_cqe_from_wc(&tcq->shm_ring[tcq->tail], wc);
+	smp_wmb();
+	WRITE_ONCE(tcq->shm->produced, produced + 1);
 	tcq->tail = (tcq->tail + 1) % tcq->cqe;
-	tcq->count++;
 	if (tcq->notify_armed) {
 		tcq->notify_armed = false;
 		notify = true;
@@ -8768,22 +8919,33 @@ static int tbv_poll_cq(struct ib_cq *cq, int num_entries, struct ib_wc *wc)
 	struct tbv_cq *tcq = container_of(cq, struct tbv_cq, base);
 	unsigned long flags;
 	int polled = 0;
-	bool overflowed;
+	u32 produced, consumed;
 
 	if (num_entries <= 0 || !wc)
 		return 0;
 
 	spin_lock_irqsave(&tcq->lock, flags);
-	while (polled < num_entries && tcq->count) {
-		wc[polled++] = tcq->entries[tcq->head];
-		tcq->head = (tcq->head + 1) % tcq->cqe;
-		tcq->count--;
+	/*
+	 * The kernel's own poll is a second CONSUMER of the same ring, so it
+	 * reports overflow on the same terms as the provider's: once per
+	 * event, and without killing the CQ. A client uses one path or the
+	 * other for a given CQ, never both at once.
+	 */
+	if (READ_ONCE(tcq->shm->ovf_seq) != tcq->ovf_seen) {
+		tcq->ovf_seen = READ_ONCE(tcq->shm->ovf_seq);
+		spin_unlock_irqrestore(&tcq->lock, flags);
+		return -EIO;
 	}
-	overflowed = tcq->overflowed;
+	produced = READ_ONCE(tcq->shm->produced);
+	consumed = READ_ONCE(tcq->shm->consumed);
+	while (polled < num_entries && produced - consumed > 0) {
+		wc[polled++] = tcq->entries[consumed % tcq->cqe];
+		consumed++;
+	}
+	if (polled)
+		WRITE_ONCE(tcq->shm->consumed, consumed);
 	spin_unlock_irqrestore(&tcq->lock, flags);
 
-	if (!polled && overflowed)
-		return -EIO;
 	return polled;
 }
 
@@ -8794,11 +8956,12 @@ static int tbv_req_notify_cq(struct ib_cq *cq, enum ib_cq_notify_flags flags)
 	int ret;
 
 	spin_lock_irqsave(&tcq->lock, irq_flags);
-	if (tcq->overflowed) {
+	if (READ_ONCE(tcq->shm->ovf_seq) != tcq->ovf_seen) {
+		tcq->ovf_seen = READ_ONCE(tcq->shm->ovf_seq);
 		ret = -EIO;
 	} else {
 		tcq->notify_armed = true;
-		ret = tcq->count ? 1 : 0;
+		ret = tbv_cq_pending(tcq) != 0;
 	}
 	spin_unlock_irqrestore(&tcq->lock, irq_flags);
 	return ret;
@@ -9250,6 +9413,8 @@ static const struct ib_device_ops tbv_ibdev_ops = {
 	.destroy_ah = tbv_destroy_ah,
 	.create_cq = tbv_create_cq,
 	.destroy_cq = tbv_destroy_cq,
+	.mmap = tbv_mmap,
+	.mmap_free = tbv_mmap_free,
 	.create_qp = tbv_create_qp,
 	.destroy_qp = tbv_destroy_qp,
 	.modify_qp = tbv_modify_qp,
