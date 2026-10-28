@@ -3124,6 +3124,29 @@ static void tbv_qp_release_apple_tx_window(struct tbv_qp *tqp,
 		wake_up_all(&tqp->apple_tx_wait);
 }
 
+/*
+ * A retryable send that completed successfully, is not being retransmitted
+ * and whose every posted frame has reported TX done has no packet left on
+ * any path: tx_pending counts exactly those frames.  The cancel scan below
+ * would then find nothing, yet it allocates a ring-sized array and walks the
+ * whole TX ring under each path's tx_lock, which profiling showed as the
+ * sender's main cost at line rate.  Every other case keeps the scan.
+ */
+static bool tbv_send_ctx_tx_idle(struct tbv_send_ctx *send, int status)
+{
+	struct tbv_qp *tqp = send->tqp;
+	unsigned long flags;
+	bool idle;
+
+	if (status || !send->retryable || !tqp)
+		return false;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	idle = !send->retrying && !atomic_read(&send->tx_pending);
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	return idle;
+}
+
 static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 {
 	struct tbv_qp *tqp = send->tqp;
@@ -3139,7 +3162,8 @@ static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 	if (!complete)
 		return false;
 
-	tbv_cancel_send_ctx_packets(send);
+	if (!tbv_send_ctx_tx_idle(send, status))
+		tbv_cancel_send_ctx_packets(send);
 	tbv_apple_sq_release_slot(send);
 
 	if (send->apple_window_acquired) {
