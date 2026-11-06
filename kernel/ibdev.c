@@ -3499,6 +3499,20 @@ static bool tbv_qp_timeout_reap_tx(struct tbv_qp *tqp,
 				list_add_tail(&send->retry_node, retry_sends);
 				continue;
 			}
+			/*
+			 * An RNR NAK for a multi-frame SEND can arrive while that
+			 * message's later frames are still in the TX ring (or while
+			 * a retry is still being posted).  The retry budget is not
+			 * exhausted then; wait for the frames to drain and look
+			 * again instead of failing the WR with RNR_RETRY_EXC_ERR.
+			 */
+			if (send->retryable &&
+			    (send->retrying || atomic_read(&send->tx_pending)) &&
+			    tbv_send_rnr_retry_allowed(send) &&
+			    !tqp->closing && tqp->state != IB_QPS_ERR) {
+				need_resched = true;
+				continue;
+			}
 			if (!send->ready) {
 				send->ready = true;
 				send->completion_status = -EAGAIN;
