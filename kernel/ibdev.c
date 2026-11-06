@@ -3124,6 +3124,36 @@ static void tbv_qp_release_apple_tx_window(struct tbv_qp *tqp,
 		wake_up_all(&tqp->apple_tx_wait);
 }
 
+/*
+ * The cancel scan below allocates a ring-sized array and walks the whole TX
+ * ring under each path's tx_lock, which profiling showed as the sender's main
+ * cost at line rate.  A successful retryable send does not need it when
+ *  - every posted frame has reported TX done (tx_pending counts exactly
+ *    those frames), or
+ *  - it was never retransmitted: the ACK proves the peer received every
+ *    frame, so none can still wait unsent on a path.  Frames still on a TX
+ *    ring keep their own send_ctx reference and complete normally; the send
+ *    is already off pending_sends, so their late tx_done arms no timer.
+ * The second case is the common one when the ACK is handled on another CPU
+ * before the TX completions (second NHI).  Every other case keeps the scan.
+ */
+static bool tbv_send_ctx_tx_idle(struct tbv_send_ctx *send, int status)
+{
+	struct tbv_qp *tqp = send->tqp;
+	unsigned long flags;
+	bool idle;
+
+	if (status || !send->retryable || !tqp)
+		return false;
+
+	spin_lock_irqsave(&tqp->lock, flags);
+	idle = !send->retrying &&
+	       (!atomic_read(&send->tx_pending) ||
+		(!send->retries && !send->rnr_retries));
+	spin_unlock_irqrestore(&tqp->lock, flags);
+	return idle;
+}
+
 static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 {
 	struct tbv_qp *tqp = send->tqp;
@@ -3139,7 +3169,8 @@ static bool tbv_send_complete(struct tbv_send_ctx *send, int status)
 	if (!complete)
 		return false;
 
-	tbv_cancel_send_ctx_packets(send);
+	if (!tbv_send_ctx_tx_idle(send, status))
+		tbv_cancel_send_ctx_packets(send);
 	tbv_apple_sq_release_slot(send);
 
 	if (send->apple_window_acquired) {
