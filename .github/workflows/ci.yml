@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.1
+        with:
+          extra_nix_config: |
+            extra-substituters = https://cache.hellas.ai
+            extra-trusted-public-keys = cache.hellas.ai-1:PYolh95U/Ms5fKE+NQTcNZUHyEv4QikaNocg9I9iy0g=
+      - name: Check module, protocol, and userspace
+        run: |
+          nix build --no-update-lock-file --no-link --print-build-logs \
+            .#checks.x86_64-linux.{thunderbolt-ibverbs,portable-kernel-patches,script-syntax,proto-smoke,verbs-smoke-build}
+
+  macos:
+    name: macOS checks
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.1
+        with:
+          extra_nix_config: |
+            extra-substituters = https://cache.hellas.ai
+            extra-trusted-public-keys = cache.hellas.ai-1:PYolh95U/Ms5fKE+NQTcNZUHyEv4QikaNocg9I9iy0g=
+      - name: Build the Apple Silicon userspace tools
+        run: nix build --no-update-lock-file --no-link --print-build-logs .#checks.aarch64-darwin.bench-tools
+
+  required:
+    name: CI
+    if: always()
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require both platform checks
+        if: needs.linux.result != 'success' || needs.macos.result != 'success'
+        run: exit 1
