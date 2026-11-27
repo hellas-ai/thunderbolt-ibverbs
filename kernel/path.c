@@ -1783,6 +1783,26 @@ static void tbv_path_schedule_tx(struct tbv_path *path)
 					packet->start_credit_group_frames,
 					path->tx_remote_data_credit_max);
 
+			/*
+			 * Once a raw stream starts, this path sends only that
+			 * stream's frames until it ends, so control frames (credit
+			 * returns, ACKs) are held back.  Starting with only the
+			 * default start credits can run out mid-stream; if the peer
+			 * is also in a raw stream on this rail, neither side can
+			 * return credits and the rail stalls for good.  Reserve
+			 * credits for the whole stream before starting it.
+			 */
+			if (packet->raw_stream_start) {
+				start_credit_required = min_t(u32,
+					packet->start_credit_group_frames,
+					path->tx_remote_data_credit_max);
+				if (packet->start_credit_group_frames >
+				    path->tx_remote_data_credit_max)
+					pr_warn_ratelimited("raw stream %u frames > credit window %u - can still stall\n",
+							    packet->start_credit_group_frames,
+							    path->tx_remote_data_credit_max);
+			}
+
 			if (path->tx_remote_data_credits <
 			    max_t(u32, 1, start_credit_required)) {
 				if (state)
